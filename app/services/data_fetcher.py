@@ -1,6 +1,7 @@
 import httpx
 import pandas as pd
 import numpy as np
+import asyncio
 from datetime import datetime
 from app.db.mongodb import get_db
 import traceback
@@ -9,7 +10,6 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
 }
 
 SECTOR_MAP = {
@@ -41,87 +41,66 @@ SECTOR_STOCKS = {
 }
 
 # ============================================
-# YAHOO FINANCE DIRECT API (bypassa yfinance)
+# YAHOO SESSION MANAGER (singola sessione)
 # ============================================
 
-_crumb = None
-_cookie_jar = None
+class YahooSession:
+    def __init__(self):
+        self.client = None
+        self.crumb = None
+        self.ready = False
 
-async def _init_yahoo_session(client):
-    """Ottieni cookie e crumb da Yahoo Finance"""
-    global _crumb, _cookie_jar
-    try:
-        r1 = await client.get("https://fc.yahoo.com", follow_redirects=True)
-        r2 = await client.get(
-            "https://query2.finance.yahoo.com/v1/test/getcrumb",
-            follow_redirects=True
+    async def init(self):
+        self.client = httpx.AsyncClient(
+            headers=HEADERS,
+            follow_redirects=True,
+            timeout=30
         )
-        if r2.status_code == 200 and r2.text:
-            _crumb = r2.text
-            _cookie_jar = dict(client.cookies)
-            print(f"Yahoo session OK - crumb: {_crumb[:10]}...")
-            return True
-        else:
-            print(f"Crumb failed: status={r2.status_code}, text={r2.text[:100]}")
-    except Exception as e:
-        print(f"Yahoo session error: {e}")
-    return False
+        try:
+            print("Initializing Yahoo session...")
+            await self.client.get("https://fc.yahoo.com")
+            await asyncio.sleep(1)
+            r = await self.client.get("https://query2.finance.yahoo.com/v1/test/getcrumb")
+            if r.status_code == 200 and r.text and len(r.text) < 50:
+                self.crumb = r.text
+                self.ready = True
+                print(f"Yahoo session OK - crumb: {self.crumb[:15]}...")
+            else:
+                print(f"Crumb failed: status={r.status_code}")
+        except Exception as e:
+            print(f"Yahoo session error: {e}")
 
-async def fetch_chart(ticker, period="3mo", interval="1d"):
-    """Scarica OHLCV direttamente da Yahoo Finance chart API"""
-    global _crumb, _cookie_jar
-
-    async with httpx.AsyncClient(
-        headers=HEADERS,
-        cookies=_cookie_jar,
-        follow_redirects=True,
-        timeout=30
-    ) as client:
-        if not _crumb:
-            ok = await _init_yahoo_session(client)
-            if not ok:
-                print(f"  SKIP {ticker}: no Yahoo session")
-                return None
-
+    async def fetch(self, ticker, period="3mo", interval="1d"):
+        if not self.ready:
+            print(f"  SKIP {ticker}: session not ready")
+            return None
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
         params = {
             "range": period,
             "interval": interval,
-            "crumb": _crumb,
+            "crumb": self.crumb,
             "includePrePost": "false",
             "events": "",
         }
-
         try:
-            r = await client.get(url, params=params)
-            if r.status_code == 401:
-                print(f"  {ticker}: 401 - refreshing session...")
-                _crumb = None
-                _cookie_jar = None
-                ok = await _init_yahoo_session(client)
-                if ok:
-                    r = await client.get(url, params=params)
-                else:
-                    return None
-
+            r = await self.client.get(url, params=params)
+            if r.status_code == 429:
+                print(f"  {ticker}: rate limited, waiting 5s...")
+                await asyncio.sleep(5)
+                r = await self.client.get(url, params=params)
             if r.status_code != 200:
                 print(f"  {ticker}: HTTP {r.status_code}")
                 return None
-
             data = r.json()
             result = data.get("chart", {}).get("result")
             if not result:
                 print(f"  {ticker}: no chart result")
                 return None
-
             quote = result[0]
             timestamps = quote.get("timestamp", [])
             ohlcv = quote.get("indicators", {}).get("quote", [{}])[0]
-
             if not timestamps or not ohlcv.get("close"):
-                print(f"  {ticker}: empty data")
                 return None
-
             df = pd.DataFrame({
                 "Open": ohlcv.get("open", []),
                 "High": ohlcv.get("high", []),
@@ -129,12 +108,15 @@ async def fetch_chart(ticker, period="3mo", interval="1d"):
                 "Close": ohlcv.get("close", []),
                 "Volume": ohlcv.get("volume", []),
             }, index=pd.to_datetime(timestamps, unit="s"))
-
             df = df.dropna()
             return df
         except Exception as e:
-            print(f"  {ticker} fetch error: {e}")
+            print(f"  {ticker} error: {e}")
             return None
+
+    async def close(self):
+        if self.client:
+            await self.client.aclose()
 
 # ============================================
 # INDICATORI TECNICI
@@ -172,10 +154,8 @@ def calc_volume_profile(highs, lows, volumes, bins=50):
         price_max = float(highs.max())
         if price_max <= price_min:
             return None, None, None
-
         bin_edges = np.linspace(price_min, price_max, bins + 1)
         volume_per_level = np.zeros(bins)
-
         for idx in range(len(highs)):
             row_low = float(lows.iloc[idx])
             row_high = float(highs.iloc[idx])
@@ -184,10 +164,8 @@ def calc_volume_profile(highs, lows, volumes, bins=50):
             for i in range(bins):
                 if row_low <= bin_edges[i + 1] and row_high >= bin_edges[i]:
                     volume_per_level[i] += row_vol / spread
-
         poc_idx = int(np.argmax(volume_per_level))
         poc_price = round((bin_edges[poc_idx] + bin_edges[poc_idx + 1]) / 2, 2)
-
         total_vol = volume_per_level.sum()
         target_vol = total_vol * 0.70
         sorted_idx = np.argsort(volume_per_level)[::-1]
@@ -198,12 +176,10 @@ def calc_volume_profile(highs, lows, volumes, bins=50):
             va_indices.append(idx)
             if cumulative >= target_vol:
                 break
-
         va_low = round(float(bin_edges[min(va_indices)]), 2)
         va_high = round(float(bin_edges[max(va_indices) + 1]), 2)
         return poc_price, va_high, va_low
     except Exception as e:
-        print(f"    VP error: {e}")
         return None, None, None
 
 def calc_setup_score(data):
@@ -215,13 +191,11 @@ def calc_setup_score(data):
         score += 10
     else:
         score += 5
-
     hist = data.get("macd_histogram", 0)
     if hist > 0:
         score += 15
     elif hist > -0.5:
         score += 8
-
     price = data.get("price", 0)
     ema10 = data.get("ema10", 0)
     ema20 = data.get("ema20", 0)
@@ -232,7 +206,6 @@ def calc_setup_score(data):
         score += 10
     elif price > ema50:
         score += 5
-
     rel_vol = data.get("relative_volume", 1)
     if rel_vol >= 2.0:
         score += 15
@@ -240,7 +213,6 @@ def calc_setup_score(data):
         score += 12
     elif rel_vol >= 1.0:
         score += 8
-
     poc = data.get("poc_price", 0)
     if poc and price:
         dist = abs(price - poc) / price * 100
@@ -250,10 +222,8 @@ def calc_setup_score(data):
             score += 10
         elif dist <= 10:
             score += 5
-
     sector_score = data.get("sector_strength", 50)
     score += int(sector_score / 100 * 15)
-
     change = data.get("change_pct", 0)
     if 0.5 <= change <= 5:
         score += 10
@@ -261,7 +231,6 @@ def calc_setup_score(data):
         score += 6
     elif change > 5:
         score += 4
-
     return min(score, 100)
 
 def detect_setup_type(data):
@@ -271,7 +240,6 @@ def detect_setup_type(data):
     ema20 = data.get("ema20", 0)
     rsi = data.get("rsi", 50)
     rel_vol = data.get("relative_volume", 1)
-
     if va_high and price > va_high and rel_vol >= 1.5:
         return "breakout"
     if poc and price and abs(price - poc) / price * 100 <= 2:
@@ -290,30 +258,35 @@ def detect_setup_type(data):
 
 async def fetch_and_analyze_sectors():
     db = get_db()
+    yahoo = YahooSession()
+    await yahoo.init()
+
+    if not yahoo.ready:
+        print("CRITICAL: Yahoo session failed!")
+        await yahoo.close()
+        return []
+
     print("=" * 50)
     print("STARTING SECTOR REFRESH")
     print("=" * 50)
 
-    spy_df = await fetch_chart("SPY")
+    spy_df = await yahoo.fetch("SPY")
+    await asyncio.sleep(0.5)
     spy_return = 0
     if spy_df is not None and len(spy_df) >= 20:
         spy_return = ((float(spy_df["Close"].iloc[-1]) / float(spy_df["Close"].iloc[-20])) - 1) * 100
         print(f"SPY 20d return: {spy_return:.2f}%")
-    else:
-        print("WARNING: SPY data not available")
 
     results = []
     for etf, name in SECTOR_MAP.items():
         try:
-            print(f"\n  Fetching {etf} ({name})...")
-            df = await fetch_chart(etf)
+            df = await yahoo.fetch(etf)
+            await asyncio.sleep(0.5)
             if df is None or len(df) < 20:
-                print(f"  SKIP {etf}: insufficient data")
+                print(f"  SKIP {etf}")
                 continue
-
             close = df["Close"]
             volume = df["Volume"]
-
             ret_20d = ((float(close.iloc[-1]) / float(close.iloc[-20])) - 1) * 100
             strength = round(float(ret_20d - spy_return), 2)
             rsi = round(float(calc_rsi(close)), 2)
@@ -324,7 +297,6 @@ async def fetch_and_analyze_sectors():
             avg_vol = float(volume.rolling(20).mean().iloc[-1])
             curr_vol = float(volume.iloc[-1])
             rel_vol = round(curr_vol / avg_vol, 2) if avg_vol > 0 else 1
-
             trend = 0
             if price > ema10 > ema20_val > ema50:
                 trend = 90
@@ -334,9 +306,7 @@ async def fetch_and_analyze_sectors():
                 trend = 50
             else:
                 trend = 30
-
             composite = round((strength * 2 + trend + rsi) / 4, 2)
-
             sector_doc = {
                 "code": etf,
                 "name": name,
@@ -350,7 +320,6 @@ async def fetch_and_analyze_sectors():
                 "composite_score": composite,
                 "updated_at": datetime.utcnow(),
             }
-
             await db.sectors.update_one(
                 {"code": etf}, {"$set": sector_doc}, upsert=True
             )
@@ -360,6 +329,7 @@ async def fetch_and_analyze_sectors():
             print(f"  ERROR {etf}: {e}")
             traceback.print_exc()
 
+    await yahoo.close()
     print(f"\nSECTORS DONE: {len(results)}/11")
     return results
 
@@ -369,6 +339,14 @@ async def fetch_and_analyze_sectors():
 
 async def fetch_and_analyze_stocks():
     db = get_db()
+    yahoo = YahooSession()
+    await yahoo.init()
+
+    if not yahoo.ready:
+        print("CRITICAL: Yahoo session failed!")
+        await yahoo.close()
+        return []
+
     print("=" * 50)
     print("STARTING STOCKS REFRESH")
     print("=" * 50)
@@ -383,31 +361,26 @@ async def fetch_and_analyze_stocks():
         print(f"\n--- {sector_code} ---")
         for ticker in tickers:
             try:
-                df = await fetch_chart(ticker)
+                df = await yahoo.fetch(ticker)
+                await asyncio.sleep(0.5)
                 if df is None or len(df) < 20:
-                    print(f"    SKIP {ticker}: no data")
                     continue
-
                 close = df["Close"]
                 volume = df["Volume"]
                 high = df["High"]
                 low = df["Low"]
-
                 price = float(close.iloc[-1])
                 prev_close = float(close.iloc[-2])
                 change_pct = round(((price - prev_close) / prev_close) * 100, 2)
                 avg_vol = float(volume.rolling(20).mean().iloc[-1])
                 curr_vol = float(volume.iloc[-1])
                 rel_vol = round(curr_vol / avg_vol, 2) if avg_vol > 0 else 1
-
                 rsi = round(float(calc_rsi(close)), 2)
                 macd = calc_macd(close)
                 ema10 = round(float(calc_ema(close, 10)), 2)
                 ema20 = round(float(calc_ema(close, 20)), 2)
                 ema50 = round(float(calc_ema(close, 50)), 2)
-
                 poc, va_high, va_low = calc_volume_profile(high, low, volume)
-
                 ind_data = {
                     "price": price,
                     "rsi": rsi,
@@ -421,10 +394,8 @@ async def fetch_and_analyze_stocks():
                     "change_pct": change_pct,
                     "sector_strength": sector_scores.get(sector_code, 50),
                 }
-
                 setup_score = calc_setup_score(ind_data)
                 setup_type = detect_setup_type(ind_data)
-
                 asset_doc = {
                     "ticker": ticker,
                     "name": ticker,
@@ -447,7 +418,6 @@ async def fetch_and_analyze_stocks():
                     "setup_type": setup_type,
                     "updated_at": datetime.utcnow(),
                 }
-
                 await db.assets.update_one(
                     {"ticker": ticker}, {"$set": asset_doc}, upsert=True
                 )
@@ -456,5 +426,6 @@ async def fetch_and_analyze_stocks():
             except Exception as e:
                 print(f"    ERROR {ticker}: {e}")
 
+    await yahoo.close()
     print(f"\nSTOCKS DONE: {len(results)}/110")
     return results
