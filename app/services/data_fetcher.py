@@ -1,8 +1,15 @@
 import yfinance as yf
 import numpy as np
+import requests
 from datetime import datetime
 from app.db.mongodb import get_db
 import traceback
+
+# Custom session per evitare blocchi Yahoo
+session = requests.Session()
+session.headers.update({
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+})
 
 SECTOR_MAP = {
     "XLK": "Technology",
@@ -38,11 +45,13 @@ def calc_rsi(prices, period=14):
     loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
     rs = gain / loss
     rsi = 100 - (100 / (1 + rs))
-    return rsi.iloc[-1] if not rsi.empty else 50
+    val = rsi.iloc[-1] if not rsi.empty else 50
+    return 50 if np.isnan(val) else val
 
 def calc_ema(prices, period):
     ema = prices.ewm(span=period, adjust=False).mean()
-    return ema.iloc[-1] if not ema.empty else 0
+    val = ema.iloc[-1] if not ema.empty else 0
+    return 0 if np.isnan(val) else val
 
 def calc_macd(prices):
     ema12 = prices.ewm(span=12, adjust=False).mean()
@@ -56,32 +65,20 @@ def calc_macd(prices):
         "histogram": round(float(histogram.iloc[-1]), 4),
     }
 
-def calc_volume_profile(df, bins=50):
-    if df.empty or len(df) < 10:
-        return None, None, None
+def calc_volume_profile(highs, lows, volumes, bins=50):
     try:
-        low_col = df["Low"]
-        high_col = df["High"]
-        vol_col = df["Volume"]
-        if hasattr(low_col, 'columns'):
-            low_col = low_col.iloc[:, 0]
-        if hasattr(high_col, 'columns'):
-            high_col = high_col.iloc[:, 0]
-        if hasattr(vol_col, 'columns'):
-            vol_col = vol_col.iloc[:, 0]
-
-        price_min = float(low_col.min())
-        price_max = float(high_col.max())
+        price_min = float(lows.min())
+        price_max = float(highs.max())
         if price_max == price_min:
             return None, None, None
 
         bin_edges = np.linspace(price_min, price_max, bins + 1)
         volume_per_level = np.zeros(bins)
 
-        for idx in range(len(df)):
-            row_low = float(low_col.iloc[idx])
-            row_high = float(high_col.iloc[idx])
-            row_vol = float(vol_col.iloc[idx])
+        for idx in range(len(highs)):
+            row_low = float(lows.iloc[idx])
+            row_high = float(highs.iloc[idx])
+            row_vol = float(volumes.iloc[idx])
             spread_bins = max(1, int((row_high - row_low) / ((price_max - price_min) / bins)))
             for i in range(bins):
                 if row_low <= bin_edges[i + 1] and row_high >= bin_edges[i]:
@@ -105,7 +102,7 @@ def calc_volume_profile(df, bins=50):
         va_high = round(float(bin_edges[max(va_indices) + 1]), 2)
         return poc_price, va_high, va_low
     except Exception as e:
-        print(f"Volume profile error: {e}")
+        print(f"    Volume profile error: {e}")
         return None, None, None
 
 def calc_setup_score(data):
@@ -176,204 +173,3 @@ def detect_setup_type(data):
 
     if va_high and price > va_high and rel_vol >= 1.5:
         return "breakout"
-    if poc and abs(price - poc) / price * 100 <= 2:
-        return "pullback_to_poc"
-    if ema20 and abs(price - ema20) / price * 100 <= 1.5:
-        return "ema_bounce"
-    if rsi <= 30:
-        return "oversold_reversal"
-    if rsi >= 70:
-        return "overbought_warning"
-    return "neutral"
-
-async def fetch_and_analyze_sectors():
-    db = get_db()
-    print("=" * 50)
-    print("STARTING SECTOR REFRESH")
-    print("=" * 50)
-
-    try:
-        spy_data = yf.download("SPY", period="3mo", interval="1d", progress=False)
-        print(f"SPY data shape: {spy_data.shape}")
-        print(f"SPY columns: {list(spy_data.columns)}")
-    except Exception as e:
-        print(f"CRITICAL - SPY download failed: {e}")
-        traceback.print_exc()
-        spy_data = None
-
-    spy_return = 0
-    if spy_data is not None and not spy_data.empty and len(spy_data) >= 20:
-        spy_close = spy_data["Close"]
-        if hasattr(spy_close, 'columns'):
-            spy_close = spy_close.iloc[:, 0]
-        spy_return = ((float(spy_close.iloc[-1]) / float(spy_close.iloc[-20])) - 1) * 100
-        print(f"SPY return 20d: {spy_return:.2f}%")
-
-    results = []
-    for etf, name in SECTOR_MAP.items():
-        try:
-            print(f"\nFetching {etf} ({name})...")
-            df = yf.download(etf, period="3mo", interval="1d", progress=False)
-            print(f"  {etf} data shape: {df.shape}")
-
-            if df.empty or len(df) < 20:
-                print(f"  SKIP {etf}: not enough data ({len(df)} rows)")
-                continue
-
-            close = df["Close"]
-            if hasattr(close, 'columns'):
-                close = close.iloc[:, 0]
-            volume = df["Volume"]
-            if hasattr(volume, 'columns'):
-                volume = volume.iloc[:, 0]
-
-            ret_20d = ((float(close.iloc[-1]) / float(close.iloc[-20])) - 1) * 100
-            strength = round(float(ret_20d - spy_return), 2)
-            rsi = round(float(calc_rsi(close)), 2)
-            ema10 = float(calc_ema(close, 10))
-            ema20 = float(calc_ema(close, 20))
-            ema50 = float(calc_ema(close, 50))
-            price = float(close.iloc[-1])
-            avg_vol = float(volume.rolling(20).mean().iloc[-1])
-            curr_vol = float(volume.iloc[-1])
-            rel_vol = round(curr_vol / avg_vol, 2) if avg_vol > 0 else 1
-
-            trend = 0
-            if price > ema10 > ema20 > ema50:
-                trend = 90
-            elif price > ema20 > ema50:
-                trend = 70
-            elif price > ema50:
-                trend = 50
-            else:
-                trend = 30
-
-            composite = round((strength * 2 + trend + rsi) / 4, 2)
-
-            sector_doc = {
-                "code": etf,
-                "name": name,
-                "etf_ticker": etf,
-                "price": round(price, 2),
-                "return_20d": round(float(ret_20d), 2),
-                "strength_score": strength,
-                "trend_score": trend,
-                "volume_score": round(rel_vol * 30, 2),
-                "rsi": rsi,
-                "composite_score": composite,
-                "updated_at": datetime.utcnow(),
-            }
-
-            await db.sectors.update_one(
-                {"code": etf}, {"$set": sector_doc}, upsert=True
-            )
-            results.append(sector_doc)
-            print(f"  OK {etf}: price={price:.2f}, composite={composite:.2f}")
-        except Exception as e:
-            print(f"  ERROR {etf}: {e}")
-            traceback.print_exc()
-
-    print(f"\nSECTOR REFRESH DONE: {len(results)} sectors")
-    return results
-
-async def fetch_and_analyze_stocks():
-    db = get_db()
-    print("=" * 50)
-    print("STARTING STOCKS REFRESH")
-    print("=" * 50)
-
-    sector_scores = {}
-    async for s in db.sectors.find():
-        sector_scores[s["code"]] = s.get("composite_score", 50)
-    print(f"Sector scores loaded: {sector_scores}")
-
-    results = []
-    for sector_code, tickers in SECTOR_STOCKS.items():
-        for ticker in tickers:
-            try:
-                df = yf.download(ticker, period="3mo", interval="1d", progress=False)
-
-                if df.empty or len(df) < 20:
-                    print(f"  SKIP {ticker}: not enough data")
-                    continue
-
-                close = df["Close"]
-                if hasattr(close, 'columns'):
-                    close = close.iloc[:, 0]
-                volume = df["Volume"]
-                if hasattr(volume, 'columns'):
-                    volume = volume.iloc[:, 0]
-
-                price = float(close.iloc[-1])
-                prev_close = float(close.iloc[-2])
-                change_pct = round(((price - prev_close) / prev_close) * 100, 2)
-                avg_vol = float(volume.rolling(20).mean().iloc[-1])
-                curr_vol = float(volume.iloc[-1])
-                rel_vol = round(curr_vol / avg_vol, 2) if avg_vol > 0 else 1
-
-                rsi = round(float(calc_rsi(close)), 2)
-                macd = calc_macd(close)
-                ema10 = round(float(calc_ema(close, 10)), 2)
-                ema20 = round(float(calc_ema(close, 20)), 2)
-                ema50 = round(float(calc_ema(close, 50)), 2)
-
-                poc, va_high, va_low = calc_volume_profile(df)
-
-                stock_name = ticker
-                try:
-                    info = yf.Ticker(ticker).info
-                    stock_name = info.get("shortName", ticker)
-                except Exception:
-                    pass
-
-                ind_data = {
-                    "price": price,
-                    "rsi": rsi,
-                    "macd_histogram": macd["histogram"],
-                    "ema10": ema10,
-                    "ema20": ema20,
-                    "ema50": ema50,
-                    "relative_volume": rel_vol,
-                    "poc_price": poc,
-                    "va_high": va_high,
-                    "change_pct": change_pct,
-                    "sector_strength": sector_scores.get(sector_code, 50),
-                }
-
-                setup_score = calc_setup_score(ind_data)
-                setup_type = detect_setup_type(ind_data)
-
-                asset_doc = {
-                    "ticker": ticker,
-                    "name": stock_name,
-                    "sector_code": sector_code,
-                    "price": round(price, 2),
-                    "change_pct": change_pct,
-                    "avg_volume": round(avg_vol, 0),
-                    "relative_volume": rel_vol,
-                    "rsi": rsi,
-                    "macd": macd,
-                    "ema10": ema10,
-                    "ema20": ema20,
-                    "ema50": ema50,
-                    "momentum_score": rsi,
-                    "volume_score": round(rel_vol * 30, 2),
-                    "poc_price": poc,
-                    "value_area_high": va_high,
-                    "value_area_low": va_low,
-                    "setup_score": setup_score,
-                    "setup_type": setup_type,
-                    "updated_at": datetime.utcnow(),
-                }
-
-                await db.assets.update_one(
-                    {"ticker": ticker}, {"$set": asset_doc}, upsert=True
-                )
-                results.append(asset_doc)
-                print(f"  OK {ticker}: score={setup_score}, type={setup_type}")
-            except Exception as e:
-                print(f"  ERROR {ticker}: {e}")
-                traceback.print_exc()
-
-    print(f"\nSTOCKS REFRESH DONE: {len(results)} stocks")
-    return results
