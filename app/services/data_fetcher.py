@@ -1,15 +1,16 @@
-import yfinance as yf
+import httpx
+import pandas as pd
 import numpy as np
-import requests
 from datetime import datetime
 from app.db.mongodb import get_db
 import traceback
 
-# Custom session per evitare blocchi Yahoo
-session = requests.Session()
-session.headers.update({
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-})
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+}
 
 SECTOR_MAP = {
     "XLK": "Technology",
@@ -39,6 +40,106 @@ SECTOR_STOCKS = {
     "XLC": ["META", "GOOGL", "GOOG", "NFLX", "DIS", "CMCSA", "T", "VZ", "TMUS", "EA"],
 }
 
+# ============================================
+# YAHOO FINANCE DIRECT API (bypassa yfinance)
+# ============================================
+
+_crumb = None
+_cookie_jar = None
+
+async def _init_yahoo_session(client):
+    """Ottieni cookie e crumb da Yahoo Finance"""
+    global _crumb, _cookie_jar
+    try:
+        r1 = await client.get("https://fc.yahoo.com", follow_redirects=True)
+        r2 = await client.get(
+            "https://query2.finance.yahoo.com/v1/test/getcrumb",
+            follow_redirects=True
+        )
+        if r2.status_code == 200 and r2.text:
+            _crumb = r2.text
+            _cookie_jar = dict(client.cookies)
+            print(f"Yahoo session OK - crumb: {_crumb[:10]}...")
+            return True
+        else:
+            print(f"Crumb failed: status={r2.status_code}, text={r2.text[:100]}")
+    except Exception as e:
+        print(f"Yahoo session error: {e}")
+    return False
+
+async def fetch_chart(ticker, period="3mo", interval="1d"):
+    """Scarica OHLCV direttamente da Yahoo Finance chart API"""
+    global _crumb, _cookie_jar
+
+    async with httpx.AsyncClient(
+        headers=HEADERS,
+        cookies=_cookie_jar,
+        follow_redirects=True,
+        timeout=30
+    ) as client:
+        if not _crumb:
+            ok = await _init_yahoo_session(client)
+            if not ok:
+                print(f"  SKIP {ticker}: no Yahoo session")
+                return None
+
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+        params = {
+            "range": period,
+            "interval": interval,
+            "crumb": _crumb,
+            "includePrePost": "false",
+            "events": "",
+        }
+
+        try:
+            r = await client.get(url, params=params)
+            if r.status_code == 401:
+                print(f"  {ticker}: 401 - refreshing session...")
+                _crumb = None
+                _cookie_jar = None
+                ok = await _init_yahoo_session(client)
+                if ok:
+                    r = await client.get(url, params=params)
+                else:
+                    return None
+
+            if r.status_code != 200:
+                print(f"  {ticker}: HTTP {r.status_code}")
+                return None
+
+            data = r.json()
+            result = data.get("chart", {}).get("result")
+            if not result:
+                print(f"  {ticker}: no chart result")
+                return None
+
+            quote = result[0]
+            timestamps = quote.get("timestamp", [])
+            ohlcv = quote.get("indicators", {}).get("quote", [{}])[0]
+
+            if not timestamps or not ohlcv.get("close"):
+                print(f"  {ticker}: empty data")
+                return None
+
+            df = pd.DataFrame({
+                "Open": ohlcv.get("open", []),
+                "High": ohlcv.get("high", []),
+                "Low": ohlcv.get("low", []),
+                "Close": ohlcv.get("close", []),
+                "Volume": ohlcv.get("volume", []),
+            }, index=pd.to_datetime(timestamps, unit="s"))
+
+            df = df.dropna()
+            return df
+        except Exception as e:
+            print(f"  {ticker} fetch error: {e}")
+            return None
+
+# ============================================
+# INDICATORI TECNICI
+# ============================================
+
 def calc_rsi(prices, period=14):
     delta = prices.diff()
     gain = delta.where(delta > 0, 0).rolling(window=period).mean()
@@ -46,12 +147,12 @@ def calc_rsi(prices, period=14):
     rs = gain / loss
     rsi = 100 - (100 / (1 + rs))
     val = rsi.iloc[-1] if not rsi.empty else 50
-    return 50 if np.isnan(val) else val
+    return 50 if pd.isna(val) else val
 
 def calc_ema(prices, period):
     ema = prices.ewm(span=period, adjust=False).mean()
     val = ema.iloc[-1] if not ema.empty else 0
-    return 0 if np.isnan(val) else val
+    return 0 if pd.isna(val) else val
 
 def calc_macd(prices):
     ema12 = prices.ewm(span=12, adjust=False).mean()
@@ -69,7 +170,7 @@ def calc_volume_profile(highs, lows, volumes, bins=50):
     try:
         price_min = float(lows.min())
         price_max = float(highs.max())
-        if price_max == price_min:
+        if price_max <= price_min:
             return None, None, None
 
         bin_edges = np.linspace(price_min, price_max, bins + 1)
@@ -79,20 +180,19 @@ def calc_volume_profile(highs, lows, volumes, bins=50):
             row_low = float(lows.iloc[idx])
             row_high = float(highs.iloc[idx])
             row_vol = float(volumes.iloc[idx])
-            spread_bins = max(1, int((row_high - row_low) / ((price_max - price_min) / bins)))
+            spread = max(1, int((row_high - row_low) / ((price_max - price_min) / bins)))
             for i in range(bins):
-                if row_low <= bin_edges[i + 1] and row_high >= bin_edges[i]:
-                    volume_per_level[i] += row_vol / spread_bins
+                if row_low <= bin_edges[i + 1] and row_high >= bin_edgesvolume_per_level[i] += row_vol / spread
 
         poc_idx = int(np.argmax(volume_per_level))
         poc_price = round((bin_edges[poc_idx] + bin_edges[poc_idx + 1]) / 2, 2)
 
         total_vol = volume_per_level.sum()
         target_vol = total_vol * 0.70
-        sorted_indices = np.argsort(volume_per_level)[::-1]
+        sorted_idx = np.argsort(volume_per_level)[::-1]
         cumulative = 0
         va_indices = []
-        for idx in sorted_indices:
+        for idx in sorted_idx:
             cumulative += volume_per_level[idx]
             va_indices.append(idx)
             if cumulative >= target_vol:
@@ -102,7 +202,7 @@ def calc_volume_profile(highs, lows, volumes, bins=50):
         va_high = round(float(bin_edges[max(va_indices) + 1]), 2)
         return poc_price, va_high, va_low
     except Exception as e:
-        print(f"    Volume profile error: {e}")
+        print(f"    VP error: {e}")
         return None, None, None
 
 def calc_setup_score(data):
@@ -173,9 +273,9 @@ def detect_setup_type(data):
 
     if va_high and price > va_high and rel_vol >= 1.5:
         return "breakout"
-    if poc and abs(price - poc) / price * 100 <= 2:
+    if poc and price and abs(price - poc) / price * 100 <= 2:
         return "pullback_to_poc"
-    if ema20 and abs(price - ema20) / price * 100 <= 1.5:
+    if ema20 and price and abs(price - ema20) / price * 100 <= 1.5:
         return "ema_bounce"
     if rsi <= 30:
         return "oversold_reversal"
@@ -183,66 +283,35 @@ def detect_setup_type(data):
         return "overbought_warning"
     return "neutral"
 
-def get_col(df, col_name, ticker=None):
-    """Estrae una colonna da un DataFrame yfinance (gestisce MultiIndex)"""
-    col = df[col_name]
-    if hasattr(col, 'columns'):
-        if ticker and ticker in col.columns:
-            return col[ticker]
-        return col.iloc[:, 0]
-    return col
+# ============================================
+# FETCH & ANALYZE SECTORS
+# ============================================
 
 async def fetch_and_analyze_sectors():
     db = get_db()
     print("=" * 50)
-    print("STARTING SECTOR REFRESH (BATCH)")
+    print("STARTING SECTOR REFRESH")
     print("=" * 50)
 
-    all_etfs = list(SECTOR_MAP.keys()) + ["SPY"]
-    tickers_str = " ".join(all_etfs)
-
-    try:
-        print(f"Batch downloading: {tickers_str}")
-        batch_data = yf.download(
-            tickers_str,
-            period="3mo",
-            interval="1d",
-            group_by="ticker",
-            progress=False,
-            session=session,
-            threads=False
-        )
-        print(f"Batch data shape: {batch_data.shape}")
-        print(f"Batch columns (first 10): {list(batch_data.columns)[:10]}")
-    except Exception as e:
-        print(f"CRITICAL - Batch download failed: {e}")
-        traceback.print_exc()
-        return []
-
-    if batch_data.empty:
-        print("CRITICAL - batch_data is empty!")
-        return []
-
-    # SPY return
+    spy_df = await fetch_chart("SPY")
     spy_return = 0
-    try:
-        spy_close = batch_data["SPY"]["Close"].dropna()
-        if len(spy_close) >= 20:
-            spy_return = ((float(spy_close.iloc[-1]) / float(spy_close.iloc[-20])) - 1) * 100
-            print(f"SPY return 20d: {spy_return:.2f}%")
-    except Exception as e:
-        print(f"SPY calc error: {e}")
+    if spy_df is not None and len(spy_df) >= 20:
+        spy_return = ((float(spy_df["Close"].iloc[-1]) / float(spy_df["Close"].iloc[-20])) - 1) * 100
+        print(f"SPY 20d return: {spy_return:.2f}%")
+    else:
+        print("WARNING: SPY data not available")
 
     results = []
     for etf, name in SECTOR_MAP.items():
         try:
-            print(f"\nProcessing {etf} ({name})...")
-            close = batch_data[etf]["Close"].dropna()
-            volume = batch_data[etf]["Volume"].dropna()
-
-            if len(close) < 20:
-                print(f"  SKIP {etf}: only {len(close)} rows")
+            print(f"\n  Fetching {etf} ({name})...")
+            df = await fetch_chart(etf)
+            if df is None or len(df) < 20:
+                print(f"  SKIP {etf}: insufficient data")
                 continue
+
+            close = df["Close"]
+            volume = df["Volume"]
 
             ret_20d = ((float(close.iloc[-1]) / float(close.iloc[-20])) - 1) * 100
             strength = round(float(ret_20d - spy_return), 2)
@@ -285,18 +354,22 @@ async def fetch_and_analyze_sectors():
                 {"code": etf}, {"$set": sector_doc}, upsert=True
             )
             results.append(sector_doc)
-            print(f"  OK {etf}: price={price:.2f}, score={composite:.2f}")
+            print(f"  OK {etf}: ${price:.2f} score={composite:.2f}")
         except Exception as e:
             print(f"  ERROR {etf}: {e}")
             traceback.print_exc()
 
-    print(f"\nSECTOR REFRESH DONE: {len(results)} sectors")
+    print(f"\nSECTORS DONE: {len(results)}/11")
     return results
+
+# ============================================
+# FETCH & ANALYZE STOCKS
+# ============================================
 
 async def fetch_and_analyze_stocks():
     db = get_db()
     print("=" * 50)
-    print("STARTING STOCKS REFRESH (BATCH)")
+    print("STARTING STOCKS REFRESH")
     print("=" * 50)
 
     sector_scores = {}
@@ -306,43 +379,18 @@ async def fetch_and_analyze_stocks():
 
     results = []
     for sector_code, tickers in SECTOR_STOCKS.items():
-        print(f"\n--- Sector {sector_code}: {tickers} ---")
-        tickers_str = " ".join(tickers)
-
-        try:
-            batch_data = yf.download(
-                tickers_str,
-                period="3mo",
-                interval="1d",
-                group_by="ticker",
-                progress=False,
-                session=session,
-                threads=False
-            )
-            print(f"  Batch shape: {batch_data.shape}")
-        except Exception as e:
-            print(f"  BATCH ERROR {sector_code}: {e}")
-            traceback.print_exc()
-            continue
-
-        if batch_data.empty:
-            print(f"  EMPTY batch for {sector_code}")
-            continue
-
+        print(f"\n--- {sector_code} ---")
         for ticker in tickers:
             try:
-                try:
-                    close = batch_data[ticker]["Close"].dropna()
-                    volume = batch_data[ticker]["Volume"].dropna()
-                    high = batch_data[ticker]["High"].dropna()
-                    low = batch_data[ticker]["Low"].dropna()
-                except KeyError:
-                    print(f"    SKIP {ticker}: not in batch data")
+                df = await fetch_chart(ticker)
+                if df is None or len(df) < 20:
+                    print(f"    SKIP {ticker}: no data")
                     continue
 
-                if len(close) < 20:
-                    print(f"    SKIP {ticker}: only {len(close)} rows")
-                    continue
+                close = df["Close"]
+                volume = df["Volume"]
+                high = df["High"]
+                low = df["Low"]
 
                 price = float(close.iloc[-1])
                 prev_close = float(close.iloc[-2])
@@ -358,8 +406,6 @@ async def fetch_and_analyze_stocks():
                 ema50 = round(float(calc_ema(close, 50)), 2)
 
                 poc, va_high, va_low = calc_volume_profile(high, low, volume)
-
-                stock_name = ticker
 
                 ind_data = {
                     "price": price,
@@ -380,7 +426,7 @@ async def fetch_and_analyze_stocks():
 
                 asset_doc = {
                     "ticker": ticker,
-                    "name": stock_name,
+                    "name": ticker,
                     "sector_code": sector_code,
                     "price": round(price, 2),
                     "change_pct": change_pct,
@@ -409,5 +455,5 @@ async def fetch_and_analyze_stocks():
             except Exception as e:
                 print(f"    ERROR {ticker}: {e}")
 
-    print(f"\nSTOCKS REFRESH DONE: {len(results)} stocks")
+    print(f"\nSTOCKS DONE: {len(results)}/110")
     return results
