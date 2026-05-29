@@ -72,6 +72,179 @@ async def fetch_td(client, symbol):
         return None
 
 
+# ============================================
+# CANDLESTICK PATTERN DETECTION
+# ============================================
+
+def detect_candlestick_patterns(df):
+    """Detect candlestick patterns from last 3 candles"""
+    if df is None or len(df) < 3:
+        return []
+
+    patterns = []
+    o = df["Open"].values
+    h = df["High"].values
+    l = df["Low"].values
+    c = df["Close"].values
+
+    # Last 3 candles
+    i = len(df) - 1  # today
+    i1 = i - 1       # yesterday
+    i2 = i - 2       # 2 days ago
+
+    body = abs(c[i] - o[i])
+    range_total = h[i] - l[i]
+    upper_shadow = h[i] - max(o[i], c[i])
+    lower_shadow = min(o[i], c[i]) - l[i]
+    is_bullish = c[i] > o[i]
+    is_bearish = c[i] < o[i]
+
+    body1 = abs(c[i1] - o[i1])
+    is_bullish1 = c[i1] > o[i1]
+    is_bearish1 = c[i1] < o[i1]
+
+    body2 = abs(c[i2] - o[i2])
+    is_bullish2 = c[i2] > o[i2]
+
+    if range_total == 0:
+        return []
+
+    body_pct = body / range_total
+
+    # 1. HAMMER (bullish reversal)
+    # Small body at top, long lower shadow (2x body), small upper shadow
+    if body_pct < 0.35 and lower_shadow >= body * 2 and upper_shadow < body * 0.5:
+        patterns.append({
+            "name": "Hammer",
+            "type": "bullish",
+            "strength": "strong",
+            "description": "Bullish reversal - buyers pushed price up from lows"
+        })
+
+    # 2. INVERTED HAMMER (bullish reversal)
+    # Small body at bottom, long upper shadow, small lower shadow
+    if body_pct < 0.35 and upper_shadow >= body * 2 and lower_shadow < body * 0.5:
+        patterns.append({
+            "name": "Inverted Hammer",
+            "type": "bullish",
+            "strength": "moderate",
+            "description": "Potential bullish reversal - needs confirmation"
+        })
+
+    # 3. BULLISH ENGULFING
+    # Previous bearish, current bullish, current body engulfs previous body
+    if is_bearish1 and is_bullish and c[i] > o[i1] and o[i] < c[i1] and body > body1:
+        patterns.append({
+            "name": "Bullish Engulfing",
+            "type": "bullish",
+            "strength": "strong",
+            "description": "Strong bullish reversal - buyers overwhelmed sellers"
+        })
+
+    # 4. BEARISH ENGULFING
+    # Previous bullish, current bearish, current body engulfs previous body
+    if is_bullish1 and is_bearish and o[i] > c[i1] and c[i] < o[i1] and body > body1:
+        patterns.append({
+            "name": "Bearish Engulfing",
+            "type": "bearish",
+            "strength": "strong",
+            "description": "Strong bearish reversal - sellers overwhelmed buyers"
+        })
+
+    # 5. DOJI (indecision)
+    # Very small body relative to range
+    if body_pct < 0.1 and range_total > 0:
+        patterns.append({
+            "name": "Doji",
+            "type": "neutral",
+            "strength": "moderate",
+            "description": "Market indecision - watch for breakout direction"
+        })
+
+    # 6. MORNING STAR (bullish reversal - 3 candle pattern)
+    # Day 1: big bearish, Day 2: small body (gap down), Day 3: big bullish closes above day1 midpoint
+    day1_mid = (o[i2] + c[i2]) / 2
+    if is_bearish1 is False and body2 > 0 and (c[i2] < o[i2]) and body_pct < 0.3 is False:
+        pass
+    if len(df) >= 3:
+        if c[i2] < o[i2] and body2 > range_total * 0.15:  # day1 bearish with decent body
+            if body1 < body2 * 0.4:  # day2 small body
+                if is_bullish and c[i] > day1_mid:  # day3 bullish, closes above day1 midpoint
+                    patterns.append({
+                        "name": "Morning Star",
+                        "type": "bullish",
+                        "strength": "strong",
+                        "description": "3-candle bullish reversal - high reliability pattern"
+                    })
+
+    # 7. EVENING STAR (bearish reversal - 3 candle pattern)
+    day1_mid2 = (o[i2] + c[i2]) / 2
+    if len(df) >= 3:
+        if c[i2] > o[i2] and body2 > range_total * 0.15:  # day1 bullish
+            if body1 < body2 * 0.4:  # day2 small body
+                if is_bearish and c[i] < day1_mid2:  # day3 bearish
+                    patterns.append({
+                        "name": "Evening Star",
+                        "type": "bearish",
+                        "strength": "strong",
+                        "description": "3-candle bearish reversal - high reliability pattern"
+                    })
+
+    # 8. THREE WHITE SOLDIERS (bullish continuation)
+    if len(df) >= 3:
+        if (c[i2] > o[i2]) and (c[i1] > o[i1]) and (c[i] > o[i]):
+            if c[i1] > c[i2] and c[i] > c[i1]:
+                if body1 > range_total * 0.15 and body2 > range_total * 0.15 and body > range_total * 0.15:
+                    patterns.append({
+                        "name": "Three White Soldiers",
+                        "type": "bullish",
+                        "strength": "strong",
+                        "description": "3 consecutive bullish candles - strong buying pressure"
+                    })
+
+    # 9. THREE BLACK CROWS (bearish continuation)
+    if len(df) >= 3:
+        if (c[i2] < o[i2]) and (c[i1] < o[i1]) and (c[i] < o[i]):
+            if c[i1] < c[i2] and c[i] < c[i1]:
+                if body1 > range_total * 0.15 and body2 > range_total * 0.15 and body > range_total * 0.15:
+                    patterns.append({
+                        "name": "Three Black Crows",
+                        "type": "bearish",
+                        "strength": "strong",
+                        "description": "3 consecutive bearish candles - strong selling pressure"
+                    })
+
+    # 10. SHOOTING STAR (bearish reversal at top)
+    if body_pct < 0.3 and upper_shadow >= body * 2 and lower_shadow < body * 0.3 and is_bearish:
+        patterns.append({
+            "name": "Shooting Star",
+            "type": "bearish",
+            "strength": "moderate",
+            "description": "Bearish reversal at resistance - sellers rejected higher prices"
+        })
+
+    return patterns
+
+
+def get_pattern_score_bonus(patterns):
+    """Calculate bonus/penalty points from candlestick patterns"""
+    bonus = 0
+    for p in patterns:
+        if p["type"] == "bullish" and p["strength"] == "strong":
+            bonus += 8
+        elif p["type"] == "bullish" and p["strength"] == "moderate":
+            bonus += 4
+        elif p["type"] == "bearish" and p["strength"] == "strong":
+            bonus -= 6
+        elif p["type"] == "bearish" and p["strength"] == "moderate":
+            bonus -= 3
+    return bonus
+
+
+# ============================================
+# INDICATORI TECNICI
+# ============================================
+
 def calc_rsi(prices, period=14):
     delta = prices.diff()
     gain = delta.where(delta > 0, 0).rolling(window=period).mean()
@@ -185,7 +358,12 @@ def calc_setup_score(data):
         score += 6
     elif change > 5:
         score += 4
-    return min(score, 100)
+
+    # Candlestick pattern bonus
+    pattern_bonus = data.get("pattern_bonus", 0)
+    score += pattern_bonus
+
+    return max(0, min(score, 100))
 
 
 def detect_setup_type(data):
@@ -207,6 +385,10 @@ def detect_setup_type(data):
         return "overbought_warning"
     return "neutral"
 
+
+# ============================================
+# FETCH & ANALYZE SECTORS
+# ============================================
 
 async def fetch_and_analyze_sectors():
     db = get_db()
@@ -275,13 +457,17 @@ async def fetch_and_analyze_sectors():
     return results
 
 
+# ============================================
+# FETCH & ANALYZE STOCKS
+# ============================================
+
 async def fetch_and_analyze_stocks():
     db = get_db()
     if not settings.TWELVEDATA_API_KEY:
         print("ERROR: TWELVEDATA_API_KEY not set!")
         return []
     print("=" * 50)
-    print("STARTING STOCKS REFRESH (Twelve Data)")
+    print("STARTING STOCKS REFRESH (Twelve Data + Candlestick)")
     print("=" * 50)
     sector_scores = {}
     async for s in db.sectors.find():
@@ -314,12 +500,19 @@ async def fetch_and_analyze_stocks():
                     ema20 = round(float(calc_ema(close, 20)), 2)
                     ema50 = round(float(calc_ema(close, 50)), 2)
                     poc, va_high, va_low = calc_volume_profile(high, low, volume)
+
+                    # Candlestick patterns
+                    patterns = detect_candlestick_patterns(df)
+                    pattern_bonus = get_pattern_score_bonus(patterns)
+                    patterns_list = [{"name": p["name"], "type": p["type"], "strength": p["strength"], "description": p["description"]} for p in patterns]
+
                     ind_data = {
                         "price": price, "rsi": rsi, "macd_histogram": macd["histogram"],
                         "ema10": ema10, "ema20": ema20, "ema50": ema50,
                         "relative_volume": rel_vol, "poc_price": poc, "va_high": va_high,
                         "change_pct": change_pct,
                         "sector_strength": sector_scores.get(sector_code, 50),
+                        "pattern_bonus": pattern_bonus,
                     }
                     setup_score = calc_setup_score(ind_data)
                     setup_type = detect_setup_type(ind_data)
@@ -332,11 +525,14 @@ async def fetch_and_analyze_stocks():
                         "momentum_score": rsi, "volume_score": round(rel_vol * 30, 2),
                         "poc_price": poc, "value_area_high": va_high, "value_area_low": va_low,
                         "setup_score": setup_score, "setup_type": setup_type,
+                        "candlestick_patterns": patterns_list,
+                        "pattern_bonus": pattern_bonus,
                         "updated_at": datetime.utcnow(),
                     }
                     await db.assets.update_one({"ticker": ticker}, {"$set": asset_doc}, upsert=True)
                     results.append(asset_doc)
-                    print(f"    OK {ticker}: ${price:.2f} score={setup_score} [{setup_type}]")
+                    pat_str = ", ".join([p["name"] for p in patterns]) if patterns else "none"
+                    print(f"    OK {ticker}: ${price:.2f} score={setup_score} [{setup_type}] patterns=[{pat_str}]")
                 except Exception as e:
                     print(f"    ERROR {ticker}: {e}")
     print(f"\nSTOCKS DONE: {len(results)}/110")
