@@ -173,3 +173,241 @@ def detect_setup_type(data):
 
     if va_high and price > va_high and rel_vol >= 1.5:
         return "breakout"
+    if poc and abs(price - poc) / price * 100 <= 2:
+        return "pullback_to_poc"
+    if ema20 and abs(price - ema20) / price * 100 <= 1.5:
+        return "ema_bounce"
+    if rsi <= 30:
+        return "oversold_reversal"
+    if rsi >= 70:
+        return "overbought_warning"
+    return "neutral"
+
+def get_col(df, col_name, ticker=None):
+    """Estrae una colonna da un DataFrame yfinance (gestisce MultiIndex)"""
+    col = df[col_name]
+    if hasattr(col, 'columns'):
+        if ticker and ticker in col.columns:
+            return col[ticker]
+        return col.iloc[:, 0]
+    return col
+
+async def fetch_and_analyze_sectors():
+    db = get_db()
+    print("=" * 50)
+    print("STARTING SECTOR REFRESH (BATCH)")
+    print("=" * 50)
+
+    all_etfs = list(SECTOR_MAP.keys()) + ["SPY"]
+    tickers_str = " ".join(all_etfs)
+
+    try:
+        print(f"Batch downloading: {tickers_str}")
+        batch_data = yf.download(
+            tickers_str,
+            period="3mo",
+            interval="1d",
+            group_by="ticker",
+            progress=False,
+            session=session,
+            threads=False
+        )
+        print(f"Batch data shape: {batch_data.shape}")
+        print(f"Batch columns (first 10): {list(batch_data.columns)[:10]}")
+    except Exception as e:
+        print(f"CRITICAL - Batch download failed: {e}")
+        traceback.print_exc()
+        return []
+
+    if batch_data.empty:
+        print("CRITICAL - batch_data is empty!")
+        return []
+
+    # SPY return
+    spy_return = 0
+    try:
+        spy_close = batch_data["SPY"]["Close"].dropna()
+        if len(spy_close) >= 20:
+            spy_return = ((float(spy_close.iloc[-1]) / float(spy_close.iloc[-20])) - 1) * 100
+            print(f"SPY return 20d: {spy_return:.2f}%")
+    except Exception as e:
+        print(f"SPY calc error: {e}")
+
+    results = []
+    for etf, name in SECTOR_MAP.items():
+        try:
+            print(f"\nProcessing {etf} ({name})...")
+            close = batch_data[etf]["Close"].dropna()
+            volume = batch_data[etf]["Volume"].dropna()
+
+            if len(close) < 20:
+                print(f"  SKIP {etf}: only {len(close)} rows")
+                continue
+
+            ret_20d = ((float(close.iloc[-1]) / float(close.iloc[-20])) - 1) * 100
+            strength = round(float(ret_20d - spy_return), 2)
+            rsi = round(float(calc_rsi(close)), 2)
+            ema10 = float(calc_ema(close, 10))
+            ema20_val = float(calc_ema(close, 20))
+            ema50 = float(calc_ema(close, 50))
+            price = float(close.iloc[-1])
+            avg_vol = float(volume.rolling(20).mean().iloc[-1])
+            curr_vol = float(volume.iloc[-1])
+            rel_vol = round(curr_vol / avg_vol, 2) if avg_vol > 0 else 1
+
+            trend = 0
+            if price > ema10 > ema20_val > ema50:
+                trend = 90
+            elif price > ema20_val > ema50:
+                trend = 70
+            elif price > ema50:
+                trend = 50
+            else:
+                trend = 30
+
+            composite = round((strength * 2 + trend + rsi) / 4, 2)
+
+            sector_doc = {
+                "code": etf,
+                "name": name,
+                "etf_ticker": etf,
+                "price": round(price, 2),
+                "return_20d": round(float(ret_20d), 2),
+                "strength_score": strength,
+                "trend_score": trend,
+                "volume_score": round(rel_vol * 30, 2),
+                "rsi": rsi,
+                "composite_score": composite,
+                "updated_at": datetime.utcnow(),
+            }
+
+            await db.sectors.update_one(
+                {"code": etf}, {"$set": sector_doc}, upsert=True
+            )
+            results.append(sector_doc)
+            print(f"  OK {etf}: price={price:.2f}, score={composite:.2f}")
+        except Exception as e:
+            print(f"  ERROR {etf}: {e}")
+            traceback.print_exc()
+
+    print(f"\nSECTOR REFRESH DONE: {len(results)} sectors")
+    return results
+
+async def fetch_and_analyze_stocks():
+    db = get_db()
+    print("=" * 50)
+    print("STARTING STOCKS REFRESH (BATCH)")
+    print("=" * 50)
+
+    sector_scores = {}
+    async for s in db.sectors.find():
+        sector_scores[s["code"]] = s.get("composite_score", 50)
+    print(f"Sector scores: {sector_scores}")
+
+    results = []
+    for sector_code, tickers in SECTOR_STOCKS.items():
+        print(f"\n--- Sector {sector_code}: {tickers} ---")
+        tickers_str = " ".join(tickers)
+
+        try:
+            batch_data = yf.download(
+                tickers_str,
+                period="3mo",
+                interval="1d",
+                group_by="ticker",
+                progress=False,
+                session=session,
+                threads=False
+            )
+            print(f"  Batch shape: {batch_data.shape}")
+        except Exception as e:
+            print(f"  BATCH ERROR {sector_code}: {e}")
+            traceback.print_exc()
+            continue
+
+        if batch_data.empty:
+            print(f"  EMPTY batch for {sector_code}")
+            continue
+
+        for ticker in tickers:
+            try:
+                try:
+                    close = batch_data[ticker]["Close"].dropna()
+                    volume = batch_data[ticker]["Volume"].dropna()
+                    high = batch_data[ticker]["High"].dropna()
+                    low = batch_data[ticker]["Low"].dropna()
+                except KeyError:
+                    print(f"    SKIP {ticker}: not in batch data")
+                    continue
+
+                if len(close) < 20:
+                    print(f"    SKIP {ticker}: only {len(close)} rows")
+                    continue
+
+                price = float(close.iloc[-1])
+                prev_close = float(close.iloc[-2])
+                change_pct = round(((price - prev_close) / prev_close) * 100, 2)
+                avg_vol = float(volume.rolling(20).mean().iloc[-1])
+                curr_vol = float(volume.iloc[-1])
+                rel_vol = round(curr_vol / avg_vol, 2) if avg_vol > 0 else 1
+
+                rsi = round(float(calc_rsi(close)), 2)
+                macd = calc_macd(close)
+                ema10 = round(float(calc_ema(close, 10)), 2)
+                ema20 = round(float(calc_ema(close, 20)), 2)
+                ema50 = round(float(calc_ema(close, 50)), 2)
+
+                poc, va_high, va_low = calc_volume_profile(high, low, volume)
+
+                stock_name = ticker
+
+                ind_data = {
+                    "price": price,
+                    "rsi": rsi,
+                    "macd_histogram": macd["histogram"],
+                    "ema10": ema10,
+                    "ema20": ema20,
+                    "ema50": ema50,
+                    "relative_volume": rel_vol,
+                    "poc_price": poc,
+                    "va_high": va_high,
+                    "change_pct": change_pct,
+                    "sector_strength": sector_scores.get(sector_code, 50),
+                }
+
+                setup_score = calc_setup_score(ind_data)
+                setup_type = detect_setup_type(ind_data)
+
+                asset_doc = {
+                    "ticker": ticker,
+                    "name": stock_name,
+                    "sector_code": sector_code,
+                    "price": round(price, 2),
+                    "change_pct": change_pct,
+                    "avg_volume": round(avg_vol, 0),
+                    "relative_volume": rel_vol,
+                    "rsi": rsi,
+                    "macd": macd,
+                    "ema10": ema10,
+                    "ema20": ema20,
+                    "ema50": ema50,
+                    "momentum_score": rsi,
+                    "volume_score": round(rel_vol * 30, 2),
+                    "poc_price": poc,
+                    "value_area_high": va_high,
+                    "value_area_low": va_low,
+                    "setup_score": setup_score,
+                    "setup_type": setup_type,
+                    "updated_at": datetime.utcnow(),
+                }
+
+                await db.assets.update_one(
+                    {"ticker": ticker}, {"$set": asset_doc}, upsert=True
+                )
+                results.append(asset_doc)
+                print(f"    OK {ticker}: ${price:.2f} score={setup_score} [{setup_type}]")
+            except Exception as e:
+                print(f"    ERROR {ticker}: {e}")
+
+    print(f"\nSTOCKS REFRESH DONE: {len(results)} stocks")
+    return results
