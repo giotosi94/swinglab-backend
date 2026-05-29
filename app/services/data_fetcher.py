@@ -7,7 +7,7 @@ from app.db.mongodb import get_db
 from app.config import settings
 import traceback
 
-FMP_BASE = "https://financialmodelingprep.com/api/v3"
+FMP_BASE = "https://financialmodelingprep.com/stable"
 
 SECTOR_MAP = {
     "XLK": "Technology",
