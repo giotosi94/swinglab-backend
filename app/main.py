@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 
 from app.db.mongodb import connect_db, close_db
-from app.routes import sectors, assets, scanner, targets
+from app.routes import sectors, assets, scanner, targets, data
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -15,7 +15,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="SwingLab API",
     description="Swing Trading Analysis & POC Scanner",
-    version="0.1.0",
+    version="0.2.0",
     lifespan=lifespan
 )
 
@@ -27,11 +27,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Routes
 app.include_router(sectors.router, prefix="/api/sectors", tags=["Sectors"])
 app.include_router(assets.router, prefix="/api/assets", tags=["Assets"])
 app.include_router(scanner.router, prefix="/api/scanner", tags=["Scanner"])
 app.include_router(targets.router, prefix="/api/targets", tags=["Targets"])
+app.include_router(data.router, prefix="/api/data", tags=["Data"])
 
 @app.get("/")
 def root():
@@ -39,7 +39,7 @@ def root():
         "app": "SwingLab",
         "description": "Swing Trading Analysis & POC Scanner",
         "status": "ok",
-        "version": "0.1.0"
+        "version": "0.2.0"
     }
 
 @app.get("/health")
