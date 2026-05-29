@@ -536,6 +536,12 @@ async def fetch_and_analyze_stocks():
                     ema20 = round(float(calc_ema(close, 20)), 2)
                     ema50 = round(float(calc_ema(close, 50)), 2)
                     poc_result = calc_volume_profile(high, low, volume)
+                    # 52-week high/low (from available data)
+                    high_52w = round(float(high.max()), 2)
+                    low_52w = round(float(low.min()), 2)
+                    pct_from_high = round(((price - high_52w) / high_52w) * 100, 2) if high_52w > 0 else 0
+                    pct_from_low = round(((price - low_52w) / low_52w) * 100, 2) if low_52w > 0 else 0
+                    range_position = round(((price - low_52w) / (high_52w - low_52w)) * 100, 1) if (high_52w - low_52w) > 0 else 50
                     poc = poc_result[0]
                     va_high = poc_result[1]
                     va_low = poc_result[2]
@@ -572,6 +578,11 @@ async def fetch_and_analyze_stocks():
                         "multi_tf_vp": multi_tf_vp,
                         "candlestick_patterns": patterns_list,
                         "pattern_bonus": pattern_bonus,
+                        "high_52w": high_52w,
+                        "low_52w": low_52w,
+                        "pct_from_high": pct_from_high,
+                        "pct_from_low": pct_from_low,
+                        "range_position": range_position,
                         "updated_at": datetime.utcnow(),
                     }
                     await db.assets.update_one({"ticker": ticker}, {"$set": asset_doc}, upsert=True)
