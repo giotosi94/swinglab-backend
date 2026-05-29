@@ -2,6 +2,7 @@ import yfinance as yf
 import numpy as np
 from datetime import datetime
 from app.db.mongodb import get_db
+import traceback
 
 SECTOR_MAP = {
     "XLK": "Technology",
@@ -58,56 +59,57 @@ def calc_macd(prices):
 def calc_volume_profile(df, bins=50):
     if df.empty or len(df) < 10:
         return None, None, None
+    try:
+        low_col = df["Low"]
+        high_col = df["High"]
+        vol_col = df["Volume"]
+        if hasattr(low_col, 'columns'):
+            low_col = low_col.iloc[:, 0]
+        if hasattr(high_col, 'columns'):
+            high_col = high_col.iloc[:, 0]
+        if hasattr(vol_col, 'columns'):
+            vol_col = vol_col.iloc[:, 0]
 
-    low_col = df["Low"]
-    high_col = df["High"]
-    vol_col = df["Volume"]
-    if hasattr(low_col, 'columns'):
-        low_col = low_col.iloc[:, 0]
-    if hasattr(high_col, 'columns'):
-        high_col = high_col.iloc[:, 0]
-    if hasattr(vol_col, 'columns'):
-        vol_col = vol_col.iloc[:, 0]
+        price_min = float(low_col.min())
+        price_max = float(high_col.max())
+        if price_max == price_min:
+            return None, None, None
 
-    price_min = float(low_col.min())
-    price_max = float(high_col.max())
-    if price_max == price_min:
+        bin_edges = np.linspace(price_min, price_max, bins + 1)
+        volume_per_level = np.zeros(bins)
+
+        for idx in range(len(df)):
+            row_low = float(low_col.iloc[idx])
+            row_high = float(high_col.iloc[idx])
+            row_vol = float(vol_col.iloc[idx])
+            spread_bins = max(1, int((row_high - row_low) / ((price_max - price_min) / bins)))
+            for i in range(bins):
+                if row_low <= bin_edges[i + 1] and row_high >= bin_edges[i]:
+                    volume_per_level[i] += row_vol / spread_bins
+
+        poc_idx = int(np.argmax(volume_per_level))
+        poc_price = round((bin_edges[poc_idx] + bin_edges[poc_idx + 1]) / 2, 2)
+
+        total_vol = volume_per_level.sum()
+        target_vol = total_vol * 0.70
+        sorted_indices = np.argsort(volume_per_level)[::-1]
+        cumulative = 0
+        va_indices = []
+        for idx in sorted_indices:
+            cumulative += volume_per_level[idx]
+            va_indices.append(idx)
+            if cumulative >= target_vol:
+                break
+
+        va_low = round(float(bin_edges[min(va_indices)]), 2)
+        va_high = round(float(bin_edges[max(va_indices) + 1]), 2)
+        return poc_price, va_high, va_low
+    except Exception as e:
+        print(f"Volume profile error: {e}")
         return None, None, None
-
-    bin_edges = np.linspace(price_min, price_max, bins + 1)
-    volume_per_level = np.zeros(bins)
-
-    for idx in range(len(df)):
-        row_low = float(low_col.iloc[idx])
-        row_high = float(high_col.iloc[idx])
-        row_vol = float(vol_col.iloc[idx])
-        spread_bins = max(1, int((row_high - row_low) / ((price_max - price_min) / bins)))
-        for i in range(bins):
-            if row_low <= bin_edges[i + 1] and row_high >= bin_edges[i]:
-                volume_per_level[i] += row_vol / spread_bins
-
-    poc_idx = int(np.argmax(volume_per_level))
-    poc_price = round((bin_edges[poc_idx] + bin_edges[poc_idx + 1]) / 2, 2)
-
-    total_vol = volume_per_level.sum()
-    target_vol = total_vol * 0.70
-    sorted_indices = np.argsort(volume_per_level)[::-1]
-    cumulative = 0
-    va_indices = []
-    for idx in sorted_indices:
-        cumulative += volume_per_level[idx]
-        va_indices.append(idx)
-        if cumulative >= target_vol:
-            break
-
-    va_low = round(float(bin_edges[min(va_indices)]), 2)
-    va_high = round(float(bin_edges[max(va_indices) + 1]), 2)
-
-    return poc_price, va_high, va_low
 
 def calc_setup_score(data):
     score = 0
-
     rsi = data.get("rsi", 50)
     if 40 <= rsi <= 60:
         score += 15
@@ -186,19 +188,36 @@ def detect_setup_type(data):
 
 async def fetch_and_analyze_sectors():
     db = get_db()
-    spy_data = yf.download("SPY", period="3mo", interval="1d", progress=False)
+    print("=" * 50)
+    print("STARTING SECTOR REFRESH")
+    print("=" * 50)
+
+    try:
+        spy_data = yf.download("SPY", period="3mo", interval="1d", progress=False)
+        print(f"SPY data shape: {spy_data.shape}")
+        print(f"SPY columns: {list(spy_data.columns)}")
+    except Exception as e:
+        print(f"CRITICAL - SPY download failed: {e}")
+        traceback.print_exc()
+        spy_data = None
+
     spy_return = 0
-    if not spy_data.empty and len(spy_data) >= 20:
+    if spy_data is not None and not spy_data.empty and len(spy_data) >= 20:
         spy_close = spy_data["Close"]
         if hasattr(spy_close, 'columns'):
             spy_close = spy_close.iloc[:, 0]
         spy_return = ((float(spy_close.iloc[-1]) / float(spy_close.iloc[-20])) - 1) * 100
+        print(f"SPY return 20d: {spy_return:.2f}%")
 
     results = []
     for etf, name in SECTOR_MAP.items():
         try:
+            print(f"\nFetching {etf} ({name})...")
             df = yf.download(etf, period="3mo", interval="1d", progress=False)
+            print(f"  {etf} data shape: {df.shape}")
+
             if df.empty or len(df) < 20:
+                print(f"  SKIP {etf}: not enough data ({len(df)} rows)")
                 continue
 
             close = df["Close"]
@@ -249,24 +268,33 @@ async def fetch_and_analyze_sectors():
                 {"code": etf}, {"$set": sector_doc}, upsert=True
             )
             results.append(sector_doc)
+            print(f"  OK {etf}: price={price:.2f}, composite={composite:.2f}")
         except Exception as e:
-            print(f"Error fetching {etf}: {e}")
+            print(f"  ERROR {etf}: {e}")
+            traceback.print_exc()
 
+    print(f"\nSECTOR REFRESH DONE: {len(results)} sectors")
     return results
 
 async def fetch_and_analyze_stocks():
     db = get_db()
+    print("=" * 50)
+    print("STARTING STOCKS REFRESH")
+    print("=" * 50)
 
     sector_scores = {}
     async for s in db.sectors.find():
         sector_scores[s["code"]] = s.get("composite_score", 50)
+    print(f"Sector scores loaded: {sector_scores}")
 
     results = []
     for sector_code, tickers in SECTOR_STOCKS.items():
         for ticker in tickers:
             try:
                 df = yf.download(ticker, period="3mo", interval="1d", progress=False)
+
                 if df.empty or len(df) < 20:
+                    print(f"  SKIP {ticker}: not enough data")
                     continue
 
                 close = df["Close"]
@@ -291,11 +319,12 @@ async def fetch_and_analyze_stocks():
 
                 poc, va_high, va_low = calc_volume_profile(df)
 
+                stock_name = ticker
                 try:
                     info = yf.Ticker(ticker).info
                     stock_name = info.get("shortName", ticker)
                 except Exception:
-                    stock_name = ticker
+                    pass
 
                 ind_data = {
                     "price": price,
@@ -341,8 +370,10 @@ async def fetch_and_analyze_stocks():
                     {"ticker": ticker}, {"$set": asset_doc}, upsert=True
                 )
                 results.append(asset_doc)
-                print(f"✅ {ticker} - score: {setup_score} - {setup_type}")
+                print(f"  OK {ticker}: score={setup_score}, type={setup_type}")
             except Exception as e:
-                print(f"❌ Error {ticker}: {e}")
+                print(f"  ERROR {ticker}: {e}")
+                traceback.print_exc()
 
+    print(f"\nSTOCKS REFRESH DONE: {len(results)} stocks")
     return results
