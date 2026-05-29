@@ -41,8 +41,8 @@ SECTOR_STOCKS = {
 async def fetch_fmp(client, symbol):
     from_date = (datetime.now() - timedelta(days=100)).strftime("%Y-%m-%d")
     to_date = datetime.now().strftime("%Y-%m-%d")
-    url = f"{FMP_BASE}/historical-price-full/{symbol}"
-    params = {"from": from_date, "to": to_date, "apikey": settings.FMP_API_KEY}
+    url = f"{FMP_BASE}/historical-price-eod/full"
+    params = {"symbol": symbol, "from": from_date, "to": to_date, "apikey": settings.FMP_API_KEY}
     try:
         r = await client.get(url, params=params)
         if r.status_code != 200:
@@ -66,8 +66,8 @@ async def fetch_fmp_batch(client, symbols):
     from_date = (datetime.now() - timedelta(days=100)).strftime("%Y-%m-%d")
     to_date = datetime.now().strftime("%Y-%m-%d")
     symbols_str = ",".join(symbols)
-    url = f"{FMP_BASE}/historical-price-full/{symbols_str}"
-    params = {"from": from_date, "to": to_date, "apikey": settings.FMP_API_KEY}
+    url = f"{FMP_BASE}/historical-price-eod/full"
+    params = {"symbol": symbols_str, "from": from_date, "to": to_date, "apikey": settings.FMP_API_KEY}
     try:
         r = await client.get(url, params=params)
         if r.status_code != 200:
