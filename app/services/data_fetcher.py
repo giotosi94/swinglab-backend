@@ -182,7 +182,8 @@ def calc_volume_profile(highs, lows, volumes, bins=50):
             row_vol = float(volumes.iloc[idx])
             spread = max(1, int((row_high - row_low) / ((price_max - price_min) / bins)))
             for i in range(bins):
-                if row_low <= bin_edges[i + 1] and row_high >= bin_edgesvolume_per_level[i] += row_vol / spread
+                if row_low <= bin_edges[i + 1] and row_high >= bin_edges[i]:
+                    volume_per_level[i] += row_vol / spread
 
         poc_idx = int(np.argmax(volume_per_level))
         poc_price = round((bin_edges[poc_idx] + bin_edges[poc_idx + 1]) / 2, 2)
