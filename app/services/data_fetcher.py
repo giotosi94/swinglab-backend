@@ -274,12 +274,12 @@ def calc_macd(prices):
     }
 
 
-def calc_volume_profile(highs, lows, volumes, bins=50):
+def calc_volume_profile(highs, lows, volumes, bins=30):
     try:
         price_min = float(lows.min())
         price_max = float(highs.max())
         if price_max <= price_min:
-            return None, None, None
+            return None, None, None, []
         bin_edges = np.linspace(price_min, price_max, bins + 1)
         volume_per_level = np.zeros(bins)
         for idx in range(len(highs)):
@@ -304,9 +304,45 @@ def calc_volume_profile(highs, lows, volumes, bins=50):
                 break
         va_low = round(float(bin_edges[min(va_indices)]), 2)
         va_high = round(float(bin_edges[max(va_indices) + 1]), 2)
-        return poc_price, va_high, va_low
+
+        # Build distribution for frontend chart
+        max_vol = float(volume_per_level.max()) if volume_per_level.max() > 0 else 1
+        distribution = []
+        for i in range(bins):
+            price_level = round((bin_edges[i] + bin_edges[i + 1]) / 2, 2)
+            vol_pct = round(float(volume_per_level[i] / max_vol * 100), 1)
+            is_poc = i == poc_idx
+            in_va = i in va_indices
+            distribution.append({
+                "price": price_level,
+                "volume_pct": vol_pct,
+                "is_poc": is_poc,
+                "in_value_area": in_va,
+            })
+        return poc_price, va_high, va_low, distribution
     except Exception:
-        return None, None, None
+        return None, None, None, []
+
+
+def calc_multi_tf_vp(df):
+    """Calculate Volume Profile for multiple timeframes"""
+    results = {}
+    for label, days in [("short", 20), ("medium", 50), ("full", len(df))]:
+        subset = df.tail(days)
+        if len(subset) < 10:
+            continue
+        poc, va_h, va_l, dist = calc_volume_profile(
+            subset["High"], subset["Low"], subset["Volume"], bins=30
+        )
+        if poc:
+            results[label] = {
+                "period_days": days,
+                "poc": poc,
+                "va_high": va_h,
+                "va_low": va_l,
+                "distribution": dist,
+            }
+    return results
 
 
 def calc_setup_score(data):
@@ -499,7 +535,14 @@ async def fetch_and_analyze_stocks():
                     ema10 = round(float(calc_ema(close, 10)), 2)
                     ema20 = round(float(calc_ema(close, 20)), 2)
                     ema50 = round(float(calc_ema(close, 50)), 2)
-                    poc, va_high, va_low = calc_volume_profile(high, low, volume)
+                    poc_result = calc_volume_profile(high, low, volume)
+                    poc = poc_result[0]
+                    va_high = poc_result[1]
+                    va_low = poc_result[2]
+                    vp_distribution = poc_result[3]
+
+                    # Multi-timeframe VP
+                    multi_tf_vp = calc_multi_tf_vp(df)
 
                     # Candlestick patterns
                     patterns = detect_candlestick_patterns(df)
@@ -525,6 +568,8 @@ async def fetch_and_analyze_stocks():
                         "momentum_score": rsi, "volume_score": round(rel_vol * 30, 2),
                         "poc_price": poc, "value_area_high": va_high, "value_area_low": va_low,
                         "setup_score": setup_score, "setup_type": setup_type,
+                        "vp_distribution": vp_distribution,
+                        "multi_tf_vp": multi_tf_vp,
                         "candlestick_patterns": patterns_list,
                         "pattern_bonus": pattern_bonus,
                         "updated_at": datetime.utcnow(),
