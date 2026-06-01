@@ -1,5 +1,6 @@
 from fastapi import APIRouter
 from app.services.data_fetcher import fetch_and_analyze_sectors, fetch_and_analyze_stocks
+from app.services.stock_search import search_and_analyze_stock
 
 router = APIRouter()
 
@@ -22,3 +23,10 @@ async def refresh_all():
         "sectors": len(sectors),
         "stocks": len(stocks),
     }
+
+@router.get("/search/{ticker}")
+async def search_stock(ticker: str):
+    result = await search_and_analyze_stock(ticker.upper())
+    if result:
+        return result
+    return {"error": f"Could not find data for {ticker.upper()}"}
