@@ -1,7 +1,7 @@
 from fastapi import APIRouter
 from app.services.data_fetcher import fetch_and_analyze_sectors, fetch_and_analyze_stocks
 from app.services.stock_search import search_and_analyze_stock
-from app.services.notifications import send_daily_briefing, send_telegram
+from app.services.telegram_bot import send_daily_briefing, send_telegram
 
 router = APIRouter()
 
