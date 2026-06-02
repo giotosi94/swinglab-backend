@@ -39,3 +39,9 @@ async def get_regime():
     if spy:
         spy["_id"] = str(spy["_id"])
     return spy or {"error": "No regime data"}
+
+@router.post("/notify")
+async def send_notifications():
+    from app.services.notifications import check_and_notify
+    result = await check_and_notify()
+    return result
