@@ -1,6 +1,7 @@
 from fastapi import APIRouter
 from app.services.data_fetcher import fetch_and_analyze_sectors, fetch_and_analyze_stocks
 from app.services.stock_search import search_and_analyze_stock
+from app.services.notifications import send_daily_briefing, send_telegram
 
 router = APIRouter()
 
@@ -31,17 +32,14 @@ async def search_stock(ticker: str):
         return result
     return {"error": f"Could not find data for {ticker.upper()}"}
 
-@router.get("/regime")
-async def get_regime():
-    from app.db.mongodb import get_db
-    db = get_db()
-    spy = await db.market_regime.find_one({"symbol": "SPY"})
-    if spy:
-        spy["_id"] = str(spy["_id"])
-    return spy or {"error": "No regime data"}
-
 @router.post("/notify")
 async def send_notifications():
-    from app.services.notifications import check_and_notify
-    result = await check_and_notify()
-    return result
+    msg = await send_daily_briefing()
+    if msg:
+        return {"message": "Notification sent", "preview": msg[:200]}
+    return {"error": "Failed to send notification"}
+
+@router.post("/notify/test")
+async def test_notification():
+    ok = await send_telegram("SwingLab test notification - everything works!")
+    return {"message": "Test sent" if ok else "Failed"}
