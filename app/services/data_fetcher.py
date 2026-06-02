@@ -485,6 +485,56 @@ async def fetch_and_analyze_sectors():
                 else:
                     trend = 30
                 composite = round((strength * 2 + trend + rsi) / 4, 2)
+                # Build daily history with indicators
+                history = []
+                rsi_series = pd.Series(dtype=float)
+                delta = close.diff()
+                gain = delta.where(delta > 0, 0).rolling(window=14).mean()
+                loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+                rs = gain / loss
+                rsi_series = 100 - (100 / (1 + rs))
+
+                ema10_series = close.ewm(span=10, adjust=False).mean()
+                ema20_series = close.ewm(span=20, adjust=False).mean()
+                ema50_series = close.ewm(span=50, adjust=False).mean()
+
+                for idx in range(20, len(df)):
+                    day_close = float(close.iloc[idx])
+                    day_rsi = float(rsi_series.iloc[idx]) if not pd.isna(rsi_series.iloc[idx]) else 50
+                    day_ema10 = float(ema10_series.iloc[idx])
+                    day_ema20 = float(ema20_series.iloc[idx])
+                    day_ema50 = float(ema50_series.iloc[idx])
+                    day_vol = float(volume.iloc[idx])
+                    avg_vol_20 = float(volume.iloc[max(0,idx-20):idx].mean())
+                    day_rvol = round(day_vol / avg_vol_20, 2) if avg_vol_20 > 0 else 1
+
+                    # Daily health
+                    day_trend = 90 if day_close > day_ema10 > day_ema20 > day_ema50 else (70 if day_close > day_ema20 > day_ema50 else (50 if day_close > day_ema50 else 30))
+
+                    # Zone
+                    if day_rsi <= 30:
+                        zone = "oversold"
+                    elif day_rsi <= 40:
+                        zone = "weak"
+                    elif day_rsi >= 70:
+                        zone = "overbought"
+                    elif day_rsi >= 60:
+                        zone = "strong"
+                    else:
+                        zone = "neutral"
+
+                    history.append({
+                        "date": df.index[idx].strftime("%Y-%m-%d") if hasattr(df.index[idx], 'strftime') else str(df["datetime"].iloc[idx])[:10] if "datetime" in df.columns else f"day_{idx}",
+                        "close": round(day_close, 2),
+                        "rsi": round(day_rsi, 1),
+                        "ema10": round(day_ema10, 2),
+                        "ema20": round(day_ema20, 2),
+                        "ema50": round(day_ema50, 2),
+                        "rvol": day_rvol,
+                        "trend": day_trend,
+                        "zone": zone,
+                    })
+
                 sector_doc = {
                     "code": etf, "name": name, "etf_ticker": etf,
                     "price": round(price, 2),
@@ -492,6 +542,7 @@ async def fetch_and_analyze_sectors():
                     "strength_score": strength, "trend_score": trend,
                     "volume_score": round(rel_vol * 30, 2),
                     "rsi": rsi, "composite_score": composite,
+                    "history": history,
                     "updated_at": datetime.utcnow(),
                 }
                 await db.sectors.update_one({"code": etf}, {"$set": sector_doc}, upsert=True)
