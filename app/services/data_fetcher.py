@@ -455,6 +455,32 @@ async def fetch_and_analyze_sectors():
         else:
             print("WARNING: SPY not available")
         results = []
+        # Save SPY data for market regime
+        if spy_df is not None and len(spy_df) >= 50:
+            spy_close = spy_df["Close"]
+            spy_ema20 = float(spy_close.ewm(span=20, adjust=False).mean().iloc[-1])
+            spy_ema50 = float(spy_close.ewm(span=50, adjust=False).mean().iloc[-1])
+            spy_ema200 = float(spy_close.ewm(span=50, adjust=False).mean().iloc[-1])  # approx with 50 data
+            spy_rsi_delta = spy_close.diff()
+            spy_gain = spy_rsi_delta.where(spy_rsi_delta > 0, 0).rolling(14).mean()
+            spy_loss = (-spy_rsi_delta.where(spy_rsi_delta < 0, 0)).rolling(14).mean()
+            spy_rs = spy_gain / spy_loss
+            spy_rsi_val = float((100 - (100 / (1 + spy_rs))).iloc[-1])
+            spy_price = float(spy_close.iloc[-1])
+            spy_change = float(((spy_close.iloc[-1] / spy_close.iloc[-2]) - 1) * 100)
+
+            spy_doc = {
+                "symbol": "SPY",
+                "price": round(spy_price, 2),
+                "change_pct": round(spy_change, 2),
+                "ema20": round(spy_ema20, 2),
+                "ema50": round(spy_ema50, 2),
+                "rsi": round(spy_rsi_val, 1),
+                "return_20d": round(spy_return, 2),
+                "updated_at": datetime.utcnow(),
+            }
+            await db.market_regime.update_one({"symbol": "SPY"}, {"$set": spy_doc}, upsert=True)
+            print(f"SPY regime saved: ${spy_price:.2f}, RSI {spy_rsi_val:.1f}")
         for etf, name in SECTOR_MAP.items():
             try:
                 await asyncio.sleep(8)
