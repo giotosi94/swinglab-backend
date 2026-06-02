@@ -30,3 +30,12 @@ async def search_stock(ticker: str):
     if result:
         return result
     return {"error": f"Could not find data for {ticker.upper()}"}
+
+@router.get("/regime")
+async def get_regime():
+    from app.db.mongodb import get_db
+    db = get_db()
+    spy = await db.market_regime.find_one({"symbol": "SPY"})
+    if spy:
+        spy["_id"] = str(spy["_id"])
+    return spy or {"error": "No regime data"}
