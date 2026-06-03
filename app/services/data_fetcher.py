@@ -938,6 +938,31 @@ async def fetch_and_analyze_stocks():
                     fvgs = detect_fvg(df)
                     wyckoff = detect_wyckoff_phase(df)
                     accumulation = calc_accumulation_score(df, poc, va_low, va_high)
+                    # Build price history for charts
+                    rsi_series = pd.Series(dtype=float)
+                    delta_s = close.diff()
+                    gain_s = delta_s.where(delta_s > 0, 0).rolling(window=14).mean()
+                    loss_s = (-delta_s.where(delta_s < 0, 0)).rolling(window=14).mean()
+                    rs_s = gain_s / loss_s
+                    rsi_series = 100 - (100 / (1 + rs_s))
+                    ema10_s = close.ewm(span=10, adjust=False).mean()
+                    ema20_s = close.ewm(span=20, adjust=False).mean()
+                    ema50_s = close.ewm(span=50, adjust=False).mean()
+
+                    price_history = []
+                    for idx in range(20, len(df)):
+                        day_rsi = float(rsi_series.iloc[idx]) if not pd.isna(rsi_series.iloc[idx]) else 50
+                        price_history.append({
+                            "date": str(df.iloc[idx].name)[:10] if hasattr(df.iloc[idx].name, 'strftime') else df["datetime"].iloc[idx].strftime("%Y-%m-%d") if "datetime" in df.columns else "d{}".format(idx),
+                            "close": round(float(close.iloc[idx]), 2),
+                            "high": round(float(high.iloc[idx]), 2),
+                            "low": round(float(low.iloc[idx]), 2),
+                            "volume": int(volume.iloc[idx]),
+                            "rsi": round(day_rsi, 1),
+                            "ema10": round(float(ema10_s.iloc[idx]), 2),
+                            "ema20": round(float(ema20_s.iloc[idx]), 2),
+                            "ema50": round(float(ema50_s.iloc[idx]), 2),
+                        })
                     pattern_bonus = get_pattern_score_bonus(patterns)
                     patterns_list = [{"name": p["name"], "type": p["type"], "strength": p["strength"], "description": p["description"]} for p in patterns]
 
@@ -966,6 +991,7 @@ async def fetch_and_analyze_stocks():
                         "fvg": fvgs,
                         "wyckoff": wyckoff,
                         "accumulation": accumulation,
+                        "price_history": price_history,
                         "pattern_bonus": pattern_bonus,
                         "high_52w": high_52w,
                         "low_52w": low_52w,
