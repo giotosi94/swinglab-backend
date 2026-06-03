@@ -24,7 +24,7 @@ async def search_and_analyze_stock(ticker):
         params = {
             "symbol": ticker,
             "interval": "1day",
-            "outputsize": 70,
+            "outputsize": 252,
             "apikey": settings.TWELVEDATA_API_KEY,
         }
         try:
