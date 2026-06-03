@@ -191,7 +191,33 @@ async def run_auto_trader():
                 confluence += 0.5
 
             # Filter conditions
-            if confluence < 6:
+            # Wyckoff bonus
+            wyckoff = a.get("wyckoff", {})
+            wyckoff_signal = wyckoff.get("signal", "neutral")
+            accum_score = a.get("accumulation", {}).get("score", 0)
+
+            if wyckoff_signal in ("strong_bullish", "bullish_soon"):
+                confluence += 1.5
+            elif wyckoff_signal == "bullish":
+                confluence += 0.5
+            elif wyckoff_signal in ("bearish", "bearish_soon"):
+                confluence -= 2
+
+            # Accumulation bonus
+            if accum_score >= 70:
+                confluence += 1
+            elif accum_score >= 40:
+                confluence += 0.5
+
+            # FVG bonus - price near a bullish FVG
+            fvgs = a.get("fvg", [])
+            bullish_fvgs = [f for f in fvgs if f.get("type") == "bullish"]
+            for fvg in bullish_fvgs:
+                if fvg["bottom"] <= price <= fvg["top"]:
+                    confluence += 1
+                    break
+
+            if confluence < 5.5:
                 continue
             if rsi > 65 or rsi < 25:
                 continue
