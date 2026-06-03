@@ -54,7 +54,7 @@ async def fetch_td(client, symbol):
     params = {
         "symbol": symbol,
         "interval": "1day",
-        "outputsize": 70,
+        "outputsize": 252,
         "apikey": settings.TWELVEDATA_API_KEY,
     }
     try:
