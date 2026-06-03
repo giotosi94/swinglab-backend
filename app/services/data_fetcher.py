@@ -82,6 +82,300 @@ async def fetch_td(client, symbol):
         print(f"  {symbol} error: {e}")
         return None
 
+# ============================================
+# FAIR VALUE GAP (FVG) DETECTION
+# ============================================
+
+def detect_fvg(df):
+    """Detect Fair Value Gaps - inefficiency zones"""
+    if df is None or len(df) < 3:
+        return []
+
+    fvgs = []
+    high = df["High"].values
+    low = df["Low"].values
+    close = df["Close"].values
+
+    for i in range(2, len(df)):
+        # Bullish FVG: candle 3 low > candle 1 high (gap up)
+        if low[i] > high[i-2]:
+            fvg_top = float(low[i])
+            fvg_bottom = float(high[i-2])
+            fvg_size = fvg_top - fvg_bottom
+            mid_price = (fvg_top + fvg_bottom) / 2
+            # Check if FVG has been filled
+            filled = False
+            for j in range(i+1, len(df)):
+                if low[j] <= fvg_bottom:
+                    filled = True
+                    break
+            if not filled and fvg_size > 0:
+                fvgs.append({
+                    "type": "bullish",
+                    "top": round(fvg_top, 2),
+                    "bottom": round(fvg_bottom, 2),
+                    "mid": round(mid_price, 2),
+                    "size_pct": round((fvg_size / mid_price) * 100, 2),
+                    "age_days": len(df) - i,
+                    "filled": False,
+                })
+
+        # Bearish FVG: candle 3 high < candle 1 low (gap down)
+        if high[i] < low[i-2]:
+            fvg_top = float(low[i-2])
+            fvg_bottom = float(high[i])
+            fvg_size = fvg_top - fvg_bottom
+            mid_price = (fvg_top + fvg_bottom) / 2
+            filled = False
+            for j in range(i+1, len(df)):
+                if high[j] >= fvg_top:
+                    filled = True
+                    break
+            if not filled and fvg_size > 0:
+                fvgs.append({
+                    "type": "bearish",
+                    "top": round(fvg_top, 2),
+                    "bottom": round(fvg_bottom, 2),
+                    "mid": round(mid_price, 2),
+                    "size_pct": round((fvg_size / mid_price) * 100, 2),
+                    "age_days": len(df) - i,
+                    "filled": False,
+                })
+
+    # Keep only recent unfilled FVGs (last 5)
+    return sorted(fvgs, key=lambda x: x["age_days"])[:5]
+
+
+# ============================================
+# WYCKOFF PHASE DETECTION
+# ============================================
+
+def detect_wyckoff_phase(df):
+    """Detect Wyckoff market phase from daily data"""
+    if df is None or len(df) < 30:
+        return {"phase": "unknown", "description": "Not enough data"}
+
+    close = df["Close"].values
+    volume = df["Volume"].values
+    high = df["High"].values
+    low = df["Low"].values
+
+    n = len(df)
+    current_price = float(close[-1])
+
+    # Recent periods
+    last_20_close = close[-20:]
+    last_20_vol = volume[-20:]
+    last_10_close = close[-10:]
+    last_10_vol = volume[-10:]
+    prev_20_close = close[-40:-20] if n >= 40 else close[:20]
+    prev_20_vol = volume[-40:-20] if n >= 40 else volume[:20]
+
+    # Calculations
+    avg_vol_recent = float(np.mean(last_20_vol))
+    avg_vol_prev = float(np.mean(prev_20_vol)) if len(prev_20_vol) > 0 else avg_vol_recent
+    vol_change = (avg_vol_recent - avg_vol_prev) / avg_vol_prev * 100 if avg_vol_prev > 0 else 0
+
+    price_range_20 = (float(max(last_20_close)) - float(min(last_20_close))) / float(np.mean(last_20_close)) * 100
+    price_change_20 = (float(last_20_close[-1]) - float(last_20_close[0])) / float(last_20_close[0]) * 100
+    price_change_10 = (float(last_10_close[-1]) - float(last_10_close[0])) / float(last_10_close[0]) * 100
+
+    # Trend direction
+    ema20 = float(pd.Series(close).ewm(span=20).mean().iloc[-1])
+    ema50 = float(pd.Series(close).ewm(span=50).mean().iloc[-1])
+
+    # Volume trend in last 10 days
+    vol_trend_10 = (float(np.mean(last_10_vol)) - float(np.mean(last_20_vol[:10]))) / float(np.mean(last_20_vol[:10])) * 100 if float(np.mean(last_20_vol[:10])) > 0 else 0
+
+    # Higher lows detection (accumulation sign)
+    lows_5 = [float(min(low[max(0,i-5):i+1])) for i in range(n-20, n, 5)]
+    higher_lows = all(lows_5[i] >= lows_5[i-1] for i in range(1, len(lows_5))) if len(lows_5) >= 2 else False
+
+    # Lower highs detection (distribution sign)
+    highs_5 = [float(max(high[max(0,i-5):i+1])) for i in range(n-20, n, 5)]
+    lower_highs = all(highs_5[i] <= highs_5[i-1] for i in range(1, len(highs_5))) if len(highs_5) >= 2 else False
+
+    # Phase detection
+    phase = "unknown"
+    confidence = 0
+    description = ""
+    signal = "neutral"
+
+    # ACCUMULATION: price range tight, volume decreasing, near lows, higher lows forming
+    if price_range_20 < 10 and current_price < ema50 and higher_lows:
+        phase = "accumulation"
+        confidence = 70
+        if vol_change < -10:
+            confidence += 15
+        if price_change_10 > 0:
+            confidence += 10
+        description = "Price consolidating near lows with higher lows forming. Smart money may be accumulating. Volume is {}. Watch for breakout above range.".format("decreasing (bullish)" if vol_change < 0 else "increasing")
+        signal = "bullish_soon"
+
+    # MARKUP: price rising, above EMAs, volume confirming
+    elif price_change_20 > 5 and current_price > ema20 > ema50:
+        phase = "markup"
+        confidence = 75
+        if vol_change > 10:
+            confidence += 10
+        if price_change_10 > 2:
+            confidence += 10
+        description = "Strong uptrend. Price above EMA20 and EMA50. Trend is confirmed by {}. Look for pullbacks to EMA20 for entries.".format("increasing volume" if vol_change > 0 else "momentum")
+        signal = "bullish"
+
+    # DISTRIBUTION: price range tight near highs, volume increasing, lower highs
+    elif price_range_20 < 10 and current_price > ema50 and lower_highs:
+        phase = "distribution"
+        confidence = 65
+        if vol_change > 15:
+            confidence += 15
+        description = "Price consolidating near highs with lower highs forming. Smart money may be distributing. Watch for breakdown below range."
+        signal = "bearish_soon"
+
+    # MARKDOWN: price falling, below EMAs
+    elif price_change_20 < -5 and current_price < ema20 and current_price < ema50:
+        phase = "markdown"
+        confidence = 75
+        if vol_change > 10:
+            confidence += 10
+        description = "Downtrend. Price below EMA20 and EMA50. Avoid buying until accumulation phase begins. Watch for selling climax (volume spike + strong reversal)."
+        signal = "bearish"
+
+    # SPRING (Wyckoff): false breakdown then recovery (accumulation phase C)
+    elif n >= 10:
+        recent_low = float(min(low[-10:]))
+        prev_low = float(min(low[-30:-10])) if n >= 30 else float(min(low[:20]))
+        if recent_low < prev_low and price_change_10 > 3:
+            phase = "spring"
+            confidence = 60
+            if vol_change > 20:
+                confidence += 15
+            description = "Potential Wyckoff Spring! Price broke below support then recovered strongly. This is often a bear trap before a significant move up."
+            signal = "strong_bullish"
+
+    # SELLING CLIMAX: huge volume + big drop
+    elif n >= 5:
+        last_5_vol_avg = float(np.mean(volume[-5:]))
+        overall_vol_avg = float(np.mean(volume[-30:])) if n >= 30 else float(np.mean(volume))
+        vol_spike = last_5_vol_avg / overall_vol_avg if overall_vol_avg > 0 else 1
+        if vol_spike > 2 and price_change_10 < -8:
+            phase = "selling_climax"
+            confidence = 55
+            description = "Potential Selling Climax! Extreme volume with sharp price drop. This often marks the end of a downtrend. Watch for reversal patterns."
+            signal = "reversal_possible"
+
+    else:
+        phase = "transition"
+        confidence = 30
+        description = "Market is in transition. No clear Wyckoff phase detected. Wait for clearer signals."
+        signal = "neutral"
+
+    confidence = min(confidence, 95)
+
+    return {
+        "phase": phase,
+        "confidence": confidence,
+        "description": description,
+        "signal": signal,
+        "metrics": {
+            "price_change_20d": round(price_change_20, 2),
+            "price_change_10d": round(price_change_10, 2),
+            "price_range_20d": round(price_range_20, 2),
+            "vol_change_pct": round(vol_change, 2),
+            "higher_lows": higher_lows,
+            "lower_highs": lower_highs,
+            "above_ema20": current_price > ema20,
+            "above_ema50": current_price > ema50,
+        }
+    }
+
+
+# ============================================
+# ACCUMULATION SCORE
+# ============================================
+
+def calc_accumulation_score(df, poc_price, va_low, va_high):
+    """Score how likely smart money is accumulating"""
+    if df is None or len(df) < 20:
+        return {"score": 0, "level": "unknown", "factors": []}
+
+    close = df["Close"].values
+    volume = df["Volume"].values
+    low = df["Low"].values
+
+    current_price = float(close[-1])
+    factors = []
+    score = 0
+
+    # 1. Price below POC (+25) - buying below fair value
+    if poc_price and current_price < poc_price:
+        dist = abs(current_price - poc_price) / poc_price * 100
+        if dist <= 5:
+            score += 25
+            factors.append({"name": "Below POC", "score": 25, "detail": "Price {:.1f}% below POC - buying zone".format(dist), "pass": True})
+        elif dist <= 15:
+            score += 15
+            factors.append({"name": "Below POC", "score": 15, "detail": "Price {:.1f}% below POC".format(dist), "pass": True})
+        else:
+            factors.append({"name": "Below POC", "score": 0, "detail": "Price {:.1f}% below POC - too far".format(dist), "pass": False})
+    else:
+        factors.append({"name": "Below POC", "score": 0, "detail": "Price above POC", "pass": False})
+
+    # 2. Near or below VA Low (+20) - deep value
+    if va_low and current_price <= va_low * 1.02:
+        score += 20
+        factors.append({"name": "Near VA Low", "score": 20, "detail": "Price near/below Value Area Low", "pass": True})
+    else:
+        factors.append({"name": "Near VA Low", "score": 0, "detail": "Price above VA Low", "pass": False})
+
+    # 3. Volume pattern: decreasing vol = accumulation (+15)
+    if len(volume) >= 20:
+        vol_first_half = float(np.mean(volume[-20:-10]))
+        vol_second_half = float(np.mean(volume[-10:]))
+        if vol_first_half > 0:
+            vol_decrease = (vol_second_half - vol_first_half) / vol_first_half * 100
+            if vol_decrease < -15:
+                score += 15
+                factors.append({"name": "Volume Decreasing", "score": 15, "detail": "Volume down {:.0f}% - typical accumulation".format(vol_decrease), "pass": True})
+            else:
+                factors.append({"name": "Volume Decreasing", "score": 0, "detail": "Volume change {:.0f}%".format(vol_decrease), "pass": False})
+
+    # 4. Higher lows in last 20 days (+20)
+    lows_weekly = []
+    for i in range(0, min(20, len(low)), 5):
+        end = min(i + 5, len(low))
+        if end > i:
+            lows_weekly.append(float(min(low[-end:][:5] if end <= len(low) else low[-5:])))
+    if len(lows_weekly) >= 3:
+        hl = all(lows_weekly[j] >= lows_weekly[j-1] * 0.99 for j in range(1, len(lows_weekly)))
+        if hl:
+            score += 20
+            factors.append({"name": "Higher Lows", "score": 20, "detail": "Forming higher lows - accumulation pattern", "pass": True})
+        else:
+            factors.append({"name": "Higher Lows", "score": 0, "detail": "No higher lows pattern", "pass": False})
+
+    # 5. Tight range (consolidation) (+10)
+    if len(close) >= 10:
+        range_pct = (float(max(close[-10:])) - float(min(close[-10:]))) / float(np.mean(close[-10:])) * 100
+        if range_pct < 8:
+            score += 10
+            factors.append({"name": "Tight Range", "score": 10, "detail": "Price range {:.1f}% - consolidation".format(range_pct), "pass": True})
+        else:
+            factors.append({"name": "Tight Range", "score": 0, "detail": "Price range {:.1f}%".format(range_pct), "pass": False})
+
+    # 6. POC recovery direction (+10)
+    if poc_price and len(close) >= 5:
+        approaching = float(close[-1]) > float(close[-5]) and current_price < poc_price
+        if approaching:
+            score += 10
+            factors.append({"name": "Approaching POC", "score": 10, "detail": "Price moving toward POC - recovery", "pass": True})
+        else:
+            factors.append({"name": "Approaching POC", "score": 0, "detail": "Not approaching POC", "pass": False})
+
+    score = min(score, 100)
+    level = "strong" if score >= 70 else "moderate" if score >= 40 else "weak" if score >= 20 else "none"
+
+    return {"score": score, "level": level, "factors": factors}
 
 # ============================================
 # CANDLESTICK PATTERN DETECTION
@@ -640,6 +934,10 @@ async def fetch_and_analyze_stocks():
 
                     # Candlestick patterns
                     patterns = detect_candlestick_patterns(df)
+                    # Advanced analysis
+                    fvgs = detect_fvg(df)
+                    wyckoff = detect_wyckoff_phase(df)
+                    accumulation = calc_accumulation_score(df, poc, va_low, va_high)
                     pattern_bonus = get_pattern_score_bonus(patterns)
                     patterns_list = [{"name": p["name"], "type": p["type"], "strength": p["strength"], "description": p["description"]} for p in patterns]
 
@@ -665,6 +963,9 @@ async def fetch_and_analyze_stocks():
                         "vp_distribution": vp_distribution,
                         "multi_tf_vp": multi_tf_vp,
                         "candlestick_patterns": patterns_list,
+                        "fvg": fvgs,
+                        "wyckoff": wyckoff,
+                        "accumulation": accumulation,
                         "pattern_bonus": pattern_bonus,
                         "high_52w": high_52w,
                         "low_52w": low_52w,
