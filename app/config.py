@@ -6,6 +6,9 @@ class Settings(BaseSettings):
     TWELVEDATA_API_KEY: str = ""
     TELEGRAM_BOT_TOKEN: str = ""
     TELEGRAM_CHAT_ID: str = ""
+    ALPACA_API_KEY: str = ""
+    ALPACA_SECRET_KEY: str = ""
+    ALPACA_PAPER: bool = True
 
     class Config:
         env_file = ".env"
