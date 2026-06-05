@@ -25,7 +25,7 @@ SECTOR_MAP = {
 
 SECTOR_STOCKS = {
     "XLK": ["AAPL", "MSFT", "NVDA", "AVGO", "AMD", "CRM", "ADBE", "INTC", "CSCO", "ORCL",
-            "PLTR", "NOW", "SNOW", "CRWD", "PANW"],
+            "PLTR", "NOW", "SNOW", "CRWD", "PANW", "MNDY"],
     "XLF": ["JPM", "BAC", "WFC", "GS", "MS", "BLK", "SCHW", "AXP", "C", "USB",
             "V", "MA", "PYPL", "COF", "ICE"],
     "XLV": ["UNH", "JNJ", "PFE", "ABBV", "MRK", "TMO", "ABT", "LLY", "BMY", "AMGN",
