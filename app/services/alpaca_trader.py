@@ -39,7 +39,8 @@ async def get_positions():
 
 
 async def get_orders(status="all", limit=50):
-    return await alpaca_request("GET", "{}/v2/orders?status={}&limit={}&direction=desc".format(ALPACA_BASE, status, limit))
+    url = "{}/v2/orders?status={}&limit={}&direction=desc".format(ALPACA_BASE, status, limit)
+    return await alpaca_request("GET", url)
 
 
 async def place_order(symbol, qty, side, order_type="market", time_in_force="day", limit_price=None, stop_price=None):
@@ -113,7 +114,8 @@ async def get_latest_price(symbol):
 
 
 async def get_portfolio_history(period="1M", timeframe="1D"):
-    return await alpaca_request("GET", "{}/v2/account/portfolio/history?period={}&timeframe={}".format(ALPACA_BASE, period, timeframe))
+    url = "{}/v2/account/portfolio/history?period={}&timeframe={}".format(ALPACA_BASE, period, timeframe)
+    return await alpaca_request("GET", url)
 
 
 async def get_alpaca_summary():
@@ -168,7 +170,7 @@ async def get_alpaca_summary():
         equities = history.get("equity", [])
         pnls = history.get("profit_loss_pct", [])
         for i in range(len(timestamps)):
-           if equities[i]:
+            if equities[i]:
                 equity_history.append({
                     "date": datetime.fromtimestamp(timestamps[i]).strftime("%Y-%m-%d"),
                     "equity": round(equities[i], 2),
