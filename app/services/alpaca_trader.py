@@ -191,3 +191,38 @@ async def get_alpaca_summary():
         "equity_history": equity_history,
         "account_status": account.get("status"),
     }
+async def get_live_prices(symbols):
+    """Get latest prices for multiple stocks in ONE call"""
+    if not symbols:
+        return {}
+    symbols_str = ",".join(symbols[:50])
+    url = "{}/v2/stocks/snapshots?symbols={}&feed=iex".format(ALPACA_DATA, symbols_str)
+    async with httpx.AsyncClient(timeout=10) as client:
+        try:
+            r = await client.get(url, headers=HEADERS)
+            if r.status_code != 200:
+                return {}
+            data = r.json()
+            prices = {}
+            for sym, snap in data.items():
+                latest = snap.get("latestTrade", {})
+                minute = snap.get("minuteBar", {})
+                daily = snap.get("dailyBar", {})
+                prev = snap.get("prevDailyBar", {})
+                price = latest.get("p", 0) or minute.get("c", 0) or daily.get("c", 0)
+                prev_close = prev.get("c", price)
+                change = price - prev_close
+                change_pct = (change / prev_close * 100) if prev_close > 0 else 0
+                prices[sym] = {
+                    "price": round(price, 2),
+                    "prev_close": round(prev_close, 2),
+                    "change": round(change, 2),
+                    "change_pct": round(change_pct, 2),
+                    "volume": daily.get("v", 0),
+                    "high": round(daily.get("h", 0), 2),
+                    "low": round(daily.get("l", 0), 2),
+                }
+            return prices
+        except Exception as e:
+            print("Live prices error: {}".format(e))
+            return {}
