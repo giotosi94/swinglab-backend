@@ -1,147 +1,123 @@
 from datetime import datetime
 from app.db.mongodb import get_db
+from app.services.alpaca_trader import (
+    get_account, get_positions, place_bracket_order,
+    place_order, close_position, get_latest_price
+)
 
 
 async def run_auto_trader():
     db = get_db()
 
-    # Get or create auto-trader state
-    state = await db.auto_trader.find_one({"_id": "state"})
-    if not state:
-        state = {
-            "_id": "state",
-            "capital": 10000,
-            "initial_capital": 10000,
-            "cash": 10000,
-            "open_positions": [],
-            "closed_trades": [],
-            "equity_history": [],
-            "total_trades": 0,
-            "wins": 0,
-            "losses": 0,
-            "created_at": datetime.utcnow(),
-        }
-        await db.auto_trader.insert_one(state)
+    # Check Alpaca connection
+    account = await get_account()
+    if not account:
+        print("AutoTrader: Alpaca not connected")
+        return {"error": "Alpaca not connected"}
 
+    equity = float(account.get("equity", 0))
+    cash = float(account.get("cash", 0))
+    buying_power = float(account.get("buying_power", 0))
+
+    print("=" * 50)
+    print("AUTO-TRADER RUNNING")
+    print("Equity: ${:.2f} | Cash: ${:.2f}".format(equity, cash))
+    print("=" * 50)
+
+    # Get current positions from Alpaca
+    positions = await get_positions() or []
+    open_tickers = [p.get("symbol") for p in positions]
+    open_sectors = []
+
+    # Get assets from DB
     assets = await db.assets.find().to_list(200)
     sectors = await db.sectors.find().sort("composite_score", -1).to_list(20)
 
     if not assets:
-        return {"message": "No assets data"}
+        print("No assets data")
+        return {"error": "No assets data"}
 
-    capital = state.get("capital", 10000)
-    cash = state.get("cash", 10000)
-    open_positions = state.get("open_positions", [])
-    closed_trades = state.get("closed_trades", [])
-    equity_history = state.get("equity_history", [])
-    total_trades = state.get("total_trades", 0)
-    wins = state.get("wins", 0)
-    losses = state.get("losses", 0)
-
-    asset_map = {a["ticker"]: a for a in assets}
     sector_codes = [s["code"] for s in sectors]
+    asset_map = {a["ticker"]: a for a in assets}
+
+    # Track sectors of open positions
+    for t in open_tickers:
+        a = asset_map.get(t)
+        if a:
+            open_sectors.append(a.get("sector_code", ""))
 
     actions = []
 
     # ============================================
-    # STEP 1: CHECK SELLS
+    # STEP 1: CHECK SELLS (positions that need closing)
     # ============================================
-    new_open = []
-    for pos in open_positions:
-        ticker = pos["ticker"]
-        asset = asset_map.get(ticker)
+    for p in positions:
+        symbol = p.get("symbol")
+        asset = asset_map.get(symbol)
         if not asset:
-            new_open.append(pos)
             continue
 
-        current_price = asset.get("price", pos["entry_price"])
-        entry_price = pos["entry_price"]
-        shares = pos["shares"]
-        days_held = (datetime.utcnow() - datetime.fromisoformat(pos["entry_date"])).days
-        pnl_pct = ((current_price - entry_price) / entry_price) * 100
+        current_price = float(p.get("current_price", 0))
+        entry_price = float(p.get("avg_entry_price", 0))
+        pnl_pct = float(p.get("unrealized_plpc", 0)) * 100
         rsi = asset.get("rsi", 50)
         setup_score = asset.get("setup_score", 50)
-        target = pos.get("target_price", entry_price * 1.08)
-        stop = pos.get("stop_loss", entry_price * 0.96)
 
         sell_reason = None
 
-        # Target hit
-        if current_price >= target:
-            sell_reason = "TARGET_HIT"
-        # Stop loss hit
-        elif current_price <= stop:
-            sell_reason = "STOP_LOSS"
-        # RSI overbought
-        elif rsi > 75 and pnl_pct > 2:
-            sell_reason = "RSI_OVERBOUGHT"
-        # Score collapsed
-        elif setup_score < 25 and pnl_pct < 0:
+        # RSI extreme overbought with profit
+        if rsi > 78 and pnl_pct > 3:
+            sell_reason = "RSI_EXTREME"
+        # Score collapsed badly
+        elif setup_score < 20 and pnl_pct < -2:
             sell_reason = "SCORE_COLLAPSED"
-        # Max hold time
-        elif days_held > 15:
-            sell_reason = "MAX_HOLD_TIME"
-        # Trailing stop: if was up 5%+ and now dropping
-        elif pnl_pct < -4:
-            sell_reason = "HARD_STOP"
+        # Bearish pattern detected while in loss
+        elif pnl_pct < -1:
+            bearish = [pat for pat in asset.get("candlestick_patterns", []) if pat.get("type") == "bearish" and pat.get("strength") == "strong"]
+            if bearish:
+                sell_reason = "BEARISH_PATTERN"
+        # Wyckoff distribution/markdown
+        elif asset.get("wyckoff", {}).get("phase") in ("distribution", "markdown") and pnl_pct < 0:
+            sell_reason = "WYCKOFF_BEARISH"
 
         if sell_reason:
-            pnl = (current_price - entry_price) * shares
-            pnl_pct_final = ((current_price - entry_price) / entry_price) * 100
-            cash += current_price * shares
+            print("  SELL {}: {} (P&L {:.1f}%)".format(symbol, sell_reason, pnl_pct))
+            result = await close_position(symbol)
+            if result is not None:
+                actions.append({
+                    "action": "SELL",
+                    "ticker": symbol,
+                    "reason": sell_reason,
+                    "pnl_pct": round(pnl_pct, 2),
+                })
 
-            closed_trade = {
-                "ticker": ticker,
-                "entry_price": entry_price,
-                "exit_price": round(current_price, 2),
-                "shares": shares,
-                "entry_date": pos["entry_date"],
-                "exit_date": datetime.utcnow().isoformat(),
-                "days_held": days_held,
-                "pnl": round(pnl, 2),
-                "pnl_pct": round(pnl_pct_final, 2),
-                "reason": sell_reason,
-                "sector": pos.get("sector", ""),
-            }
-            closed_trades.append(closed_trade)
-            total_trades += 1
-            if pnl > 0:
-                wins += 1
-            else:
-                losses += 1
+                # Save to trade history
+                await db.trade_history.insert_one({
+                    "ticker": symbol,
+                    "side": "sell",
+                    "entry_price": entry_price,
+                    "exit_price": current_price,
+                    "pnl_pct": round(pnl_pct, 2),
+                    "reason": sell_reason,
+                    "date": datetime.utcnow(),
+                })
 
-            actions.append({
-                "action": "SELL",
-                "ticker": ticker,
-                "price": round(current_price, 2),
-                "shares": shares,
-                "pnl": round(pnl, 2),
-                "pnl_pct": round(pnl_pct_final, 2),
-                "reason": sell_reason,
-            })
-        else:
-            pos["current_price"] = round(current_price, 2)
-            pos["pnl"] = round((current_price - entry_price) * shares, 2)
-            pos["pnl_pct"] = round(pnl_pct, 2)
-            pos["days_held"] = days_held
-            pos["rsi"] = round(rsi, 1)
-            pos["setup_score"] = setup_score
-            new_open.append(pos)
-
-    open_positions = new_open
+    # Refresh positions after sells
+    positions = await get_positions() or []
+    open_tickers = [p.get("symbol") for p in positions]
+    num_positions = len(positions)
 
     # ============================================
     # STEP 2: CHECK BUYS
     # ============================================
     max_positions = 5
-    max_per_position = capital * 0.20
-    risk_per_trade = capital * 0.02
+    max_per_position = equity * 0.20
+    risk_per_trade = equity * 0.02
 
-    if len(open_positions) < max_positions:
-        # Score all assets for buying
+    if num_positions >= max_positions:
+        print("Max positions reached ({}/{})".format(num_positions, max_positions))
+    else:
         candidates = []
-        open_tickers = [p["ticker"] for p in open_positions]
-        open_sectors = [p.get("sector", "") for p in open_positions]
 
         for a in assets:
             ticker = a.get("ticker", "")
@@ -163,6 +139,8 @@ async def run_auto_trader():
             ema50 = a.get("ema50", 0)
             patterns = a.get("candlestick_patterns", [])
             bullish_patterns = [p for p in patterns if p.get("type") == "bullish"]
+            wyckoff = a.get("wyckoff", {})
+            accum = a.get("accumulation", {})
 
             # Calculate confluence
             confluence = 0
@@ -190,12 +168,8 @@ async def run_auto_trader():
             if 0 < change <= 5:
                 confluence += 0.5
 
-            # Filter conditions
             # Wyckoff bonus
-            wyckoff = a.get("wyckoff", {})
             wyckoff_signal = wyckoff.get("signal", "neutral")
-            accum_score = a.get("accumulation", {}).get("score", 0)
-
             if wyckoff_signal in ("strong_bullish", "bullish_soon"):
                 confluence += 1.5
             elif wyckoff_signal == "bullish":
@@ -204,43 +178,37 @@ async def run_auto_trader():
                 confluence -= 2
 
             # Accumulation bonus
+            accum_score = accum.get("score", 0)
             if accum_score >= 70:
                 confluence += 1
             elif accum_score >= 40:
                 confluence += 0.5
 
-            # FVG bonus - price near a bullish FVG
-            fvgs = a.get("fvg", [])
-            bullish_fvgs = [f for f in fvgs if f.get("type") == "bullish"]
-            for fvg in bullish_fvgs:
-                if fvg["bottom"] <= price <= fvg["top"]:
-                    confluence += 1
-                    break
-
+            # Filters
             if confluence < 5.5:
                 continue
-            if rsi > 65 or rsi < 25:
+            if rsi > 68 or rsi < 25:
                 continue
             if stype not in ("breakout", "pullback_to_poc", "ema_bounce"):
                 continue
-            if price <= 0:
+            if price <= 1:
                 continue
             # Max 2 per sector
-            sector_count = len([p for p in open_positions if p.get("sector") == sector])
+            sector_count = open_sectors.count(sector)
             if sector_count >= 2:
                 continue
 
-            # Calculate position
-            stop_loss = va_low if va_low and va_low < price else price * 0.96
-            target_price = va_high if va_high and va_high > price else price * 1.08
+            # Position sizing
+            stop_loss = va_low if va_low and va_low < price else round(price * 0.96, 2)
+            target_price = va_high if va_high and va_high > price else round(price * 1.08, 2)
             risk_per_share = abs(price - stop_loss)
-            if risk_per_share <= 0:
+            if risk_per_share <= 0.01:
                 continue
 
             shares = min(
                 int(risk_per_trade / risk_per_share),
                 int(max_per_position / price),
-                int(cash / price)
+                int(buying_power * 0.9 / price)
             )
             if shares <= 0:
                 continue
@@ -248,162 +216,111 @@ async def run_auto_trader():
             candidates.append({
                 "ticker": ticker,
                 "price": price,
-                "confluence": confluence,
+                "confluence": round(confluence, 1),
                 "score": score,
                 "shares": shares,
                 "stop_loss": round(stop_loss, 2),
                 "target_price": round(target_price, 2),
-                "risk_per_share": round(risk_per_share, 2),
                 "sector": sector,
                 "setup_type": stype,
-                "rsi": rsi,
             })
 
-        # Sort by confluence, take top ones
+        # Sort by confluence
         candidates.sort(key=lambda x: x["confluence"], reverse=True)
 
         for c in candidates:
-            if len(open_positions) >= max_positions:
+            if num_positions >= max_positions:
                 break
-            if cash < c["price"] * c["shares"]:
-                continue
 
-            cost = c["price"] * c["shares"]
-            cash -= cost
+            ticker = c["ticker"]
+            shares = c["shares"]
+            target = c["target_price"]
+            stop = c["stop_loss"]
 
-            new_position = {
-                "ticker": c["ticker"],
-                "entry_price": round(c["price"], 2),
-                "current_price": round(c["price"], 2),
-                "shares": c["shares"],
-                "stop_loss": c["stop_loss"],
-                "target_price": c["target_price"],
-                "entry_date": datetime.utcnow().isoformat(),
-                "sector": c["sector"],
-                "setup_type": c["setup_type"],
-                "confluence": round(c["confluence"], 1),
-                "pnl": 0,
-                "pnl_pct": 0,
-                "days_held": 0,
-                "rsi": round(c["rsi"], 1),
-                "setup_score": c.get("score", 0),
-            }
-            open_positions.append(new_position)
-            total_trades += 1
+            print("  BUY {}: {} shares, target ${}, stop ${}, confluence {}".format(
+                ticker, shares, target, stop, c["confluence"]))
 
-            actions.append({
-                "action": "BUY",
-                "ticker": c["ticker"],
-                "price": round(c["price"], 2),
-                "shares": c["shares"],
-                "stop_loss": c["stop_loss"],
-                "target": c["target_price"],
-                "confluence": round(c["confluence"], 1),
-                "setup": c["setup_type"],
-            })
+            # Place bracket order on Alpaca
+            result = await place_bracket_order(
+                symbol=ticker,
+                qty=shares,
+                limit_price=c["price"] * 1.005,  # slight buffer above market
+                take_profit=target,
+                stop_loss=stop
+            )
 
-    # ============================================
-    # STEP 3: CALCULATE EQUITY
-    # ============================================
-    positions_value = sum(p.get("current_price", p["entry_price"]) * p["shares"] for p in open_positions)
-    total_equity = cash + positions_value
+            if result:
+                num_positions += 1
+                open_tickers.append(ticker)
+                open_sectors.append(c["sector"])
+                buying_power -= c["price"] * shares
 
-    equity_point = {
-        "date": datetime.utcnow().strftime("%Y-%m-%d %H:%M"),
-        "equity": round(total_equity, 2),
-        "cash": round(cash, 2),
-        "positions_value": round(positions_value, 2),
-        "open_count": len(open_positions),
-        "pnl_pct": round(((total_equity - state.get("initial_capital", 10000)) / state.get("initial_capital", 10000)) * 100, 2),
-    }
-    equity_history.append(equity_point)
+                actions.append({
+                    "action": "BUY",
+                    "ticker": ticker,
+                    "shares": shares,
+                    "price": c["price"],
+                    "target": target,
+                    "stop": stop,
+                    "confluence": c["confluence"],
+                    "setup": c["setup_type"],
+                })
 
-    # Keep last 200 equity points
-    if len(equity_history) > 200:
-        equity_history = equity_history[-200:]
-
-    # Keep last 100 closed trades
-    if len(closed_trades) > 100:
-        closed_trades = closed_trades[-100:]
+                # Save to trade history
+                await db.trade_history.insert_one({
+                    "ticker": ticker,
+                    "side": "buy",
+                    "entry_price": c["price"],
+                    "shares": shares,
+                    "target": target,
+                    "stop_loss": stop,
+                    "confluence": c["confluence"],
+                    "setup_type": c["setup_type"],
+                    "date": datetime.utcnow(),
+                })
+            else:
+                print("  FAILED to buy {}".format(ticker))
 
     # ============================================
-    # STEP 4: SAVE STATE
+    # STEP 3: SAVE STATE
     # ============================================
-    win_rate = round((wins / total_trades * 100), 1) if total_trades > 0 else 0
-    avg_pnl = round(sum(t.get("pnl", 0) for t in closed_trades) / len(closed_trades), 2) if closed_trades else 0
-    total_pnl = round(sum(t.get("pnl", 0) for t in closed_trades), 2)
-    best_trade = max(closed_trades, key=lambda t: t.get("pnl", 0)) if closed_trades else None
-    worst_trade = min(closed_trades, key=lambda t: t.get("pnl", 0)) if closed_trades else None
-
-    update = {
-        "capital": state.get("initial_capital", 10000),
-        "initial_capital": state.get("initial_capital", 10000),
-        "cash": round(cash, 2),
-        "equity": round(total_equity, 2),
-        "open_positions": open_positions,
-        "closed_trades": closed_trades,
-        "equity_history": equity_history,
-        "total_trades": total_trades,
-        "wins": wins,
-        "losses": losses,
-        "win_rate": win_rate,
-        "avg_pnl": avg_pnl,
-        "total_pnl": total_pnl,
-        "best_trade": best_trade,
-        "worst_trade": worst_trade,
+    state = {
         "last_run": datetime.utcnow().isoformat(),
+        "equity": equity,
+        "cash": cash,
+        "positions": len(open_tickers),
+        "actions": actions,
         "updated_at": datetime.utcnow(),
     }
+    await db.auto_trader.update_one(
+        {"_id": "alpaca_state"}, {"$set": state}, upsert=True
+    )
 
-    await db.auto_trader.update_one({"_id": "state"}, {"$set": update}, upsert=True)
+    print("\nAUTO-TRADER DONE: {} actions".format(len(actions)))
+    for a in actions:
+        print("  {} {} {}".format(a["action"], a["ticker"], a.get("reason", "")))
 
     return {
-        "equity": round(total_equity, 2),
-        "cash": round(cash, 2),
-        "open_positions": len(open_positions),
+        "equity": equity,
+        "cash": cash,
+        "positions": num_positions,
         "actions": actions,
-        "win_rate": win_rate,
-        "total_pnl": total_pnl,
     }
 
 
 async def reset_auto_trader(initial_capital=10000):
+    # For Alpaca, reset just closes all positions
+    from app.services.alpaca_trader import close_all_positions, cancel_all_orders
+    await cancel_all_orders()
+    await close_all_positions()
     db = get_db()
-    state = {
-        "_id": "state",
-        "capital": initial_capital,
-        "initial_capital": initial_capital,
-        "cash": initial_capital,
-        "equity": initial_capital,
-        "open_positions": [],
-        "closed_trades": [],
-        "equity_history": [{
-            "date": datetime.utcnow().strftime("%Y-%m-%d %H:%M"),
-            "equity": initial_capital,
-            "cash": initial_capital,
-            "positions_value": 0,
-            "open_count": 0,
-            "pnl_pct": 0,
-        }],
-        "total_trades": 0,
-        "wins": 0,
-        "losses": 0,
-        "win_rate": 0,
-        "avg_pnl": 0,
-        "total_pnl": 0,
-        "best_trade": None,
-        "worst_trade": None,
-        "created_at": datetime.utcnow(),
-        "updated_at": datetime.utcnow(),
-    }
-    await db.auto_trader.delete_many({})
-    await db.auto_trader.insert_one(state)
-    return state
+    await db.trade_history.delete_many({})
+    return {"message": "All positions closed and history cleared"}
 
 
 async def get_auto_trader_state():
     db = get_db()
-    state = await db.auto_trader.find_one({"_id": "state"})
+    state = await db.auto_trader.find_one({"_id": "alpaca_state"})
     if state:
         state["_id"] = str(state["_id"])
     return state
