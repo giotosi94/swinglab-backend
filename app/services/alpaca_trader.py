@@ -168,7 +168,7 @@ async def get_alpaca_summary():
         equities = history.get("equity", [])
         pnls = history.get("profit_loss_pct", [])
         for i in range(len(timestamps)):
-            if equities[i]:
+           if equities[i]:
                 equity_history.append({
                     "date": datetime.fromtimestamp(timestamps[i]).strftime("%Y-%m-%d"),
                     "equity": round(equities[i], 2),
