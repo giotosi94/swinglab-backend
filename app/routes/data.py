@@ -60,7 +60,19 @@ async def get_market_data():
     if spy: spy["_id"] = str(spy["_id"])
     if vix: vix["_id"] = str(vix["_id"])
     return {"spy": spy, "vix": vix}
-
+@router.get("/live")
+async def live_prices():
+    from app.services.alpaca_trader import get_live_prices
+    db = get_db()
+    assets = await db.assets.find({}, {"ticker": 1}).to_list(200)
+    symbols = [a["ticker"] for a in assets if a.get("ticker")]
+    # Alpaca max 50 per call, so batch
+    all_prices = {}
+    for i in range(0, len(symbols), 50):
+        batch = symbols[i:i+50]
+        prices = await get_live_prices(batch)
+        all_prices.update(prices)
+    return all_prices
 @router.get("/alpaca")
 async def alpaca_summary():
     return await get_alpaca_summary()
