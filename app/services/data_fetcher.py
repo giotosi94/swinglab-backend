@@ -15,17 +15,28 @@ SECTOR_MAP = {
 }
 
 SECTOR_STOCKS = {
-    "XLK": ["AAPL","MSFT","NVDA","AVGO","AMD","CRM","ADBE","INTC","CSCO","ORCL","PLTR","NOW","SNOW","CRWD","PANW","MNDY"],
-    "XLF": ["JPM","BAC","WFC","GS","MS","BLK","SCHW","AXP","C","USB","V","MA","PYPL","COF","ICE"],
-    "XLV": ["UNH","JNJ","PFE","ABBV","MRK","TMO","ABT","LLY","BMY","AMGN","ISRG","DXCM","VRTX","REGN","ZTS"],
-    "XLI": ["CAT","DE","UNP","HON","BA","RTX","LMT","GE","MMM","FDX","UPS","WM","ETN","ITW","EMR"],
-    "XLY": ["AMZN","TSLA","HD","MCD","NKE","SBUX","LOW","TJX","BKNG","CMG","LULU","ROST","DHI","LEN","ABNB"],
-    "XLP": ["PG","KO","PEP","COST","WMT","PM","MO","CL","MDLZ","KHC","STZ","SYY","HSY","K","GIS"],
-    "XLE": ["XOM","CVX","COP","SLB","EOG","MPC","PSX","VLO","OXY","HAL","DVN","FANG","PXD","WMB","KMI"],
-    "XLU": ["NEE","DUK","SO","D","AEP","SRE","EXC","XEL","ED","WEC","AWK","ES","ATO","CMS","PNW"],
-    "XLB": ["LIN","APD","SHW","FCX","NEM","ECL","DOW","NUE","VMC","MLM","CF","MOS","BALL","PKG","IFF"],
-    "XLRE": ["PLD","AMT","CCI","EQIX","SPG","PSA","O","WELL","DLR","AVB","VICI","MAA","EXR","ARE","UDR"],
-    "XLC": ["META","GOOGL","GOOG","NFLX","DIS","CMCSA","T","VZ","TMUS","EA","SPOT","RBLX","TTWO","WBD","PARA"],
+    "XLK": ["AAPL","MSFT","NVDA","AVGO","AMD","CRM","ADBE","INTC","CSCO","ORCL",
+            "PLTR","NOW","SNOW","CRWD","PANW","MNDY","SHOP","SQ","UBER","DDOG"],
+    "XLF": ["JPM","BAC","WFC","GS","MS","BLK","SCHW","AXP","C","USB",
+            "V","MA","PYPL","COF","ICE","SPGI","MCO","MMC","AON","TFC"],
+    "XLV": ["UNH","JNJ","PFE","ABBV","MRK","TMO","ABT","LLY","BMY","AMGN",
+            "ISRG","DXCM","VRTX","REGN","ZTS","HCA","CI","ELV","HUM","SYK"],
+    "XLI": ["CAT","DE","UNP","HON","BA","RTX","LMT","GE","MMM","FDX",
+            "UPS","WM","ETN","ITW","EMR","NSC","CSX","PCAR","ROK","IR"],
+    "XLY": ["AMZN","TSLA","HD","MCD","NKE","SBUX","LOW","TJX","BKNG","CMG",
+            "LULU","ROST","DHI","LEN","ABNB","DASH","EBAY","MAR","HLT","YUM"],
+    "XLP": ["PG","KO","PEP","COST","WMT","PM","MO","CL","MDLZ","KHC",
+            "STZ","SYY","HSY","GIS","ADM","MNST","KDP","CHD","CLX","SJM"],
+    "XLE": ["XOM","CVX","COP","SLB","EOG","MPC","PSX","VLO","OXY","HAL",
+            "DVN","FANG","WMB","KMI","TRGP","BKR","CTRA","MRO","APA","AR"],
+    "XLU": ["NEE","DUK","SO","D","AEP","SRE","EXC","XEL","ED","WEC",
+            "AWK","ES","ATO","CMS","PNW","PPL","FE","DTE","AES","ETR"],
+    "XLB": ["LIN","APD","SHW","FCX","NEM","ECL","DOW","NUE","VMC","MLM",
+            "CF","MOS","BALL","PKG","IFF","EMN","CE","RPM","SEE","AVY"],
+    "XLRE": ["PLD","AMT","CCI","EQIX","SPG","PSA","O","WELL","DLR","AVB",
+             "VICI","MAA","EXR","ARE","UDR","ESS","REG","HST","KIM","CPT"],
+    "XLC": ["META","GOOGL","GOOG","NFLX","DIS","CMCSA","T","VZ","TMUS","EA",
+            "SPOT","RBLX","TTWO","WBD","PARA","MTCH","ZM","PINS","SNAP","LYV"],
 }
 
 ALPACA_HEADERS = {
@@ -313,6 +324,50 @@ async def fetch_and_analyze_sectors():
             spy_price = float(spy_close.iloc[-1])
             spy_change = float(((spy_close.iloc[-1]/spy_close.iloc[-2])-1)*100)
             await db.market_regime.update_one({"symbol":"SPY"},{"$set":{"symbol":"SPY","price":round(spy_price,2),"change_pct":round(spy_change,2),"ema20":round(spy_ema20,2),"ema50":round(spy_ema50,2),"rsi":round(spy_rsi_val,1),"return_20d":round(spy_return,2),"updated_at":datetime.utcnow()}},upsert=True)
+        # Fetch major indices
+        for idx_sym in ["QQQ", "IWM", "DIA"]:
+            await asyncio.sleep(0.3)
+            try:
+                idx_df = await fetch_bars(client, idx_sym)
+                if idx_df is not None and len(idx_df) >= 2:
+                    ip = float(idx_df["Close"].iloc[-1])
+                    ipp = float(idx_df["Close"].iloc[-2])
+                    ic = round(((ip - ipp) / ipp) * 100, 2)
+                    ir20 = round(((float(idx_df["Close"].iloc[-1]) / float(idx_df["Close"].iloc[-20])) - 1) * 100, 2) if len(idx_df) >= 20 else 0
+                    await db.market_regime.update_one({"symbol": idx_sym}, {"$set": {"symbol": idx_sym, "price": round(ip, 2), "change_pct": ic, "return_20d": ir20, "updated_at": datetime.utcnow()}}, upsert=True)
+                    print("  {} saved: ${:.2f} ({:+.2f}%)".format(idx_sym, ip, ic))
+            except Exception as e:
+                print("  {} error: {}".format(idx_sym, e))
+
+        # Fetch crypto
+        for crypto in ["BTC/USD", "ETH/USD"]:
+            await asyncio.sleep(0.3)
+            try:
+                cr = await client.get("https://data.alpaca.markets/v1beta3/crypto/us/bars", headers=ALPACA_HEADERS, params={"symbols": crypto, "timeframe": "1Day", "limit": 5})
+                if cr.status_code == 200:
+                    cbars = cr.json().get("bars", {}).get(crypto, [])
+                    if cbars and len(cbars) >= 2:
+                        cp = float(cbars[-1].get("c", 0))
+                        cpp = float(cbars[-2].get("c", cp))
+                        cc = round(((cp - cpp) / cpp) * 100, 2) if cpp > 0 else 0
+                        await db.market_regime.update_one({"symbol": crypto}, {"$set": {"symbol": crypto, "price": round(cp, 2), "change_pct": cc, "updated_at": datetime.utcnow()}}, upsert=True)
+                        print("  {} saved: ${:.2f} ({:+.2f}%)".format(crypto, cp, cc))
+            except Exception as e:
+                print("  {} error: {}".format(crypto, e))
+
+        # Fetch EUR/USD proxy
+        for fx in ["FXE", "UUP"]:
+            await asyncio.sleep(0.3)
+            try:
+                fx_df = await fetch_bars(client, fx)
+                if fx_df is not None and len(fx_df) >= 2:
+                    fp = float(fx_df["Close"].iloc[-1])
+                    fpp = float(fx_df["Close"].iloc[-2])
+                    fc = round(((fp - fpp) / fpp) * 100, 2)
+                    await db.market_regime.update_one({"symbol": fx}, {"$set": {"symbol": fx, "price": round(fp, 2), "change_pct": fc, "updated_at": datetime.utcnow()}}, upsert=True)
+                    print("  {} saved: ${:.2f} ({:+.2f}%)".format(fx, fp, fc))
+            except Exception as e:
+                print("  {} error: {}".format(fx, e))
         results = []
         for etf, name in SECTOR_MAP.items():
             try:
@@ -392,5 +447,5 @@ async def fetch_and_analyze_stocks():
                     pat_str=", ".join([p["name"] for p in patterns]) if patterns else "none"
                     print("    OK {}: ${:.2f} score={} [{}] patterns=[{}]".format(ticker,price,setup_score,setup_type,pat_str))
                 except Exception as e: print("    ERROR {}: {}".format(ticker,e))
-    print("\nSTOCKS DONE: {}/166".format(len(results)))
+    print("\nSTOCKS DONE: {}/220".format(len(results)))
     return results
