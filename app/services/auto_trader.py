@@ -4,6 +4,7 @@ from app.services.alpaca_trader import (
     get_account, get_positions, place_bracket_order,
     place_order, close_position, get_latest_price
 )
+from app.services.agent_brain import analyze_performance, get_learned_params, log_trade_decision
 
 
 async def run_auto_trader():
@@ -19,9 +20,23 @@ async def run_auto_trader():
     cash = float(account.get("cash", 0))
     buying_power = float(account.get("buying_power", 0))
 
+    # Learn from past trades
+    brain = await analyze_performance()
+    min_confluence = brain.get("min_confluence", 5.5)
+    max_rsi = brain.get("max_rsi_entry", 68)
+    max_hold = brain.get("max_hold_days", 15)
+    best_setups = brain.get("best_setups", ["pullback_to_poc", "ema_bounce", "breakout"])
+    worst_setups = brain.get("worst_setups", [])
+    weak_sectors = brain.get("weak_sectors", [])
+
     print("=" * 50)
-    print("AUTO-TRADER RUNNING")
+    print("AUTO-TRADER RUNNING (AI Agent)")
     print("Equity: ${:.2f} | Cash: ${:.2f}".format(equity, cash))
+    print("Brain: min_conf={}, max_rsi={}, max_hold={}d".format(min_confluence, max_rsi, max_hold))
+    if worst_setups:
+        print("  Avoiding setups: {}".format(worst_setups))
+    if weak_sectors:
+        print("  Avoiding sectors: {}".format(weak_sectors))
     print("=" * 50)
 
     # Get current positions from Alpaca
@@ -30,7 +45,7 @@ async def run_auto_trader():
     open_sectors = []
 
     # Get assets from DB
-    assets = await db.assets.find().to_list(200)
+    assets = await db.assets.find().to_list(300)
     sectors = await db.sectors.find().sort("composite_score", -1).to_list(20)
 
     if not assets:
@@ -49,7 +64,7 @@ async def run_auto_trader():
     actions = []
 
     # ============================================
-    # STEP 1: CHECK SELLS (positions that need closing)
+    # STEP 1: CHECK SELLS
     # ============================================
     for p in positions:
         symbol = p.get("symbol")
@@ -65,18 +80,14 @@ async def run_auto_trader():
 
         sell_reason = None
 
-        # RSI extreme overbought with profit
         if rsi > 78 and pnl_pct > 3:
             sell_reason = "RSI_EXTREME"
-        # Score collapsed badly
         elif setup_score < 20 and pnl_pct < -2:
             sell_reason = "SCORE_COLLAPSED"
-        # Bearish pattern detected while in loss
         elif pnl_pct < -1:
             bearish = [pat for pat in asset.get("candlestick_patterns", []) if pat.get("type") == "bearish" and pat.get("strength") == "strong"]
             if bearish:
                 sell_reason = "BEARISH_PATTERN"
-        # Wyckoff distribution/markdown
         elif asset.get("wyckoff", {}).get("phase") in ("distribution", "markdown") and pnl_pct < 0:
             sell_reason = "WYCKOFF_BEARISH"
 
@@ -84,23 +95,19 @@ async def run_auto_trader():
             print("  SELL {}: {} (P&L {:.1f}%)".format(symbol, sell_reason, pnl_pct))
             result = await close_position(symbol)
             if result is not None:
-                actions.append({
-                    "action": "SELL",
-                    "ticker": symbol,
-                    "reason": sell_reason,
-                    "pnl_pct": round(pnl_pct, 2),
-                })
+                actions.append({"action": "SELL", "ticker": symbol, "reason": sell_reason, "pnl_pct": round(pnl_pct, 2)})
 
-                # Save to trade history
                 await db.trade_history.insert_one({
-                    "ticker": symbol,
-                    "side": "sell",
-                    "entry_price": entry_price,
-                    "exit_price": current_price,
-                    "pnl_pct": round(pnl_pct, 2),
-                    "reason": sell_reason,
+                    "ticker": symbol, "side": "sell", "entry_price": entry_price,
+                    "exit_price": current_price, "pnl_pct": round(pnl_pct, 2),
+                    "reason": sell_reason, "rsi_at_entry": rsi,
+                    "setup_type": asset.get("setup_type", "unknown"),
+                    "sector": asset.get("sector_code", "unknown"),
                     "date": datetime.utcnow(),
                 })
+
+                await log_trade_decision(symbol, "SELL", sell_reason,
+                    {"pnl_pct": round(pnl_pct, 2), "rsi": rsi, "score": setup_score})
 
     # Refresh positions after sells
     positions = await get_positions() or []
@@ -184,16 +191,19 @@ async def run_auto_trader():
             elif accum_score >= 40:
                 confluence += 0.5
 
-            # Filters
-            if confluence < 5.5:
+            # AI Agent filters (learned from past trades)
+            if confluence < min_confluence:
                 continue
-            if rsi > 68 or rsi < 25:
+            if rsi > max_rsi or rsi < 25:
                 continue
-            if stype not in ("breakout", "pullback_to_poc", "ema_bounce"):
+            if stype not in best_setups:
                 continue
+            if stype in worst_setups:
+                continue
+            if sector in weak_sectors:
+                confluence -= 1
             if price <= 1:
                 continue
-            # Max 2 per sector
             sector_count = open_sectors.count(sector)
             if sector_count >= 2:
                 continue
@@ -214,18 +224,12 @@ async def run_auto_trader():
                 continue
 
             candidates.append({
-                "ticker": ticker,
-                "price": price,
-                "confluence": round(confluence, 1),
-                "score": score,
-                "shares": shares,
-                "stop_loss": round(stop_loss, 2),
-                "target_price": round(target_price, 2),
-                "sector": sector,
-                "setup_type": stype,
+                "ticker": ticker, "price": price, "confluence": round(confluence, 1),
+                "score": score, "shares": shares, "stop_loss": round(stop_loss, 2),
+                "target_price": round(target_price, 2), "sector": sector,
+                "setup_type": stype, "rsi": rsi,
             })
 
-        # Sort by confluence
         candidates.sort(key=lambda x: x["confluence"], reverse=True)
 
         for c in candidates:
@@ -240,13 +244,10 @@ async def run_auto_trader():
             print("  BUY {}: {} shares, target ${}, stop ${}, confluence {}".format(
                 ticker, shares, target, stop, c["confluence"]))
 
-            # Place bracket order on Alpaca
             result = await place_bracket_order(
-                symbol=ticker,
-                qty=shares,
-                limit_price=c["price"] * 1.005,  # slight buffer above market
-                take_profit=target,
-                stop_loss=stop
+                symbol=ticker, qty=shares,
+                limit_price=c["price"] * 1.005,
+                take_profit=target, stop_loss=stop
             )
 
             if result:
@@ -256,28 +257,23 @@ async def run_auto_trader():
                 buying_power -= c["price"] * shares
 
                 actions.append({
-                    "action": "BUY",
-                    "ticker": ticker,
-                    "shares": shares,
-                    "price": c["price"],
-                    "target": target,
-                    "stop": stop,
-                    "confluence": c["confluence"],
-                    "setup": c["setup_type"],
+                    "action": "BUY", "ticker": ticker, "shares": shares,
+                    "price": c["price"], "target": target, "stop": stop,
+                    "confluence": c["confluence"], "setup": c["setup_type"],
                 })
 
-                # Save to trade history
                 await db.trade_history.insert_one({
-                    "ticker": ticker,
-                    "side": "buy",
-                    "entry_price": c["price"],
-                    "shares": shares,
-                    "target": target,
-                    "stop_loss": stop,
-                    "confluence": c["confluence"],
-                    "setup_type": c["setup_type"],
+                    "ticker": ticker, "side": "buy", "entry_price": c["price"],
+                    "shares": shares, "target": target, "stop_loss": stop,
+                    "confluence": c["confluence"], "setup_type": c["setup_type"],
+                    "sector": c["sector"], "rsi_at_entry": c["rsi"],
                     "date": datetime.utcnow(),
                 })
+
+                await log_trade_decision(ticker, "BUY",
+                    "Confluence {}, setup {}, RSI {}".format(c["confluence"], c["setup_type"], c["rsi"]),
+                    {"confluence": c["confluence"], "setup": c["setup_type"], "sector": c["sector"],
+                     "rsi": c["rsi"], "brain_params": {"min_conf": min_confluence, "max_rsi": max_rsi}})
             else:
                 print("  FAILED to buy {}".format(ticker))
 
@@ -290,6 +286,15 @@ async def run_auto_trader():
         "cash": cash,
         "positions": len(open_tickers),
         "actions": actions,
+        "brain": {
+            "min_confluence": min_confluence,
+            "max_rsi": max_rsi,
+            "max_hold_days": max_hold,
+            "best_setups": best_setups,
+            "worst_setups": worst_setups,
+            "weak_sectors": weak_sectors,
+            "win_rate": brain.get("win_rate", 50),
+        },
         "updated_at": datetime.utcnow(),
     }
     await db.auto_trader.update_one(
@@ -309,13 +314,14 @@ async def run_auto_trader():
 
 
 async def reset_auto_trader(initial_capital=10000):
-    # For Alpaca, reset just closes all positions
     from app.services.alpaca_trader import close_all_positions, cancel_all_orders
     await cancel_all_orders()
     await close_all_positions()
     db = get_db()
     await db.trade_history.delete_many({})
-    return {"message": "All positions closed and history cleared"}
+    await db.agent_brain.delete_many({})
+    await db.agent_decisions.delete_many({})
+    return {"message": "All positions closed, history and brain cleared"}
 
 
 async def get_auto_trader_state():
