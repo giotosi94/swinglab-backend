@@ -73,6 +73,10 @@ async def live_prices():
         prices = await get_live_prices(batch)
         all_prices.update(prices)
     return all_prices
+    @router.get("/alpaca/history")
+async def alpaca_history():
+    from app.services.alpaca_trader import get_portfolio_periods
+    return await get_portfolio_periods()
 @router.get("/alpaca")
 async def alpaca_summary():
     return await get_alpaca_summary()
