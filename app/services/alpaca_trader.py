@@ -226,7 +226,9 @@ async def get_live_prices(symbols):
         except Exception as e:
             print("Live prices error: {}".format(e))
             return {}
-            async def get_portfolio_periods():
+
+
+async def get_portfolio_periods():
     """Get equity history for multiple time periods"""
     periods = {}
     for label, period, tf in [("1W","1W","1D"),("1M","1M","1D"),("3M","3M","1D"),("6M","6M","1D"),("1Y","1A","1D"),("YTD","1A","1D")]:
