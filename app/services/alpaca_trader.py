@@ -226,3 +226,31 @@ async def get_live_prices(symbols):
         except Exception as e:
             print("Live prices error: {}".format(e))
             return {}
+            async def get_portfolio_periods():
+    """Get equity history for multiple time periods"""
+    periods = {}
+    for label, period, tf in [("1W","1W","1D"),("1M","1M","1D"),("3M","3M","1D"),("6M","6M","1D"),("1Y","1A","1D"),("YTD","1A","1D")]:
+        url = "{}/v2/account/portfolio/history?period={}&timeframe={}".format(ALPACA_BASE, period, tf)
+        async with httpx.AsyncClient(timeout=15) as client:
+            try:
+                r = await client.get(url, headers=HEADERS)
+                if r.status_code == 200:
+                    data = r.json()
+                    ts = data.get("timestamp", [])
+                    eq = data.get("equity", [])
+                    pl = data.get("profit_loss", [])
+                    plp = data.get("profit_loss_pct", [])
+                    points = []
+                    for i in range(len(ts)):
+                        if eq[i]:
+                            points.append({
+                                "date": datetime.fromtimestamp(ts[i]).strftime("%Y-%m-%d"),
+                                "equity": round(eq[i], 2),
+                                "pnl": round((pl[i] or 0), 2),
+                                "pnl_pct": round((plp[i] or 0) * 100, 2),
+                            })
+                    if points:
+                        periods[label] = points
+            except:
+                pass
+    return periods
