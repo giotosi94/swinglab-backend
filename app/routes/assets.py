@@ -4,6 +4,7 @@ from app.db.mongodb import get_db
 
 router = APIRouter()
 
+
 @router.get("/")
 async def get_assets(
     sector: Optional[str] = None,
@@ -18,11 +19,20 @@ async def get_assets(
     if min_score > 0:
         query["setup_score"] = {"$gte": min_score}
 
-    assets = await db.assets.find(query).to_list(limit)
+    projection = {
+        "price_history": 0,
+        "vp_distribution": 0,
+        "multi_tf_vp": 0,
+        "fvg": 0,
+        "history": 0,
+    }
+
+    assets = await db.assets.find(query, projection).to_list(limit)
     for a in assets:
         a["_id"] = str(a["_id"])
     assets.sort(key=lambda x: x.get(sort_by, 0), reverse=True)
     return assets
+
 
 @router.get("/{ticker}")
 async def get_asset(ticker: str):
