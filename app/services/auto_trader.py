@@ -10,7 +10,6 @@ from app.services.agent_brain import analyze_performance, get_learned_params, lo
 async def run_auto_trader():
     db = get_db()
 
-    # Check Alpaca connection
     account = await get_account()
     if not account:
         print("AutoTrader: Alpaca not connected")
@@ -29,9 +28,40 @@ async def run_auto_trader():
     worst_setups = brain.get("worst_setups", [])
     weak_sectors = brain.get("weak_sectors", [])
 
+    # Market context
+    spy_doc = await db.market_regime.find_one({"symbol": "SPY"})
+    vix_doc = await db.market_regime.find_one({"symbol": "VIXY"})
+
+    spy_rsi = spy_doc.get("rsi", 50) if spy_doc else 50
+    spy_price = spy_doc.get("price", 0) if spy_doc else 0
+    spy_ema50 = spy_doc.get("ema50", 0) if spy_doc else 0
+    vix_price = vix_doc.get("price", 20) if vix_doc else 20
+
+    # Market regime
+    if spy_price > spy_ema50 and spy_rsi > 50:
+        market_regime = "BULL"
+        regime_multiplier = 1.0
+    elif spy_price > spy_ema50:
+        market_regime = "NEUTRAL"
+        regime_multiplier = 0.6
+    elif spy_rsi > 35:
+        market_regime = "BEAR"
+        regime_multiplier = 0.3
+    else:
+        market_regime = "CRASH"
+        regime_multiplier = 0.0
+
+    # VIX adjustment
+    if vix_price > 30:
+        regime_multiplier *= 0.5
+    elif vix_price > 25:
+        regime_multiplier *= 0.7
+
     print("=" * 50)
     print("AUTO-TRADER RUNNING (AI Agent)")
     print("Equity: ${:.2f} | Cash: ${:.2f}".format(equity, cash))
+    print("Market: {} | SPY ${} RSI {} | VIX {} | Size: {:.0f}%".format(
+        market_regime, spy_price, round(spy_rsi), vix_price, regime_multiplier * 100))
     print("Brain: min_conf={}, max_rsi={}, max_hold={}d".format(min_confluence, max_rsi, max_hold))
     if worst_setups:
         print("  Avoiding setups: {}".format(worst_setups))
@@ -39,12 +69,10 @@ async def run_auto_trader():
         print("  Avoiding sectors: {}".format(weak_sectors))
     print("=" * 50)
 
-    # Get current positions from Alpaca
     positions = await get_positions() or []
     open_tickers = [p.get("symbol") for p in positions]
     open_sectors = []
 
-    # Get assets from DB
     assets = await db.assets.find().to_list(300)
     sectors = await db.sectors.find().sort("composite_score", -1).to_list(20)
 
@@ -55,7 +83,6 @@ async def run_auto_trader():
     sector_codes = [s["code"] for s in sectors]
     asset_map = {a["ticker"]: a for a in assets}
 
-    # Track sectors of open positions
     for t in open_tickers:
         a = asset_map.get(t)
         if a:
@@ -103,13 +130,13 @@ async def run_auto_trader():
                     "reason": sell_reason, "rsi_at_entry": rsi,
                     "setup_type": asset.get("setup_type", "unknown"),
                     "sector": asset.get("sector_code", "unknown"),
+                    "market_regime": market_regime,
                     "date": datetime.utcnow(),
                 })
 
                 await log_trade_decision(symbol, "SELL", sell_reason,
-                    {"pnl_pct": round(pnl_pct, 2), "rsi": rsi, "score": setup_score})
+                    {"pnl_pct": round(pnl_pct, 2), "rsi": rsi, "score": setup_score, "regime": market_regime})
 
-    # Refresh positions after sells
     positions = await get_positions() or []
     open_tickers = [p.get("symbol") for p in positions]
     num_positions = len(positions)
@@ -118,8 +145,12 @@ async def run_auto_trader():
     # STEP 2: CHECK BUYS
     # ============================================
     max_positions = 5
-    max_per_position = equity * 0.20
-    risk_per_trade = equity * 0.02
+    max_per_position = equity * 0.20 * regime_multiplier
+    risk_per_trade = equity * 0.02 * regime_multiplier
+
+    if market_regime == "CRASH":
+        print("CRASH MODE - no new buys, staying in cash")
+        num_positions = max_positions
 
     if num_positions >= max_positions:
         print("Max positions reached ({}/{})".format(num_positions, max_positions))
@@ -149,7 +180,6 @@ async def run_auto_trader():
             wyckoff = a.get("wyckoff", {})
             accum = a.get("accumulation", {})
 
-            # Calculate confluence
             confluence = 0
             if poc and price and abs(price - poc) / price * 100 <= 2:
                 confluence += 2
@@ -175,7 +205,6 @@ async def run_auto_trader():
             if 0 < change <= 5:
                 confluence += 0.5
 
-            # Wyckoff bonus
             wyckoff_signal = wyckoff.get("signal", "neutral")
             if wyckoff_signal in ("strong_bullish", "bullish_soon"):
                 confluence += 1.5
@@ -184,14 +213,13 @@ async def run_auto_trader():
             elif wyckoff_signal in ("bearish", "bearish_soon"):
                 confluence -= 2
 
-            # Accumulation bonus
             accum_score = accum.get("score", 0)
             if accum_score >= 70:
                 confluence += 1
             elif accum_score >= 40:
                 confluence += 0.5
 
-            # AI Agent filters (learned from past trades)
+            # AI Agent filters
             if confluence < min_confluence:
                 continue
             if rsi > max_rsi or rsi < 25:
@@ -204,11 +232,13 @@ async def run_auto_trader():
                 confluence -= 1
             if price <= 1:
                 continue
+            if rel_vol >= 3.0:
+                print("    SKIP {} - extreme volume {:.1f}x (possible earnings)".format(ticker, rel_vol))
+                continue
             sector_count = open_sectors.count(sector)
             if sector_count >= 2:
                 continue
 
-            # Position sizing
             stop_loss = va_low if va_low and va_low < price else round(price * 0.96, 2)
             target_price = va_high if va_high and va_high > price else round(price * 1.08, 2)
             risk_per_share = abs(price - stop_loss)
@@ -217,8 +247,8 @@ async def run_auto_trader():
 
             shares = min(
                 int(risk_per_trade / risk_per_share),
-                int(max_per_position / price),
-                int(buying_power * 0.9 / price)
+                int(max_per_position / price) if max_per_position > 0 else 0,
+                int(buying_power * 0.9 / price) if buying_power > 0 else 0
             )
             if shares <= 0:
                 continue
@@ -267,13 +297,15 @@ async def run_auto_trader():
                     "shares": shares, "target": target, "stop_loss": stop,
                     "confluence": c["confluence"], "setup_type": c["setup_type"],
                     "sector": c["sector"], "rsi_at_entry": c["rsi"],
+                    "market_regime": market_regime,
                     "date": datetime.utcnow(),
                 })
 
                 await log_trade_decision(ticker, "BUY",
-                    "Confluence {}, setup {}, RSI {}".format(c["confluence"], c["setup_type"], c["rsi"]),
+                    "Confluence {}, setup {}, RSI {}, regime {}".format(c["confluence"], c["setup_type"], c["rsi"], market_regime),
                     {"confluence": c["confluence"], "setup": c["setup_type"], "sector": c["sector"],
-                     "rsi": c["rsi"], "brain_params": {"min_conf": min_confluence, "max_rsi": max_rsi}})
+                     "rsi": c["rsi"], "regime": market_regime, "vix": vix_price,
+                     "brain_params": {"min_conf": min_confluence, "max_rsi": max_rsi}})
             else:
                 print("  FAILED to buy {}".format(ticker))
 
@@ -286,6 +318,13 @@ async def run_auto_trader():
         "cash": cash,
         "positions": len(open_tickers),
         "actions": actions,
+        "market": {
+            "regime": market_regime,
+            "spy_price": spy_price,
+            "spy_rsi": round(spy_rsi),
+            "vix": vix_price,
+            "size_multiplier": round(regime_multiplier * 100),
+        },
         "brain": {
             "min_confluence": min_confluence,
             "max_rsi": max_rsi,
@@ -306,10 +345,8 @@ async def run_auto_trader():
         print("  {} {} {}".format(a["action"], a["ticker"], a.get("reason", "")))
 
     return {
-        "equity": equity,
-        "cash": cash,
-        "positions": num_positions,
-        "actions": actions,
+        "equity": equity, "cash": cash, "positions": num_positions,
+        "actions": actions, "regime": market_regime,
     }
 
 
