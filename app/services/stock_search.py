@@ -1,56 +1,22 @@
 import httpx
 import pandas as pd
 import numpy as np
-import asyncio
 from datetime import datetime
 from app.db.mongodb import get_db
 from app.config import settings
 from app.services.data_fetcher import (
     calc_rsi, calc_ema, calc_macd, calc_volume_profile,
     calc_setup_score, detect_setup_type,
-    detect_candlestick_patterns, get_pattern_score_bonus
+    detect_candlestick_patterns, get_pattern_score_bonus,
+    fetch_bars, ALPACA_HEADERS
 )
-
-TD_BASE = "https://api.twelvedata.com"
 
 
 async def search_and_analyze_stock(ticker):
-    """Fetch and analyze a single stock on-demand"""
-    if not settings.TWELVEDATA_API_KEY:
-        return None
-
-    async with httpx.AsyncClient(timeout=60) as client:
-        url = f"{TD_BASE}/time_series"
-        params = {
-            "symbol": ticker,
-            "interval": "1day",
-            "outputsize": 252,
-            "apikey": settings.TWELVEDATA_API_KEY,
-        }
+    async with httpx.AsyncClient(timeout=30) as client:
         try:
-            r = await client.get(url, params=params)
-            if r.status_code != 200:
-                return None
-            data = r.json()
-            if "code" in data and data["code"] != 200:
-                return None
-            values = data.get("values", [])
-            if not values or len(values) < 20:
-                return None
-
-            df = pd.DataFrame(values)
-            df["datetime"] = pd.to_datetime(df["datetime"])
-            df = df.sort_values("datetime").reset_index(drop=True)
-            for col in ["open", "high", "low", "close", "volume"]:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-            df = df.rename(columns={
-                "open": "Open", "high": "High",
-                "low": "Low", "close": "Close",
-                "volume": "Volume"
-            })
-            df = df.dropna()
-
-            if len(df) < 20:
+            df = await fetch_bars(client, ticker)
+            if df is None or len(df) < 20:
                 return None
 
             close = df["Close"]
@@ -87,6 +53,31 @@ async def search_and_analyze_stock(ticker):
             pattern_bonus = get_pattern_score_bonus(patterns)
             patterns_list = [{"name": p["name"], "type": p["type"], "strength": p["strength"], "description": p["description"]} for p in patterns]
 
+            # Price history for chart
+            rs_s = pd.Series(dtype=float)
+            ds = close.diff()
+            gs = ds.where(ds > 0, 0).rolling(14).mean()
+            ls = (-ds.where(ds < 0, 0)).rolling(14).mean()
+            rs_s = 100 - (100 / (1 + gs / ls))
+            e10s = close.ewm(span=10).mean()
+            e20s = close.ewm(span=20).mean()
+            e50s = close.ewm(span=50).mean()
+            price_history = []
+            start_idx = max(20, len(df) - 90)
+            for idx in range(start_idx, len(df)):
+                dr = float(rs_s.iloc[idx]) if not pd.isna(rs_s.iloc[idx]) else 50
+                price_history.append({
+                    "date": df["datetime"].iloc[idx].strftime("%Y-%m-%d") if "datetime" in df.columns else "d{}".format(idx),
+                    "close": round(float(close.iloc[idx]), 2),
+                    "high": round(float(high.iloc[idx]), 2),
+                    "low": round(float(low.iloc[idx]), 2),
+                    "volume": int(volume.iloc[idx]),
+                    "rsi": round(dr, 1),
+                    "ema10": round(float(e10s.iloc[idx]), 2),
+                    "ema20": round(float(e20s.iloc[idx]), 2),
+                    "ema50": round(float(e50s.iloc[idx]), 2),
+                })
+
             ind_data = {
                 "price": price, "rsi": rsi, "macd_histogram": macd["histogram"],
                 "ema10": ema10, "ema20": ema20, "ema50": ema50,
@@ -98,7 +89,6 @@ async def search_and_analyze_stock(ticker):
             setup_score = calc_setup_score(ind_data)
             setup_type = detect_setup_type(ind_data)
 
-            # Save to DB
             db = get_db()
             asset_doc = {
                 "ticker": ticker, "name": ticker, "sector_code": "SEARCH",
@@ -106,11 +96,11 @@ async def search_and_analyze_stock(ticker):
                 "avg_volume": round(avg_vol, 0), "relative_volume": rel_vol,
                 "rsi": rsi, "macd": macd,
                 "ema10": ema10, "ema20": ema20, "ema50": ema50,
-                "momentum_score": rsi, "volume_score": round(rel_vol * 30, 2),
                 "poc_price": poc, "value_area_high": va_high, "value_area_low": va_low,
                 "setup_score": setup_score, "setup_type": setup_type,
                 "vp_distribution": vp_distribution,
                 "candlestick_patterns": patterns_list,
+                "price_history": price_history,
                 "pattern_bonus": pattern_bonus,
                 "high_52w": high_52w, "low_52w": low_52w,
                 "pct_from_high": pct_from_high, "pct_from_low": pct_from_low,
@@ -122,9 +112,8 @@ async def search_and_analyze_stock(ticker):
             await db.assets.update_one(
                 {"ticker": ticker}, {"$set": asset_doc}, upsert=True
             )
-
             return asset_doc
 
         except Exception as e:
-            print(f"Search error {ticker}: {e}")
+            print("Search error {}: {}".format(ticker, e))
             return None
