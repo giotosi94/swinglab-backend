@@ -45,8 +45,37 @@ ALPACA_HEADERS = {
 }
 
 async def fetch_bars(client, symbol):
+    from datetime import timedelta
+    end = datetime.utcnow()
+    start = end - timedelta(days=400)
     url = "https://data.alpaca.markets/v2/stocks/{}/bars".format(symbol)
-    params = {"timeframe": "1Day", "limit": 252, "feed": "iex"}
+    params = {
+        "timeframe": "1Day",
+        "start": start.strftime("%Y-%m-%dT00:00:00Z"),
+        "end": end.strftime("%Y-%m-%dT23:59:59Z"),
+        "limit": 252,
+        "feed": "sip",
+        "adjustment": "split",
+    }
+    try:
+        r = await client.get(url, headers=ALPACA_HEADERS, params=params)
+        if r.status_code != 200:
+            print("  {}: HTTP {}".format(symbol, r.status_code))
+            return None
+        data = r.json()
+        bars = data.get("bars", [])
+        if not bars:
+            print("  {}: no bars".format(symbol))
+            return None
+        df = pd.DataFrame(bars)
+        df = df.rename(columns={"t": "datetime", "o": "Open", "h": "High", "l": "Low", "c": "Close", "v": "Volume"})
+        df["datetime"] = pd.to_datetime(df["datetime"])
+        df = df.sort_values("datetime").reset_index(drop=True)
+        df = df.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
+        return df
+    except Exception as e:
+        print("  {} error: {}".format(symbol, e))
+        return None
     try:
         r = await client.get(url, headers=ALPACA_HEADERS, params=params)
         if r.status_code != 200:
