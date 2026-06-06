@@ -85,6 +85,19 @@ async def live_prices():
         all_prices.update(prices)
     return all_prices
 
+@router.get("/agent/brain")
+async def get_brain():
+    from app.services.agent_brain import get_learned_params
+    return await get_learned_params()
+
+
+@router.get("/agent/decisions")
+async def get_decisions():
+    db = get_db()
+    decisions = await db.agent_decisions.find().sort("date", -1).to_list(50)
+    for d in decisions:
+        d["_id"] = str(d["_id"])
+    return decisions
 
 @router.get("/alpaca")
 async def alpaca_summary():
