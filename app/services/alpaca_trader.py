@@ -101,6 +101,36 @@ async def close_position(symbol):
 async def close_all_positions():
     return await alpaca_request("DELETE", "{}/v2/positions".format(ALPACA_BASE))
 
+async def update_stop_loss(symbol, new_stop_price):
+    """Update stop loss by cancelling old SL and placing new one."""
+    try:
+        orders = await get_orders(status="open", limit=100)
+        if not orders:
+            return None
+        for order in orders:
+            if (order.get("symbol") == symbol and
+                order.get("side") == "sell" and
+                order.get("type") == "stop" and
+                order.get("status") in ("new", "accepted", "pending_new")):
+                old_stop = float(order.get("stop_price", 0))
+                if new_stop_price > old_stop:
+                    await cancel_order(order["id"])
+                    new_order = await place_order(
+                        symbol=symbol,
+                        qty=order.get("qty", "1"),
+                        side="sell",
+                        order_type="stop",
+                        time_in_force="gtc",
+                        stop_price=new_stop_price
+                    )
+                    if new_order:
+                        print(f"  Updated SL {symbol}: ${old_stop} -> ${new_stop_price}")
+                        return new_order
+        return None
+    except Exception as e:
+        print(f"  Update SL error {symbol}: {e}")
+        return None
+
 
 async def get_latest_price(symbol):
     url = "{}/v2/stocks/{}/quotes/latest".format(ALPACA_DATA, symbol)
