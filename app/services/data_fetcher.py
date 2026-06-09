@@ -46,11 +46,11 @@ ALPACA_HEADERS = {
 }
 
 ALPACA_DATA_URL = "https://data.alpaca.markets"
-MAX_STORED_BARS = 300  # Barre massime salvate per stock
+MAX_STORED_BARS = 300
 
 
 # ============================================
-# INDICATOR FUNCTIONS (identiche all'originale)
+# INDICATOR FUNCTIONS
 # ============================================
 
 def calc_rsi(series, period=14):
@@ -118,7 +118,6 @@ def calc_setup_score(data):
     ema50 = data.get("ema50", 0)
     rel_vol = data.get("relative_volume", 1)
     poc = data.get("poc_price")
-    change = data.get("change_pct", 0)
     sector_str = data.get("sector_strength", 50)
     pattern_bonus = data.get("pattern_bonus", 0)
     if price > ema10 > ema20 > ema50 and ema50 > 0: score += 25
@@ -142,7 +141,6 @@ def calc_setup_score(data):
 def detect_setup_type(data):
     price = data.get("price", 0)
     rsi = data.get("rsi", 50)
-    ema10 = data.get("ema10", 0)
     ema20 = data.get("ema20", 0)
     ema50 = data.get("ema50", 0)
     poc = data.get("poc_price")
@@ -279,11 +277,10 @@ def get_pattern_score_bonus(patterns):
 
 
 # ============================================
-# INCREMENTAL BAR STORAGE (MongoDB "stock_bars")
+# INCREMENTAL BAR STORAGE
 # ============================================
 
 async def fetch_bars_from_api(client, symbol, limit=252):
-    """Fetch bars da Alpaca API."""
     end = datetime.utcnow()
     start = end - timedelta(days=400)
     url = f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/bars"
@@ -306,33 +303,22 @@ async def fetch_bars_from_api(client, symbol, limit=252):
 
 
 async def get_or_fetch_bars(client, db, symbol):
-    """
-    INCREMENTAL: controlla se abbiamo barre in MongoDB.
-    - Se NON esistono: fetch completo (252 barre), salva tutto.
-    - Se ESISTONO: fetch SOLO le ultime 5 barre, appendi le nuove, tronca a MAX_STORED_BARS.
-    Ritorna un DataFrame pronto per l'analisi.
-    """
     doc = await db.stock_bars.find_one({"ticker": symbol})
 
     if doc and doc.get("bars") and len(doc["bars"]) >= 20:
-        # --- INCREMENTAL: fetch solo ultime 5 barre ---
-        last_date = doc.get("last_bar_date", "")
         new_bars_raw = await fetch_bars_from_api(client, symbol, limit=5)
-
         if new_bars_raw:
             existing_dates = {b["date"] for b in doc["bars"]}
             new_bars = []
             for b in new_bars_raw:
-                bar_date = b["t"][:10]  # "2026-06-09T..."  -> "2026-06-09"
+                bar_date = b["t"][:10]
                 if bar_date not in existing_dates:
                     new_bars.append({
                         "date": bar_date,
                         "o": b["o"], "h": b["h"], "l": b["l"], "c": b["c"], "v": b["v"],
                     })
-
             if new_bars:
                 all_bars = doc["bars"] + new_bars
-                # Ordina per data e tronca
                 all_bars.sort(key=lambda x: x["date"])
                 all_bars = all_bars[-MAX_STORED_BARS:]
                 last_bar = all_bars[-1]["date"]
@@ -342,16 +328,13 @@ async def get_or_fetch_bars(client, db, symbol):
                 )
                 return _bars_to_df(all_bars)
             else:
-                # Nessuna barra nuova, usa quelle esistenti
                 return _bars_to_df(doc["bars"])
         else:
             return _bars_to_df(doc["bars"])
     else:
-        # --- FULL FETCH: prima volta per questa stock ---
         bars_raw = await fetch_bars_from_api(client, symbol, limit=252)
         if not bars_raw:
             return None
-
         bars = []
         for b in bars_raw:
             bars.append({
@@ -361,7 +344,6 @@ async def get_or_fetch_bars(client, db, symbol):
         bars.sort(key=lambda x: x["date"])
         bars = bars[-MAX_STORED_BARS:]
         last_bar = bars[-1]["date"] if bars else ""
-
         await db.stock_bars.update_one(
             {"ticker": symbol},
             {"$set": {"ticker": symbol, "bars": bars, "last_bar_date": last_bar, "updated_at": datetime.utcnow()}},
@@ -371,7 +353,6 @@ async def get_or_fetch_bars(client, db, symbol):
 
 
 def _bars_to_df(bars):
-    """Converte le barre salvate in MongoDB in un DataFrame per gli indicatori."""
     if not bars or len(bars) < 5:
         return None
     df = pd.DataFrame(bars)
@@ -383,28 +364,23 @@ def _bars_to_df(bars):
 
 
 async def get_or_fetch_bars_batch(client, db, symbols, max_concurrent=10):
-    """Fetch incrementale per piu' symbols in parallelo."""
     semaphore = asyncio.Semaphore(max_concurrent)
     results = {}
-
     async def _fetch_one(sym):
         async with semaphore:
             df = await get_or_fetch_bars(client, db, sym)
             results[sym] = df
-
     await asyncio.gather(*[_fetch_one(s) for s in symbols])
     return results
 
 
 # ============================================
-# STOCK ANALYSIS (identica all'originale)
+# STOCK ANALYSIS
 # ============================================
 
 def analyze_stock(ticker, df, sector_code, sector_scores):
-    """Analizza una singola stock. Logica invariata."""
     if df is None or len(df) < 20:
         return None
-
     close = df["Close"]; volume = df["Volume"]; high = df["High"]; low = df["Low"]
     price = float(close.iloc[-1]); prev_close = float(close.iloc[-2])
     change_pct = round(((price - prev_close) / prev_close) * 100, 2)
@@ -461,7 +437,7 @@ def analyze_stock(ticker, df, sector_code, sector_scores):
 
 
 # ============================================
-# MAIN: SECTORS (ottimizzato + incrementale)
+# SECTORS
 # ============================================
 
 async def fetch_and_analyze_sectors(force=False):
@@ -472,11 +448,9 @@ async def fetch_and_analyze_sectors(force=False):
     print("=" * 50)
 
     async with httpx.AsyncClient(timeout=30) as client:
-        # Fetch SPY + indices + FX + sectors ALL in parallel
         all_syms = ["SPY", "QQQ", "IWM", "DIA", "FXE", "UUP"] + list(SECTOR_MAP.keys())
         bars_map = await get_or_fetch_bars_batch(client, db, all_syms, max_concurrent=8)
 
-        # --- SPY benchmark ---
         spy_df = bars_map.get("SPY")
         spy_return = 0
         if spy_df is not None and len(spy_df) >= 20:
@@ -495,7 +469,6 @@ async def fetch_and_analyze_sectors(force=False):
                           "return_20d": round(spy_return, 2), "updated_at": datetime.utcnow()}}, upsert=True)
             print(f"  SPY: ${spy_price:.2f} RSI={spy_rsi_val:.1f} ret20d={spy_return:.2f}%")
 
-        # --- Indices ---
         for idx_sym in ["QQQ", "IWM", "DIA"]:
             idx_df = bars_map.get(idx_sym)
             if idx_df is not None and len(idx_df) >= 2:
@@ -506,7 +479,6 @@ async def fetch_and_analyze_sectors(force=False):
                     {"$set": {"symbol": idx_sym, "price": round(ip, 2), "change_pct": ic, "return_20d": ir20, "updated_at": datetime.utcnow()}}, upsert=True)
                 print(f"  {idx_sym}: ${ip:.2f} ({ic:+.2f}%)")
 
-        # --- Crypto (no bars storage, just latest) ---
         for crypto in ["BTC/USD", "ETH/USD"]:
             try:
                 cr = await client.get(f"{ALPACA_DATA_URL}/v1beta3/crypto/us/bars",
@@ -522,7 +494,6 @@ async def fetch_and_analyze_sectors(force=False):
             except Exception as e:
                 print(f"  {crypto} error: {e}")
 
-        # --- FX ---
         for fx in ["FXE", "UUP"]:
             fx_df = bars_map.get(fx)
             if fx_df is not None and len(fx_df) >= 2:
@@ -532,7 +503,6 @@ async def fetch_and_analyze_sectors(force=False):
                     {"$set": {"symbol": fx, "price": round(fp, 2), "change_pct": fc, "updated_at": datetime.utcnow()}}, upsert=True)
                 print(f"  {fx}: ${fp:.2f} ({fc:+.2f}%)")
 
-        # --- 11 Sectors ---
         results = []
         for etf, name in SECTOR_MAP.items():
             try:
@@ -574,7 +544,7 @@ async def fetch_and_analyze_sectors(force=False):
 
 
 # ============================================
-# MAIN: STOCKS (incrementale + parallelo)
+# STOCKS
 # ============================================
 
 async def fetch_and_analyze_stocks(force=False):
@@ -598,7 +568,6 @@ async def fetch_and_analyze_stocks(force=False):
     total = len(all_tickers)
     print(f"  Total stocks: {total}")
 
-    # --- BATCH INCREMENTAL FETCH ---
     batch_size = 20
     results = []
 
@@ -608,10 +577,8 @@ async def fetch_and_analyze_stocks(force=False):
             batch_idx = batch_num // batch_size + 1
             total_batches = (total + batch_size - 1) // batch_size
             t_batch = time.time()
-
             print(f"\n  Batch {batch_idx}/{total_batches} ({len(batch)} stocks)")
 
-            # Fetch incrementale in parallelo (10 concurrent)
             bars_map = await get_or_fetch_bars_batch(client, db, batch, max_concurrent=10)
 
             success = 0; skipped = 0
