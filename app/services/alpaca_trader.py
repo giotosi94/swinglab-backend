@@ -259,9 +259,7 @@ async def get_live_prices(symbols):
             return {}
 
 
-async def get_portfolio_periods():
-    periods = {}
-    for label, period, tf in [("1W","1W","1D"),("1M","1M","1D"),("3M","3M","1D"),("6M","6M","1D"),("1Y","1A","1D"),("YTD","1A","1D")]:
+for label, period, tf in [("1D","1D","15Min"),("1W","1W","1D"),("1M","1M","1D"),("3M","3M","1D"),("6M","6M","1D"),("1Y","1A","1D"),("YTD","1A","1D")]:
         url = "{}/v2/account/portfolio/history?period={}&timeframe={}".format(ALPACA_BASE, period, tf)
         async with httpx.AsyncClient(timeout=15) as client:
             try:
