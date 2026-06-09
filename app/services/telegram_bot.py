@@ -1,6 +1,8 @@
 import httpx
+from datetime import datetime
 from app.config import settings
 from app.db.mongodb import get_db
+from app.services.stock_names import get_stock_name
 
 
 async def send_telegram(message):
@@ -17,10 +19,9 @@ async def send_telegram(message):
         async with httpx.AsyncClient() as client:
             r = await client.post(url, json=payload)
             if r.status_code == 200:
-                print("Telegram message sent")
                 return True
             else:
-                print(f"Telegram error: {r.status_code} - {r.text}")
+                print(f"Telegram error: {r.status_code} - {r.text[:100]}")
                 return False
     except Exception as e:
         print(f"Telegram error: {e}")
@@ -28,90 +29,86 @@ async def send_telegram(message):
 
 
 async def send_daily_briefing():
+    """Morning briefing con stato mercato, top picks, e portfolio."""
     db = get_db()
     sectors = await db.sectors.find().sort("composite_score", -1).to_list(20)
-    assets = await db.assets.find().to_list(200)
+    assets = await db.assets.find(
+        {}, {"ticker":1,"setup_score":1,"setup_type":1,"rsi":1,"price":1,"sector_code":1}
+    ).to_list(300)
+    market_ctx = await db.market_context.find_one({"_id": "latest"})
+    alpaca_state = await db.auto_trader.find_one({"_id": "alpaca_state"})
 
     if not assets:
         await send_telegram("SwingLab: No data available.")
-        return None
+        return
 
-    top_sector = sectors[0] if sectors else None
+    regime = market_ctx.get("market_regime", "UNKNOWN") if market_ctx else "UNKNOWN"
+    confidence = market_ctx.get("regime_confidence", 0) if market_ctx else 0
 
-    strong_buys = []
-    buys = []
-    bottoms = []
-    overbought = []
+    sorted_assets = sorted(assets, key=lambda x: x.get("setup_score", 0), reverse=True)
+    strong_buys = [a for a in sorted_assets if a.get("setup_score", 0) >= 65]
+    buys = [a for a in sorted_assets if 50 <= a.get("setup_score", 0) < 65]
+    oversold = [a for a in assets if a.get("rsi", 50) <= 30]
+    overbought = [a for a in assets if a.get("rsi", 50) >= 70]
 
-    for a in assets:
-        score = a.get("setup_score", 0)
-        stype = a.get("setup_type", "")
-        rsi = a.get("rsi", 50)
+    equity = alpaca_state.get("equity", 0) if alpaca_state else 0
+    positions = alpaca_state.get("positions", 0) if alpaca_state else 0
 
-        if score >= 65 and stype in ("breakout", "pullback_to_poc"):
-            strong_buys.append(a)
-        elif score >= 55 and stype in ("pullback_to_poc", "ema_bounce", "breakout"):
-            buys.append(a)
+    regime_emoji = {"BULL":"\U0001F7E2","NEUTRAL":"\U0001F7E1","BEAR":"\U0001F7E0","CRASH":"\U0001F534"}.get(regime, "\u26AA")
 
-        if rsi <= 35:
-            bottoms.append(a)
-        if rsi >= 70:
-            overbought.append(a)
-
-    msg = "<b>SwingLab Daily Briefing</b>\n\n"
-
-    if top_sector:
-        code = top_sector.get("code", "")
-        name = top_sector.get("name", "")
-        comp = top_sector.get("composite_score", 0)
-        msg += "<b>Top Sector:</b> {} ({}) Score: {:.1f}\n\n".format(code, name, comp)
-
-    msg += "<b>Signals:</b>\n"
-    msg += "  Strong Buy: {}\n".format(len(strong_buys))
-    msg += "  Buy: {}\n".format(len(buys))
-    msg += "  Bottoming: {}\n".format(len(bottoms))
-    msg += "  Overbought: {}\n\n".format(len(overbought))
+    msg = "<b>\U0001F305 SwingLab Morning Briefing</b>\n\n"
+    msg += f"<b>Market:</b> {regime_emoji} {regime} ({confidence:.0f}%)\n"
+    if sectors:
+        top = sectors[0]
+        msg += f"<b>Top Sector:</b> {top.get('code','')} ({top.get('name','')}) Score: {top.get('composite_score',0):.1f}\n"
+    msg += f"\n<b>Portfolio:</b> ${equity:,.0f} | {positions} positions\n"
+    msg += f"\n<b>Signals:</b>\n"
+    msg += f"  \U0001F525 Strong Buy: {len(strong_buys)}\n"
+    msg += f"  \U0001F4C8 Buy: {len(buys)}\n"
+    msg += f"  \U0001F4C9 Oversold: {len(oversold)}\n"
+    msg += f"  \u26A0 Overbought: {len(overbought)}\n"
 
     if strong_buys:
-        msg += "<b>STRONG BUY:</b>\n"
-        sorted_sb = sorted(strong_buys, key=lambda x: x.get("setup_score", 0), reverse=True)
-        for a in sorted_sb[:5]:
-            ticker = a.get("ticker", "")
-            price = a.get("price", 0)
-            score = a.get("setup_score", 0)
-            stype = a.get("setup_type", "")
-            msg += "  {} ${:.2f} Score:{} [{}]\n".format(ticker, price, score, stype)
-        msg += "\n"
-
-    if buys:
-        msg += "<b>BUY:</b>\n"
-        sorted_b = sorted(buys, key=lambda x: x.get("setup_score", 0), reverse=True)
-        for a in sorted_b[:5]:
-            ticker = a.get("ticker", "")
-            price = a.get("price", 0)
-            score = a.get("setup_score", 0)
-            msg += "  {} ${:.2f} Score:{}\n".format(ticker, price, score)
-        msg += "\n"
-
-    if bottoms:
-        msg += "<b>BOTTOMING:</b>\n"
-        sorted_bot = sorted(bottoms, key=lambda x: x.get("rsi", 50))
-        for a in sorted_bot[:5]:
-            ticker = a.get("ticker", "")
-            rsi = a.get("rsi", 0)
-            msg += "  {} RSI:{:.1f}\n".format(ticker, rsi)
-        msg += "\n"
-
-    if overbought:
-        msg += "<b>OVERBOUGHT:</b>\n"
-        sorted_ob = sorted(overbought, key=lambda x: x.get("rsi", 50), reverse=True)
-        for a in sorted_ob[:5]:
-            ticker = a.get("ticker", "")
-            rsi = a.get("rsi", 0)
-            msg += "  {} RSI:{:.1f}\n".format(ticker, rsi)
-        msg += "\n"
-
-    msg += "Stocks: {} | Sectors: {}".format(len(assets), len(sectors))
+        msg += f"\n<b>\U0001F525 TOP PICKS:</b>\n"
+        for a in strong_buys[:5]:
+            t = a.get("ticker", "")
+            msg += f"  <b>{t}</b> ({get_stock_name(t)}) ${a.get('price',0):.2f} Score:{a.get('setup_score',0)} [{a.get('setup_type','')}]\n"
 
     await send_telegram(msg)
-    return msg
+    print("\U0001F4F1 Daily briefing sent")
+
+
+async def send_evening_report():
+    """Evening report con P&L del giorno."""
+    db = get_db()
+    today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+
+    trades = await db.trade_history.find({"date": {"$gte": today}}).to_list(50)
+    buys_today = [t for t in trades if t.get("side") == "buy"]
+    sells_today = [t for t in trades if t.get("side") == "sell"]
+
+    alpaca_state = await db.auto_trader.find_one({"_id": "alpaca_state"})
+    equity = alpaca_state.get("equity", 0) if alpaca_state else 0
+
+    msg = "<b>\U0001F319 SwingLab Evening Report</b>\n\n"
+    msg += f"<b>Equity:</b> ${equity:,.2f}\n"
+    msg += f"<b>Today:</b> {len(buys_today)} buys, {len(sells_today)} sells\n"
+
+    if sells_today:
+        total_pnl = sum(t.get("pnl_pct", 0) for t in sells_today)
+        wins = sum(1 for t in sells_today if t.get("pnl_pct", 0) > 0)
+        msg += f"\n<b>Closed:</b>\n"
+        for t in sells_today:
+            emoji = "\U0001F7E2" if t.get("pnl_pct", 0) > 0 else "\U0001F534"
+            ticker = t.get("ticker", "")
+            msg += f"  {emoji} {ticker} ({get_stock_name(ticker)}) {t.get('pnl_pct',0):+.1f}% [{t.get('reason','')}]\n"
+        msg += f"\n<b>Day P&L:</b> {total_pnl:+.1f}% | {wins}/{len(sells_today)} wins\n"
+
+    if buys_today:
+        msg += f"\n<b>New Positions:</b>\n"
+        for t in buys_today:
+            ticker = t.get("ticker", "")
+            msg += f"  \U0001F7E1 {ticker} ({get_stock_name(ticker)}) {t.get('shares',0)} shares @ ${t.get('entry_price',0):.2f}\n"
+
+    await send_telegram(msg)
+    print("\U0001F4F1 Evening report sent")
