@@ -85,19 +85,39 @@ async def live_prices():
         all_prices.update(prices)
     return all_prices
 
+
 @router.get("/agent/brain")
 async def get_brain():
-    from app.services.agent_brain import get_learned_params
-    return await get_learned_params()
+    """Retrocompatibile: ora legge i parametri dall'AlphaStrategist agent."""
+    db = get_db()
+    params = await db.agent_memory_alpha_strategist.find_one({"_id": "params"})
+    if params:
+        params["_id"] = str(params["_id"])
+        return params
+    # Fallback: prova il vecchio agent_brain
+    old_params = await db.agent_brain.find_one({"_id": "learned_params"})
+    if old_params:
+        old_params["_id"] = str(old_params["_id"])
+        return old_params
+    return {"min_confluence": 35, "max_rsi_entry": 68, "best_setups": ["pullback_to_poc", "ema_bounce", "breakout"], "total_trades": 0}
 
 
 @router.get("/agent/decisions")
 async def get_decisions():
+    """Retrocompatibile: aggrega decisioni da tutti e 4 gli agenti."""
     db = get_db()
-    decisions = await db.agent_decisions.find().sort("date", -1).to_list(50)
-    for d in decisions:
-        d["_id"] = str(d["_id"])
-    return decisions
+    all_decisions = []
+    for agent_name in ["macro_analyst", "alpha_strategist", "risk_manager", "executor"]:
+        col_name = f"agent_decisions_{agent_name}"
+        decisions = await db[col_name].find().sort("created_at", -1).to_list(15)
+        for d in decisions:
+            d["_id"] = str(d["_id"])
+            d["agent"] = agent_name
+        all_decisions.extend(decisions)
+    # Ordina per data decrescente
+    all_decisions.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+    return all_decisions[:50]
+
 
 @router.get("/alpaca")
 async def alpaca_summary():
