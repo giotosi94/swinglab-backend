@@ -5,8 +5,9 @@ from datetime import datetime
 
 from app.db.mongodb import connect_db, close_db
 from app.routes import sectors, assets, scanner, targets, data
-from app.routes import agents  # 🆕 Multi-Agent routes
+from app.routes import agents
 from app.routes import settings
+from app.routes import trades  # NEW
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -17,7 +18,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="SwingLab API",
     description="Swing Trading Analysis & Multi-Agent AI System",
-    version="0.3.0",
+    version="0.3.1",
     lifespan=lifespan
 )
 
@@ -34,8 +35,9 @@ app.include_router(assets.router, prefix="/api/assets", tags=["Assets"])
 app.include_router(scanner.router, prefix="/api/scanner", tags=["Scanner"])
 app.include_router(targets.router, prefix="/api/targets", tags=["Targets"])
 app.include_router(data.router, prefix="/api/data", tags=["Data"])
-app.include_router(agents.router, prefix="/api/agents", tags=["Agents"])  # 🆕
+app.include_router(agents.router, prefix="/api/agents", tags=["Agents"])
 app.include_router(settings.router, prefix="/api/settings", tags=["Settings"])
+app.include_router(trades.router, prefix="/api/trades", tags=["Trades"])  # NEW
 
 @app.get("/")
 def root():
@@ -43,7 +45,7 @@ def root():
         "app": "SwingLab",
         "description": "Swing Trading Analysis & Multi-Agent AI System",
         "status": "ok",
-        "version": "0.3.0"
+        "version": "0.3.1"
     }
 
 @app.get("/health")
