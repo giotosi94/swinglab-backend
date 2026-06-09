@@ -304,7 +304,6 @@ async def fetch_bars_from_api(client, symbol, limit=252):
 
 async def get_or_fetch_bars(client, db, symbol):
     doc = await db.stock_bars.find_one({"ticker": symbol})
-
     if doc and doc.get("bars") and len(doc["bars"]) >= 20:
         new_bars_raw = await fetch_bars_from_api(client, symbol, limit=5)
         if new_bars_raw:
@@ -372,6 +371,12 @@ async def get_or_fetch_bars_batch(client, db, symbols, max_concurrent=10):
             results[sym] = df
     await asyncio.gather(*[_fetch_one(s) for s in symbols])
     return results
+
+
+async def fetch_bars(client, symbol):
+    """Backward-compatible wrapper. Used by stock_search.py."""
+    db = get_db()
+    return await get_or_fetch_bars(client, db, symbol)
 
 
 # ============================================
