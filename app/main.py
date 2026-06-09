@@ -6,6 +6,7 @@ from datetime import datetime
 from app.db.mongodb import connect_db, close_db
 from app.routes import sectors, assets, scanner, targets, data
 from app.routes import agents  # 🆕 Multi-Agent routes
+from app.routes import settings
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -34,6 +35,7 @@ app.include_router(scanner.router, prefix="/api/scanner", tags=["Scanner"])
 app.include_router(targets.router, prefix="/api/targets", tags=["Targets"])
 app.include_router(data.router, prefix="/api/data", tags=["Data"])
 app.include_router(agents.router, prefix="/api/agents", tags=["Agents"])  # 🆕
+app.include_router(settings.router, prefix="/api/settings", tags=["Settings"])
 
 @app.get("/")
 def root():
