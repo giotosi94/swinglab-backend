@@ -8,6 +8,7 @@ from app.routes import sectors, assets, scanner, targets, data
 from app.routes import agents
 from app.routes import settings
 from app.routes import trades  # NEW
+from app.routes import ml
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -38,6 +39,7 @@ app.include_router(data.router, prefix="/api/data", tags=["Data"])
 app.include_router(agents.router, prefix="/api/agents", tags=["Agents"])
 app.include_router(settings.router, prefix="/api/settings", tags=["Settings"])
 app.include_router(trades.router, prefix="/api/trades", tags=["Trades"])  # NEW
+app.include_router(ml.router)
 
 @app.get("/")
 def root():
