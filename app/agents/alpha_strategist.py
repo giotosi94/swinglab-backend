@@ -450,8 +450,8 @@ class AlphaStrategist(BaseAgent):
             min_stop = round(price * 0.96, 2)
             min_target = round(price * 1.06, 2)
 
-            stop_loss = min(raw_stop, min_stop)      # wider stop = more protection
-            target_price = max(raw_target, min_target) # higher target = better R/R
+            stop_loss = max(raw_stop, min_stop)        # tighter stop = better R/R
+            target_price = max(raw_target, min_target)  # higher target = better R/R
 
             # Risk/Reward ratio
             risk = abs(price - stop_loss)
