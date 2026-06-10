@@ -22,7 +22,7 @@ try:
     HAS_XGB = True
 except ImportError:
     HAS_XGB = False
-    print("⚠️ XGBoost not installed. Using sklearn fallback.")
+    print("Warning: XGBoost not installed. Using sklearn fallback.")
 
 # Fallback: sklearn
 try:
@@ -32,7 +32,7 @@ try:
     HAS_SKLEARN = True
 except ImportError:
     HAS_SKLEARN = False
-    print("⚠️ scikit-learn not installed. ML features disabled.")
+    print("Warning: scikit-learn not installed. ML features disabled.")
 
 
 class SwingLabModel:
@@ -44,25 +44,17 @@ class SwingLabModel:
         self.metadata = {}
 
     async def train(self, use_synthetic_if_needed=True):
-        """Train the model on trade history."""
         if not HAS_SKLEARN:
             return {"error": "scikit-learn not installed"}
-
-        print("\n🧠 ML MODEL TRAINING")
+        print("\nML MODEL TRAINING")
         print("=" * 50)
-
         db = get_db()
-
-        # Fetch closed trades
         trades = await db.trade_history.find(
             {"side": "sell", "pnl_pct": {"$exists": True}}
         ).to_list(length=5000)
-
-        print(f"  📊 Found {len(trades)} real trades")
-
+        print(f"  Found {len(trades)} real trades")
         features_list = []
         labels = []
-
         if len(trades) >= 15:
             for t in trades:
                 try:
@@ -72,34 +64,27 @@ class SwingLabModel:
                     features_list.append(arr)
                     labels.append(label)
                 except Exception as e:
-                    print(f"  ⚠️ Skip trade: {e}")
+                    print(f"  Skip trade: {e}")
                     continue
-            print(f"  ✅ Extracted {len(features_list)} feature vectors from real trades")
-
+            print(f"  Extracted {len(features_list)} feature vectors from real trades")
         elif use_synthetic_if_needed:
-            print("  📦 Not enough real trades, generating synthetic data...")
+            print("  Not enough real trades, generating synthetic data...")
             syn_features, syn_labels = await self.generate_synthetic_data(300)
             features_list = syn_features
             labels = syn_labels
-            print(f"  ✅ Generated {len(features_list)} synthetic samples")
-
+            print(f"  Generated {len(features_list)} synthetic samples")
         else:
             return {"error": f"Not enough data: {len(trades)} trades (need 15+)"}
-
         if len(features_list) < 15:
             return {"error": f"Not enough valid data: {len(features_list)} samples"}
-
         X = np.array(features_list)
         y = np.array(labels)
-
-        print(f"  📊 Dataset: {len(X)} samples, {sum(y)} wins, {len(y) - sum(y)} losses")
-        print(f"  📊 Win rate: {sum(y) / len(y) * 100:.1f}%")
-
+        print(f"  Dataset: {len(X)} samples, {sum(y)} wins, {len(y) - sum(y)} losses")
+        print(f"  Win rate: {sum(y) / len(y) * 100:.1f}%")
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=0.2, random_state=42,
             stratify=y if len(set(y)) > 1 else None
         )
-
         if HAS_XGB:
             self.model = xgb.XGBClassifier(
                 n_estimators=100, max_depth=4, learning_rate=0.1,
@@ -109,15 +94,12 @@ class SwingLabModel:
             self.model = GradientBoostingClassifier(
                 n_estimators=100, max_depth=4, learning_rate=0.1, random_state=42,
             )
-
-        print("  🔄 Training model...")
+        print("  Training model...")
         self.model.fit(X_train, y_train)
-
         y_pred = self.model.predict(X_test)
         accuracy = round(accuracy_score(y_test, y_pred) * 100, 1)
         precision = round(precision_score(y_test, y_pred, zero_division=0) * 100, 1)
         recall = round(recall_score(y_test, y_pred, zero_division=0) * 100, 1)
-
         importances = self.model.feature_importances_
         feature_names = get_feature_names()
         importance_dict = {
@@ -126,7 +108,6 @@ class SwingLabModel:
                 zip(feature_names, importances), key=lambda x: x[1], reverse=True,
             )
         }
-
         self.is_trained = True
         self.metadata = {
             "accuracy": accuracy, "precision": precision, "recall": recall,
@@ -136,22 +117,18 @@ class SwingLabModel:
             "feature_importance": importance_dict,
             "model_type": "xgboost" if HAS_XGB else "sklearn_gb",
         }
-
         await self.save_to_db()
-
-        print(f"  ✅ Model trained! Accuracy: {accuracy}%")
-        print(f"  📊 Precision: {precision}%, Recall: {recall}%")
-        print(f"  🏆 Top features: {list(importance_dict.keys())[:5]}")
+        print(f"  Model trained! Accuracy: {accuracy}%")
+        print(f"  Precision: {precision}%, Recall: {recall}%")
+        print(f"  Top features: {list(importance_dict.keys())[:5]}")
         print("=" * 50)
-
         return {"status": "trained", **self.metadata, "top_features": dict(list(importance_dict.items())[:5])}
-      async def predict(self, asset, market_context=None):
-        """Predict WIN probability for a single asset."""
+
+    async def predict(self, asset, market_context=None):
         if not self.is_trained:
             loaded = await self.load_from_db()
             if not loaded:
                 return {"ml_score": None, "status": "not_trained"}
-
         try:
             features = extract_features_from_asset(asset, market_context)
             arr = np.array([features_to_array(features)])
@@ -164,16 +141,14 @@ class SwingLabModel:
                 "status": "ok",
             }
         except Exception as e:
-            print(f"  ⚠️ ML predict error: {e}")
+            print(f"  ML predict error: {e}")
             return {"ml_score": None, "status": "error", "error": str(e)}
 
     async def predict_batch(self, assets, market_context=None):
-        """Predict for multiple assets at once."""
         if not self.is_trained:
             loaded = await self.load_from_db()
             if not loaded:
                 return {}
-
         results = {}
         try:
             feature_arrays = []
@@ -182,13 +157,10 @@ class SwingLabModel:
                 features = extract_features_from_asset(asset, market_context)
                 feature_arrays.append(features_to_array(features))
                 tickers.append(asset.get("ticker", "?"))
-
             if not feature_arrays:
                 return {}
-
             X = np.array(feature_arrays)
             probs = self.model.predict_proba(X)
-
             for i, ticker in enumerate(tickers):
                 win_prob = float(probs[i][1]) if probs[i].shape[0] > 1 else float(probs[i][0])
                 results[ticker] = {
@@ -197,12 +169,10 @@ class SwingLabModel:
                     "confidence": round(abs(win_prob - 0.5) * 200, 1),
                 }
         except Exception as e:
-            print(f"  ⚠️ ML batch predict error: {e}")
-
+            print(f"  ML batch predict error: {e}")
         return results
 
     async def save_to_db(self):
-        """Save trained model to MongoDB."""
         if not self.model:
             return False
         try:
@@ -218,14 +188,13 @@ class SwingLabModel:
                 }},
                 upsert=True,
             )
-            print("  💾 Model saved to MongoDB")
+            print("  Model saved to MongoDB")
             return True
         except Exception as e:
-            print(f"  ⚠️ Save model error: {e}")
+            print(f"  Save model error: {e}")
             return False
 
     async def load_from_db(self):
-        """Load model from MongoDB."""
         try:
             db = get_db()
             doc = await db.ml_models.find_one({"_id": "xgboost_v1"})
@@ -235,27 +204,23 @@ class SwingLabModel:
             self.model = pickle.loads(model_bytes)
             self.metadata = doc.get("metadata", {})
             self.is_trained = True
-            print("  📦 Model loaded from MongoDB")
+            print("  Model loaded from MongoDB")
             return True
         except Exception as e:
-            print(f"  ⚠️ Load model error: {e}")
+            print(f"  Load model error: {e}")
             return False
 
     async def get_status(self):
-        """Return model status."""
         if not self.is_trained:
             await self.load_from_db()
-
         if not self.is_trained:
             return {
                 "is_trained": False,
                 "status": "not_trained",
                 "message": "Run /api/ml/train to train the model",
             }
-
         importance = self.metadata.get("feature_importance", {})
         top5 = dict(list(importance.items())[:5])
-
         return {
             "is_trained": True,
             "status": "ready",
@@ -270,32 +235,20 @@ class SwingLabModel:
         }
 
     async def generate_synthetic_data(self, n_samples=300):
-        """
-        Generate synthetic training data from current assets.
-        Used for bootstrapping when no real trades exist.
-        """
         import random
         db = get_db()
-
         assets = await db.assets.find({}).to_list(length=300)
         if not assets:
             return [], []
-
         features_list = []
         labels = []
-
         for _ in range(n_samples):
             asset = random.choice(assets)
             feats = extract_features_from_asset(asset)
-
-            # Add noise
             for key in ["rsi", "relative_volume", "change_pct", "confluence_score"]:
                 if key in feats:
                     feats[key] += random.gauss(0, feats[key] * 0.1 + 0.5)
-
             arr = features_to_array(feats)
-
-            # Simulate outcome based on indicators
             win_prob = 0.45
             rsi = feats.get("rsi", 50)
             if 35 <= rsi <= 60:
@@ -314,13 +267,10 @@ class SwingLabModel:
                 win_prob += 0.05
             if feats.get("has_bullish_patterns", 0) == 1:
                 win_prob += 0.05
-
             win_prob = min(max(win_prob, 0.1), 0.9)
             label = 1 if random.random() < win_prob else 0
-
             features_list.append(arr)
             labels.append(label)
-
         return features_list, labels
 
 
