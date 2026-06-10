@@ -158,6 +158,10 @@ async def alpaca_close_all():
     result = await close_all_positions()
     return result or {"error": "Close all failed"}
 
+@router.delete("/alpaca/orders-all")
+async def alpaca_cancel_all_orders():
+    result = await cancel_all_orders()
+    return result or {"message": "All orders cancelled"}
 
 @router.delete("/alpaca/order/{order_id}")
 async def alpaca_cancel(order_id: str):
