@@ -182,6 +182,7 @@ async def get_brain():
 
 @router.get("/{agent_name}/decisions")
 async def agent_decisions(agent_name: str, limit: int = 20):
+    """Ultime decisioni di un agente specifico."""
     orch = _get_orch()
     agent = orch.agents.get(agent_name)
     if not agent:
@@ -192,6 +193,7 @@ async def agent_decisions(agent_name: str, limit: int = 20):
 
 @router.get("/{agent_name}/performance")
 async def agent_performance(agent_name: str, limit: int = 30):
+    """Storico performance di un agente."""
     orch = _get_orch()
     agent = orch.agents.get(agent_name)
     if not agent:
@@ -202,6 +204,10 @@ async def agent_performance(agent_name: str, limit: int = 30):
 
 @router.get("/{agent_name}/params")
 async def agent_params(agent_name: str):
+    """Parametri appresi di un agente."""
     orch = _get_orch()
     agent = orch.agents.get(agent_name)
     if not agent:
+        return {"error": f"Agent '{agent_name}' not found"}
+    params = await agent.get_params()
+    return {"agent": agent_name, "params": params}
