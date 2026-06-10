@@ -211,13 +211,21 @@ class Executor(BaseAgent):
         failed_buys = []
         buffer_pct = params.get("limit_price_buffer_pct", 0.5) / 100
 
+        # Check existing open orders to avoid duplicates
+        open_orders = await get_orders(status="open", limit=100)
+        open_buy_tickers = set()
+        if open_orders:
+            for o in open_orders:
+                if o.get("side") == "buy" and o.get("status") in ("new", "accepted", "pending_new"):
+                    open_buy_tickers.add(o.get("symbol"))
+
         for t in approved_trades:
             ticker = t["ticker"]
-            shares = t["shares"]
-            price = t["price"]
-            target = t["target_price"]
-            stop = t["stop_loss"]
-            limit_price = round(price * (1 + buffer_pct), 2)
+
+            # Skip if already has open buy order
+            if ticker in open_buy_tickers:
+                print(f"  ⏭ Skip {ticker}: already has open buy order")
+                continue
 
             try:
                 result = await place_bracket_order(
