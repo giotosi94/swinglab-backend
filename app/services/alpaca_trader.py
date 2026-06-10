@@ -38,8 +38,10 @@ async def get_positions():
     return await alpaca_request("GET", "{}/v2/positions".format(ALPACA_BASE))
 
 
-async def get_orders(status="all", limit=50):
-    url = "{}/v2/orders?status={}&limit={}&direction=desc".format(ALPACA_BASE, status, limit)
+async def get_orders(status="all", limit=50, nested=True):
+    url = "{}/v2/orders?status={}&limit={}&direction=desc&nested={}".format(
+        ALPACA_BASE, status, limit, str(nested).lower()
+    )
     return await alpaca_request("GET", url)
 
 
@@ -183,7 +185,7 @@ async def get_alpaca_summary():
     order_list = []
     if orders:
         for o in orders[:20]:
-            order_list.append({
+            order_data = {
                 "id": o.get("id"),
                 "symbol": o.get("symbol"),
                 "qty": o.get("qty"),
@@ -192,7 +194,26 @@ async def get_alpaca_summary():
                 "status": o.get("status"),
                 "filled_avg_price": o.get("filled_avg_price"),
                 "created_at": o.get("created_at"),
-            })
+                "limit_price": o.get("limit_price"),
+                "stop_price": o.get("stop_price"),
+                "order_class": o.get("order_class"),
+            }
+            # Include bracket legs
+            if o.get("legs"):
+                order_data["legs"] = []
+                for leg in o["legs"]:
+                    order_data["legs"].append({
+                        "id": leg.get("id"),
+                        "symbol": leg.get("symbol"),
+                        "qty": leg.get("qty"),
+                        "side": leg.get("side"),
+                        "type": leg.get("type"),
+                        "status": leg.get("status"),
+                        "limit_price": leg.get("limit_price"),
+                        "stop_price": leg.get("stop_price"),
+                        "filled_avg_price": leg.get("filled_avg_price"),
+                    })
+            order_list.append(order_data)
 
     equity_history = []
     if history and history.get("equity"):
