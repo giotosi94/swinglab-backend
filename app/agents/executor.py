@@ -227,6 +227,12 @@ class Executor(BaseAgent):
                 print(f"  ⏭ Skip {ticker}: already has open buy order")
                 continue
 
+            shares = t["shares"]
+            price = t["price"]
+            target = t["target_price"]
+            stop = t["stop_loss"]
+            limit_price = round(price * (1 + buffer_pct), 2)
+
             try:
                 result = await place_bracket_order(
                     symbol=ticker, qty=shares,
