@@ -442,9 +442,16 @@ class AlphaStrategist(BaseAgent):
                 skipped_reasons["low_confluence"] += 1
                 continue
 
-            # Target e stop loss
-            stop_loss = va_low if va_low and va_low < price else round(price * 0.96, 2)
-            target_price = va_high if va_high and va_high > price else round(price * 1.08, 2)
+            # Target e stop loss (hybrid: VA + minimum %)
+            raw_stop = va_low if va_low and va_low < price else round(price * 0.96, 2)
+            raw_target = va_high if va_high and va_high > price else round(price * 1.08, 2)
+
+            # Ensure minimum 4% stop distance and 6% target distance
+            min_stop = round(price * 0.96, 2)
+            min_target = round(price * 1.06, 2)
+
+            stop_loss = min(raw_stop, min_stop)      # wider stop = more protection
+            target_price = max(raw_target, min_target) # higher target = better R/R
 
             # Risk/Reward ratio
             risk = abs(price - stop_loss)
