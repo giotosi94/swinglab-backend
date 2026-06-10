@@ -259,7 +259,9 @@ async def get_live_prices(symbols):
             return {}
 
 
-for label, period, tf in [("1D","1D","15Min"),("1W","1W","1D"),("1M","1M","1D"),("3M","3M","1D"),("6M","6M","1D"),("1Y","1A","1D"),("YTD","1A","1D")]:
+async def get_portfolio_periods():
+    periods = {}
+    for label, period, tf in [("1D","1D","15Min"),("1W","1W","1D"),("1M","1M","1D"),("3M","3M","1D"),("6M","6M","1D"),("1Y","1A","1D"),("YTD","1A","1D")]:
         url = "{}/v2/account/portfolio/history?period={}&timeframe={}".format(ALPACA_BASE, period, tf)
         async with httpx.AsyncClient(timeout=15) as client:
             try:
@@ -274,7 +276,7 @@ for label, period, tf in [("1D","1D","15Min"),("1W","1W","1D"),("1M","1M","1D"),
                     for i in range(len(ts)):
                         if eq[i]:
                             points.append({
-                                "date": datetime.fromtimestamp(ts[i]).strftime("%Y-%m-%d"),
+                                "date": datetime.fromtimestamp(ts[i]).strftime("%H:%M" if tf == "15Min" else "%Y-%m-%d"),
                                 "equity": round(eq[i], 2),
                                 "pnl": round((pl[i] or 0), 2),
                                 "pnl_pct": round((plp[i] or 0) * 100, 2),
