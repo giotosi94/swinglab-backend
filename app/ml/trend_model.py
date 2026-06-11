@@ -187,7 +187,7 @@ class TrendPredictor:
                 continue
             stocks_used += 1
             close = df["Close"]
-            for idx in range(20, len(df) - 5):
+            for idx in range(max(20, len(df) - 60), len(df) - 5):
                 features = extract_trend_features(df, idx)
                 if features is None:
                     continue
