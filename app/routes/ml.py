@@ -51,3 +51,31 @@ async def ml_predict_all():
         "top_20": sorted_preds[:20],
         "model_status": await ml_model.get_status(),
     }
+    from app.ml.trend_model import trend_predictor
+
+
+@router.get("/trend/status")
+async def trend_status():
+    return await trend_predictor.get_status()
+
+
+@router.post("/trend/train")
+async def trend_train():
+    result = await trend_predictor.train()
+    return result
+
+
+@router.post("/trend/predict/{ticker}")
+async def trend_predict_ticker(ticker: str):
+    result = await trend_predictor.predict_stock(ticker)
+    return result
+
+
+@router.get("/trend/all")
+async def trend_predict_all():
+    results = await trend_predictor.predict_all()
+    return {
+        "total": len(results),
+        "predictions": results[:30],
+        "model_status": await trend_predictor.get_status(),
+    }
