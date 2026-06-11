@@ -35,14 +35,25 @@ class Executor(BaseAgent):
         et_offset = timedelta(hours=-4)
         et_now = utc_now + et_offset
         is_weekday = et_now.weekday() < 5
-        market_open = et_now.replace(hour=9, minute=30, second=0, microsecond=0)
-        market_close = et_now.replace(hour=16, minute=0, second=0, microsecond=0)
-        is_trading_hours = market_open <= et_now <= market_close
+
+        # Extended hours: 4:00 AM - 8:00 PM ET
+        extended_open = et_now.replace(hour=4, minute=0, second=0, microsecond=0)
+        extended_close = et_now.replace(hour=20, minute=0, second=0, microsecond=0)
+
+        # Regular hours: 9:30 AM - 4:00 PM ET
+        regular_open = et_now.replace(hour=9, minute=30, second=0, microsecond=0)
+        regular_close = et_now.replace(hour=16, minute=0, second=0, microsecond=0)
+
+        is_regular = regular_open <= et_now <= regular_close
+        is_extended = extended_open <= et_now <= extended_close
+
         return {
-            "is_open": is_weekday and is_trading_hours,
+            "is_open": is_weekday and is_extended,
+            "is_regular": is_weekday and is_regular,
+            "is_extended": is_weekday and is_extended and not is_regular,
             "eastern_time": et_now.strftime("%Y-%m-%d %H:%M:%S ET"),
             "is_weekday": is_weekday,
-            "is_trading_hours": is_trading_hours,
+            "session": "regular" if is_regular else ("extended" if is_extended else "closed"),
         }
 
     async def _cancel_stale_orders(self, params: dict) -> int:
