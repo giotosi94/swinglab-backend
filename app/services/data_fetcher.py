@@ -453,7 +453,10 @@ async def fetch_and_analyze_sectors(force=False):
     print("=" * 50)
 
     async with httpx.AsyncClient(timeout=30) as client:
-        all_syms = ["SPY", "QQQ", "IWM", "DIA", "FXE", "UUP"] + list(SECTOR_MAP.keys())
+        all_syms = [
+            "SPY", "QQQ", "IWM", "DIA", "FXE", "UUP",
+            "TLT", "HYG", "LQD", "GLD", "USO", "RSP", "IWO", "VXX", "EEM", "IYT",
+        ] + list(SECTOR_MAP.keys())
         bars_map = await get_or_fetch_bars_batch(client, db, all_syms, max_concurrent=8)
 
         spy_df = bars_map.get("SPY")
@@ -508,6 +511,29 @@ async def fetch_and_analyze_sectors(force=False):
                     {"$set": {"symbol": fx, "price": round(fp, 2), "change_pct": fc, "updated_at": datetime.utcnow()}}, upsert=True)
                 print(f"  {fx}: ${fp:.2f} ({fc:+.2f}%)")
 
+        # Macro indicators (Bonds, Commodities, Breadth, Risk Appetite)
+        macro_syms = ["TLT", "HYG", "LQD", "GLD", "USO", "RSP", "IWO", "VXX", "EEM", "IYT"]
+        for sym in macro_syms:
+            sym_df = bars_map.get(sym)
+            if sym_df is not None and len(sym_df) >= 2:
+                sp = float(sym_df["Close"].iloc[-1])
+                spp = float(sym_df["Close"].iloc[-2])
+                sc = round(((sp - spp) / spp) * 100, 2)
+                extra = {"symbol": sym, "price": round(sp, 2), "change_pct": sc, "updated_at": datetime.utcnow()}
+                # Add RSI and EMAs for richer analysis
+                if len(sym_df) >= 20:
+                    try:
+                        extra["rsi"] = round(float(calc_rsi(sym_df["Close"])), 1)
+                        extra["ema20"] = round(float(calc_ema(sym_df["Close"], 20)), 2)
+                        extra["ema50"] = round(float(calc_ema(sym_df["Close"], 50)), 2) if len(sym_df) >= 50 else 0
+                        extra["return_20d"] = round(((sp / float(sym_df["Close"].iloc[-20])) - 1) * 100, 2)
+                    except:
+                        pass
+                await db.market_regime.update_one({"symbol": sym}, {"$set": extra}, upsert=True)
+                print(f"  {sym}: ${sp:.2f} ({sc:+.2f}%)")
+            else:
+                print(f"  {sym}: no data")
+        
         results = []
         for etf, name in SECTOR_MAP.items():
             try:
