@@ -26,13 +26,16 @@ class MacroAnalyst(BaseAgent):
     def default_params(self) -> dict:
         return {
             # Pesi per il calcolo del regime_confidence
-            "w_spy_trend": 0.25,
-            "w_spy_rsi": 0.15,
-            "w_vix": 0.15,
-            "w_breadth": 0.20,
-            "w_indices_alignment": 0.10,
-            "w_crypto": 0.05,
-            "w_dollar": 0.10,
+           "w_spy_trend": 0.18,
+            "w_spy_rsi": 0.10,
+            "w_vix": 0.12,
+            "w_breadth": 0.15,
+            "w_indices_alignment": 0.08,
+            "w_crypto": 0.04,
+            "w_dollar": 0.08,
+            "w_bonds": 0.10,
+            "w_commodities": 0.05,
+            "w_risk_appetite": 0.10,
             # Soglie per VIXY (non VIX spot!)
             "vixy_high": 22,
             "vixy_extreme": 28,
@@ -175,7 +178,109 @@ class MacroAnalyst(BaseAgent):
         else:
             dollar_strength = "neutral"
             dollar_score = 55
+# ============================================
+        # 5B. BONDS & CREDIT (TLT, HYG, LQD)
+        # ============================================
+        tlt = await db.market_regime.find_one({"symbol": "TLT"})
+        hyg = await db.market_regime.find_one({"symbol": "HYG"})
+        lqd = await db.market_regime.find_one({"symbol": "LQD"})
 
+        tlt_change = tlt.get("change_pct", 0) if tlt else 0
+        hyg_change = hyg.get("change_pct", 0) if hyg else 0
+        lqd_change = lqd.get("change_pct", 0) if lqd else 0
+
+        # Credit spread: HYG dropping more than LQD = credit stress
+        credit_spread = hyg_change - lqd_change
+        # TLT rising = flight to safety
+        bonds_flight = tlt_change > 0.5
+
+        if credit_spread < -0.5 and bonds_flight:
+            bonds_signal = "risk_off"
+            bonds_score = 20
+        elif credit_spread < -0.3:
+            bonds_signal = "credit_stress"
+            bonds_score = 35
+        elif credit_spread > 0.3 and tlt_change < 0:
+            bonds_signal = "risk_on"
+            bonds_score = 80
+        elif tlt_change > 0.5:
+            bonds_signal = "flight_to_safety"
+            bonds_score = 40
+        else:
+            bonds_signal = "neutral"
+            bonds_score = 60
+
+        # ============================================
+        # 5C. COMMODITIES (GLD, USO)
+        # ============================================
+        gld = await db.market_regime.find_one({"symbol": "GLD"})
+        uso = await db.market_regime.find_one({"symbol": "USO"})
+
+        gld_change = gld.get("change_pct", 0) if gld else 0
+        uso_change = uso.get("change_pct", 0) if uso else 0
+
+        if gld_change > 1 and spy_return_20d < 0:
+            commodities_signal = "risk_off"
+            commodities_score = 25
+        elif gld_change > 0.5 and uso_change > 1:
+            commodities_signal = "inflation"
+            commodities_score = 40
+        elif gld_change < -0.5 and uso_change > 0:
+            commodities_signal = "growth"
+            commodities_score = 75
+        elif gld_change < 0:
+            commodities_signal = "risk_on"
+            commodities_score = 70
+        else:
+            commodities_signal = "neutral"
+            commodities_score = 55
+
+        # ============================================
+        # 5D. BREADTH DIVERGENCE (RSP vs SPY)
+        # ============================================
+        rsp = await db.market_regime.find_one({"symbol": "RSP"})
+        rsp_change = rsp.get("change_pct", 0) if rsp else 0
+        spy_change = spy.get("change_pct", 0) if spy else 0
+
+        breadth_gap = rsp_change - spy_change
+        if breadth_gap > 0.5:
+            breadth_divergence = "broad_rally"
+            breadth_div_score = 85
+        elif breadth_gap > -0.3:
+            breadth_divergence = "normal"
+            breadth_div_score = 60
+        elif breadth_gap > -1.0:
+            breadth_divergence = "narrow"
+            breadth_div_score = 40
+        else:
+            breadth_divergence = "very_narrow"
+            breadth_div_score = 20
+
+        # ============================================
+        # 5E. RISK APPETITE (IWO, EEM, IYT)
+        # ============================================
+        iwo = await db.market_regime.find_one({"symbol": "IWO"})
+        eem = await db.market_regime.find_one({"symbol": "EEM"})
+        iyt = await db.market_regime.find_one({"symbol": "IYT"})
+
+        iwo_change = iwo.get("change_pct", 0) if iwo else 0
+        eem_change = eem.get("change_pct", 0) if eem else 0
+        iyt_change = iyt.get("change_pct", 0) if iyt else 0
+
+        risk_signals = sum(1 for x in [iwo_change, eem_change, iyt_change] if x > 0)
+
+        if risk_signals == 3 and iyt_change > 0.5:
+            risk_appetite = "strong"
+            risk_appetite_score = 90
+        elif risk_signals >= 2:
+            risk_appetite = "moderate"
+            risk_appetite_score = 70
+        elif risk_signals == 1:
+            risk_appetite = "low"
+            risk_appetite_score = 40
+        else:
+            risk_appetite = "risk_off"
+            risk_appetite_score = 20
         # ============================================
         # 6. SECTOR ROTATION & RANKINGS
         # ============================================
@@ -242,13 +347,16 @@ class MacroAnalyst(BaseAgent):
         # ============================================
         w = params
         regime_confidence = round(
-            spy_trend_score * w.get("w_spy_trend", 0.25) +
-            rsi_score * w.get("w_spy_rsi", 0.15) +
-            vol_score * w.get("w_vix", 0.15) +
-            breadth_score * w.get("w_breadth", 0.20) +
-            alignment_score * w.get("w_indices_alignment", 0.10) +
-            crypto_score * w.get("w_crypto", 0.05) +
-            dollar_score * w.get("w_dollar", 0.10)
+            spy_trend_score * w.get("w_spy_trend", 0.18) +
+            rsi_score * w.get("w_spy_rsi", 0.10) +
+            vol_score * w.get("w_vix", 0.12) +
+            breadth_score * w.get("w_breadth", 0.15) +
+            alignment_score * w.get("w_indices_alignment", 0.08) +
+            crypto_score * w.get("w_crypto", 0.04) +
+            dollar_score * w.get("w_dollar", 0.08) +
+            bonds_score * w.get("w_bonds", 0.10) +
+            commodities_score * w.get("w_commodities", 0.05) +
+            risk_appetite_score * w.get("w_risk_appetite", 0.10)
         , 1)
 
         # Determine final regime
@@ -289,6 +397,10 @@ class MacroAnalyst(BaseAgent):
             "dollar_strength": dollar_strength,
             "market_breadth": market_breadth,
             "breadth_pct": breadth_pct,
+            "bonds_signal": bonds_signal,
+            "commodities_signal": commodities_signal,
+            "breadth_divergence": breadth_divergence,
+            "risk_appetite": risk_appetite,
             "sector_rankings": sector_rankings,
             # Dettagli per debug/monitoring
             "details": {
@@ -304,6 +416,17 @@ class MacroAnalyst(BaseAgent):
                            "net": dollar_net, "score": dollar_score},
                 "breadth": {"above_ema50": above_ema50, "total": total_stocks,
                             "pct": breadth_pct, "score": breadth_score},
+                "bonds": {"tlt_change": tlt_change, "hyg_change": hyg_change,
+                          "lqd_change": lqd_change, "credit_spread": round(credit_spread, 2),
+                          "signal": bonds_signal, "score": bonds_score},
+                "commodities": {"gld_change": gld_change, "uso_change": uso_change,
+                                "signal": commodities_signal, "score": commodities_score},
+                "breadth_div": {"spy_change": spy_change, "rsp_change": rsp_change,
+                                "gap": round(breadth_gap, 2), "signal": breadth_divergence,
+                                "score": breadth_div_score},
+                "risk_appetite_detail": {"iwo_change": iwo_change, "eem_change": eem_change,
+                                  "iyt_change": iyt_change, "signal": risk_appetite,
+                                  "score": risk_appetite_score},
             },
             "analyzed_at": datetime.utcnow().isoformat(),
         }
