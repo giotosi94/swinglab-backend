@@ -142,6 +142,111 @@ class Executor(BaseAgent):
 
         return adjustments
 
+    async def _sync_closed_trades(self):
+        """
+        Sincronizza i trade chiusi da Alpaca (TP/SL scattati broker-side)
+        con la trade_history di SwingLab.
+        """
+        db = get_db()
+        synced = 0
+
+        try:
+            orders = await get_orders(status="closed", limit=50)
+            if not orders:
+                return synced
+
+            positions = await get_positions() or []
+            open_tickers = {p.get("symbol") for p in positions}
+
+            for order in orders:
+                if order.get("side") != "sell" or order.get("status") != "filled":
+                    continue
+
+                ticker = order.get("symbol", "")
+                filled_price = float(order.get("filled_avg_price", 0))
+                filled_qty = int(float(order.get("filled_qty", order.get("qty", 0))))
+                order_type = order.get("type", "")
+                order_id = order.get("id", "")
+
+                if not ticker or filled_price <= 0:
+                    continue
+
+                if ticker in open_tickers:
+                    continue
+
+                existing = await db.trade_history.find_one({
+                    "ticker": ticker, "side": "sell", "order_id": order_id,
+                })
+                if existing:
+                    continue
+
+                recent_sell = await db.trade_history.find_one({
+                    "ticker": ticker, "side": "sell", "exit_price": filled_price,
+                })
+                if recent_sell:
+                    continue
+
+                buy_trade = await db.trade_history.find_one(
+                    {"ticker": ticker, "side": "buy"}, sort=[("date", -1)]
+                )
+
+                entry_price = buy_trade.get("entry_price", 0) if buy_trade else 0
+                shares = buy_trade.get("shares", filled_qty) if buy_trade else filled_qty
+                setup_type = buy_trade.get("setup_type", "unknown") if buy_trade else "unknown"
+                sector = buy_trade.get("sector", "unknown") if buy_trade else "unknown"
+                rsi_at_entry = buy_trade.get("rsi_at_entry", 50) if buy_trade else 50
+                market_regime = buy_trade.get("market_regime", "UNKNOWN") if buy_trade else "UNKNOWN"
+                buy_date = buy_trade.get("date", datetime.utcnow()) if buy_trade else datetime.utcnow()
+
+                if entry_price > 0:
+                    pnl_pct = round(((filled_price - entry_price) / entry_price) * 100, 2)
+                    pnl_dollar = round(pnl_pct / 100 * entry_price * shares, 2)
+                else:
+                    pnl_pct = 0
+                    pnl_dollar = 0
+
+                if order_type == "stop" or order_type == "stop_limit":
+                    reason = "STOP_LOSS"
+                elif order_type == "limit":
+                    reason = "TAKE_PROFIT"
+                else:
+                    reason = "TP_OR_SL"
+
+                days_held = max(1, (datetime.utcnow() - buy_date).days) if buy_date else 1
+
+                trade_doc = {
+                    "ticker": ticker, "side": "sell",
+                    "entry_price": entry_price, "exit_price": filled_price,
+                    "shares": shares, "pnl_pct": pnl_pct, "pnl_dollar": pnl_dollar,
+                    "days_held": days_held, "reason": reason,
+                    "setup_type": setup_type, "sector": sector,
+                    "rsi_at_entry": rsi_at_entry, "market_regime": market_regime,
+                    "order_id": order_id, "agent": "executor_sync",
+                    "date": datetime.utcnow(), "synced": True,
+                }
+
+                await db.trade_history.insert_one(trade_doc)
+                await db.trailing_stops.delete_one({"ticker": ticker})
+
+                emoji = "🟢" if pnl_pct > 0 else "🔴"
+                print(f"  {emoji} SYNCED {reason} {ticker}: {pnl_pct:+.2f}% (${pnl_dollar:+.0f}) {days_held}d")
+
+                msg = (f"{emoji} <b>SYNCED {reason} {ticker}</b>\n"
+                       f"Entry: ${entry_price} -> Exit: ${filled_price}\n"
+                       f"P&L: {pnl_pct:+.2f}% (${pnl_dollar:+.0f})\n"
+                       f"Days: {days_held} | Setup: {setup_type}")
+                await self._send_notification(msg, await self.get_params())
+
+                synced += 1
+
+        except Exception as e:
+            print(f"  ⚠️ Trade sync error: {e}")
+
+        if synced > 0:
+            print(f"  📥 Synced {synced} closed trades from Alpaca")
+
+        return synced
+    
     async def analyze(self, context: dict) -> dict:
         db = get_db()
         params = await self.get_params()
@@ -161,7 +266,10 @@ class Executor(BaseAgent):
                 "cancelled_stale": 0, "trailing_adjustments": [],
                 "market_status": market_status, "message": msg,
             }
-
+       
+        # 0.5 SYNC CLOSED TRADES (TP/SL fired by Alpaca)
+        synced = await self._sync_closed_trades()
+        
         # 1. CANCEL STALE ORDERS
         cancelled = await self._cancel_stale_orders(params)
 
