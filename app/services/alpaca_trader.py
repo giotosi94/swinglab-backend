@@ -297,7 +297,7 @@ async def get_portfolio_periods():
                     for i in range(len(ts)):
                         if eq[i]:
                             points.append({
-                                "date": datetime.fromtimestamp(ts[i]).strftime("%H:%M" if tf == "15Min" else "%Y-%m-%d"),
+                                "date": str(ts[i]) if tf == "15Min" else datetime.fromtimestamp(ts[i]).strftime("%Y-%m-%d"),
                                 "equity": round(eq[i], 2),
                                 "pnl": round((pl[i] or 0), 2),
                                 "pnl_pct": round((plp[i] or 0) * 100, 2),
