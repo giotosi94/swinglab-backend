@@ -5,6 +5,7 @@ SwingLab ML — API Routes
 from fastapi import APIRouter
 from app.db.mongodb import get_db
 from app.ml.model import ml_model
+from app.ml.trend_model import trend_predictor
 
 router = APIRouter(prefix="/api/ml", tags=["ml"])
 
