@@ -63,7 +63,26 @@ async def reset_trader(capital: float = Query(default=10000)):
 @router.get("/market")
 async def get_market_data():
     db = get_db()
-    symbols = ["SPY", "QQQ", "IWM", "DIA", "VIX", "VIXY", "BTC/USD", "ETH/USD", "FXE", "UUP"]
+    symbols = [
+        # Indici
+        "SPY", "QQQ", "IWM", "DIA",
+        # Volatilità
+        "VIXY", "VXX",
+        # Bonds & Credit
+        "TLT", "HYG", "LQD",
+        # Commodities
+        "GLD", "USO",
+        # Breadth & Style
+        "RSP", "IWO",
+        # Dollar & FX
+        "FXE", "UUP",
+        # Emerging
+        "EEM",
+        # Transport (economia reale)
+        "IYT",
+        # Crypto
+        "BTC/USD", "ETH/USD",
+    ]
     result = {}
     for sym in symbols:
         doc = await db.market_regime.find_one({"symbol": sym})
