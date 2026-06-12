@@ -195,13 +195,10 @@ async def reset_all_bars():
 
 @router.get("/test-bars/{symbol}")
 async def test_bars(symbol: str):
+    from app.services.data_fetcher import fetch_bars_from_api
     import httpx
-    url = f"https://data.alpaca.markets/v2/stocks/{symbol}/bars"
-    headers = {
-        "APCA-API-KEY-ID": settings.ALPACA_API_KEY,
-        "APCA-API-SECRET-KEY": settings.ALPACA_SECRET_KEY,
-    }
-    params = {"timeframe": "1Day", "limit": 5, "feed": "sip", "adjustment": "split"}
     async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(url, headers=headers, params=params)
-        return {"status": r.status_code, "data": r.json() if r.status_code == 200 else r.text}
+        bars = await fetch_bars_from_api(client, symbol, limit=5)
+        if bars:
+            return {"count": len(bars), "last": bars[-1]["t"][:10], "bars": bars}
+        return {"count": 0, "error": "No bars returned"}
