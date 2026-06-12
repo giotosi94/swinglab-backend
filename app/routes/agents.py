@@ -58,6 +58,7 @@ async def run_macro():
             "breadth_pct": result.get("breadth_pct", 0),
             "rotation": result.get("rotation_signal", "unknown"),
             "sector_rankings": result.get("sector_rankings", []),
+            "llm_reasoning": result.get("llm_reasoning"),
         })
         return {"status": "ok", "agent": "macro_analyst", "result": result}
     except Exception as e:
