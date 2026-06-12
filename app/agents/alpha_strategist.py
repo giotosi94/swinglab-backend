@@ -480,6 +480,47 @@ class AlphaStrategist(BaseAgent):
         # Prendi i top (max 10 candidati)
         top_candidates = candidates[:10]
 
+# ============================================
+        # LLM REASONING per ogni candidato (optional)
+        # ============================================
+        from app.services.llm_service import llm_ask, llm_available
+        if llm_available() and top_candidates:
+            for candidate in top_candidates[:5]:
+                try:
+                    factors_pass = [f["name"] for f in candidate.get("confluence_detail", {}).get("factors", []) if f.get("pass")]
+                    factors_fail = [f["name"] for f in candidate.get("confluence_detail", {}).get("factors", []) if not f.get("pass")]
+
+                    stock_data = (
+                        f"Ticker: {candidate['ticker']} ({candidate.get('sector', '')})\n"
+                        f"Prezzo: ${candidate['price']}\n"
+                        f"Setup: {candidate.get('setup_type', 'unknown')}\n"
+                        f"Confluence: {candidate.get('confluence', 0)}/100\n"
+                        f"RSI: {candidate.get('rsi', 50)}\n"
+                        f"R/R: {candidate.get('risk_reward', 0)}\n"
+                        f"Target: ${candidate.get('target_price', 0)} | Stop: ${candidate.get('stop_loss', 0)}\n"
+                        f"Wyckoff: {candidate.get('wyckoff_phase', 'unknown')}\n"
+                        f"Fattori positivi: {', '.join(factors_pass)}\n"
+                        f"Fattori negativi: {', '.join(factors_fail)}\n"
+                        f"Regime mercato: {market_ctx.get('market_regime', 'NEUTRAL')}"
+                    )
+
+                    analysis = llm_ask(
+                        system_prompt=(
+                            "Sei un analista di swing trading esperto. "
+                            "Valuta questo candidato BUY in max 2 frasi in italiano. "
+                            "Indica se è un buon entry e perché. "
+                            "Sii diretto, concreto, no disclaimers."
+                        ),
+                        user_prompt=stock_data,
+                        max_tokens=150,
+                        temperature=0.3,
+                    )
+                    if analysis:
+                        candidate["llm_analysis"] = analysis
+                        print(f"    🧠 {candidate['ticker']}: {analysis[:60]}...")
+                except Exception as e:
+                    print(f"    LLM error {candidate.get('ticker')}: {e}")
+        
         # Summary
         summary = {
             "total_assets_scanned": len(assets),
