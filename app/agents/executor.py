@@ -258,6 +258,9 @@ class Executor(BaseAgent):
         market_status = self.is_market_open()
         allow_premarket = params.get("allow_premarket", False)
 
+        # 0.5 SYNC CLOSED TRADES (always runs, even when market closed)
+        synced = await self._sync_closed_trades()
+
         if not market_status["is_open"] and not allow_premarket:
             msg = f"Market closed ({market_status['eastern_time']}). {len(approved_trades)} buys and {len(approved_sells)} sells queued."
             print(f"⚡ Executor: {msg}")
@@ -266,10 +269,7 @@ class Executor(BaseAgent):
                 "cancelled_stale": 0, "trailing_adjustments": [],
                 "market_status": market_status, "message": msg,
             }
-       
-        # 0.5 SYNC CLOSED TRADES (TP/SL fired by Alpaca)
-        synced = await self._sync_closed_trades()
-        
+             
         # 1. CANCEL STALE ORDERS
         cancelled = await self._cancel_stale_orders(params)
 
