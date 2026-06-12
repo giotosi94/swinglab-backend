@@ -144,84 +144,77 @@ class Executor(BaseAgent):
 
     async def _sync_closed_trades(self):
         """
-        Sincronizza i trade chiusi da Alpaca (TP/SL scattati broker-side)
-        con la trade_history di SwingLab.
+        Sincronizza i trade chiusi confrontando BUY in trade_history
+        con le posizioni attuali su Alpaca.
+        Se un BUY esiste ma la posizione no → è stato chiuso (TP/SL).
         """
         db = get_db()
         synced = 0
 
         try:
-            orders = await get_orders(status="all", limit=100, nested=False)
-            if not orders:
-                return synced
-
             positions = await get_positions() or []
             open_tickers = {p.get("symbol") for p in positions}
 
-            for order in orders:
-                if order.get("side") != "sell" or order.get("status") != "filled":
-                    continue
+            buy_trades = await db.trade_history.find({"side": "buy"}).to_list(500)
 
-                ticker = order.get("symbol", "")
-                filled_price = float(order.get("filled_avg_price", 0))
-                filled_qty = int(float(order.get("filled_qty", order.get("qty", 0))))
-                order_type = order.get("type", "")
-                order_id = order.get("id", "")
-
-                if not ticker or filled_price <= 0:
+            for buy in buy_trades:
+                ticker = buy.get("ticker", "")
+                if not ticker:
                     continue
 
                 if ticker in open_tickers:
                     continue
 
-                existing = await db.trade_history.find_one({
-                    "ticker": ticker, "side": "sell", "order_id": order_id,
+                existing_sell = await db.trade_history.find_one({
+                    "ticker": ticker, "side": "sell",
                 })
-                if existing:
+                if existing_sell:
                     continue
 
-                recent_sell = await db.trade_history.find_one({
-                    "ticker": ticker, "side": "sell", "exit_price": filled_price,
-                })
-                if recent_sell:
-                    continue
+                orders = await get_orders(status="all", limit=100, nested=False)
+                exit_price = 0
+                reason = "TP_OR_SL"
 
-                buy_trade = await db.trade_history.find_one(
-                    {"ticker": ticker, "side": "buy"}, sort=[("date", -1)]
-                )
+                if orders:
+                    for o in orders:
+                        if (o.get("symbol") == ticker and
+                            o.get("side") == "sell" and
+                            o.get("status") == "filled" and
+                            o.get("filled_avg_price")):
+                            exit_price = float(o["filled_avg_price"])
+                            if o.get("type") == "stop":
+                                reason = "STOP_LOSS"
+                            elif o.get("type") == "limit":
+                                reason = "TAKE_PROFIT"
+                            break
 
-                entry_price = buy_trade.get("entry_price", 0) if buy_trade else 0
-                shares = buy_trade.get("shares", filled_qty) if buy_trade else filled_qty
-                setup_type = buy_trade.get("setup_type", "unknown") if buy_trade else "unknown"
-                sector = buy_trade.get("sector", "unknown") if buy_trade else "unknown"
-                rsi_at_entry = buy_trade.get("rsi_at_entry", 50) if buy_trade else 50
-                market_regime = buy_trade.get("market_regime", "UNKNOWN") if buy_trade else "UNKNOWN"
-                buy_date = buy_trade.get("date", datetime.utcnow()) if buy_trade else datetime.utcnow()
+                if exit_price <= 0:
+                    from app.services.alpaca_trader import get_latest_price
+                    exit_price = await get_latest_price(ticker) or 0
 
-                if entry_price > 0:
-                    pnl_pct = round(((filled_price - entry_price) / entry_price) * 100, 2)
+                entry_price = buy.get("entry_price", 0)
+                shares = buy.get("shares", 0)
+                buy_date = buy.get("date", datetime.utcnow())
+
+                if entry_price > 0 and exit_price > 0:
+                    pnl_pct = round(((exit_price - entry_price) / entry_price) * 100, 2)
                     pnl_dollar = round(pnl_pct / 100 * entry_price * shares, 2)
                 else:
                     pnl_pct = 0
                     pnl_dollar = 0
 
-                if order_type == "stop" or order_type == "stop_limit":
-                    reason = "STOP_LOSS"
-                elif order_type == "limit":
-                    reason = "TAKE_PROFIT"
-                else:
-                    reason = "TP_OR_SL"
-
                 days_held = max(1, (datetime.utcnow() - buy_date).days) if buy_date else 1
 
                 trade_doc = {
                     "ticker": ticker, "side": "sell",
-                    "entry_price": entry_price, "exit_price": filled_price,
+                    "entry_price": entry_price, "exit_price": round(exit_price, 2),
                     "shares": shares, "pnl_pct": pnl_pct, "pnl_dollar": pnl_dollar,
                     "days_held": days_held, "reason": reason,
-                    "setup_type": setup_type, "sector": sector,
-                    "rsi_at_entry": rsi_at_entry, "market_regime": market_regime,
-                    "order_id": order_id, "agent": "executor_sync",
+                    "setup_type": buy.get("setup_type", "unknown"),
+                    "sector": buy.get("sector", "unknown"),
+                    "rsi_at_entry": buy.get("rsi_at_entry", 50),
+                    "market_regime": buy.get("market_regime", "UNKNOWN"),
+                    "agent": "executor_sync",
                     "date": datetime.utcnow(), "synced": True,
                 }
 
@@ -232,9 +225,9 @@ class Executor(BaseAgent):
                 print(f"  {emoji} SYNCED {reason} {ticker}: {pnl_pct:+.2f}% (${pnl_dollar:+.0f}) {days_held}d")
 
                 msg = (f"{emoji} <b>SYNCED {reason} {ticker}</b>\n"
-                       f"Entry: ${entry_price} -> Exit: ${filled_price}\n"
+                       f"Entry: ${entry_price} -> Exit: ${exit_price}\n"
                        f"P&L: {pnl_pct:+.2f}% (${pnl_dollar:+.0f})\n"
-                       f"Days: {days_held} | Setup: {setup_type}")
+                       f"Days: {days_held} | Setup: {buy.get('setup_type', '')}")
                 await self._send_notification(msg, await self.get_params())
 
                 synced += 1
