@@ -431,6 +431,47 @@ class MacroAnalyst(BaseAgent):
             "analyzed_at": datetime.utcnow().isoformat(),
         }
 
+# ============================================
+        # 9. LLM REASONING (optional)
+        # ============================================
+        from app.services.llm_service import llm_ask, llm_available
+        llm_reasoning = None
+        if llm_available():
+            try:
+                data_summary = (
+                    f"SPY: ${spy_price:.2f} (RSI {spy_rsi:.0f}, 20d return {spy_return_20d:+.1f}%)\n"
+                    f"VIX/VIXY: ${vixy_price:.1f}\n"
+                    f"Indices bullish: {indices_bullish}/{indices_total}\n"
+                    f"Breadth: {breadth_pct:.1f}% stocks above EMA50\n"
+                    f"Crypto: BTC {btc_change:+.1f}%, ETH {eth_change:+.1f}%\n"
+                    f"Dollar: UUP {uup_change:+.1f}%, FXE {fxe_change:+.1f}%\n"
+                    f"Bonds: TLT {tlt_change:+.1f}%, HYG {hyg_change:+.1f}%, LQD {lqd_change:+.1f}%\n"
+                    f"Gold: {gld_change:+.1f}%, Oil: {uso_change:+.1f}%\n"
+                    f"RSP vs SPY gap: {breadth_gap:+.2f}%\n"
+                    f"Risk signals (IWO/EEM/IYT): {risk_signals}/3 positive\n"
+                    f"Top sectors: {', '.join(s['code'] for s in sector_rankings[:3])}\n"
+                    f"Bottom sectors: {', '.join(s['code'] for s in sector_rankings[-3:])}\n"
+                    f"Rotation: {rotation_signal}\n"
+                    f"My calculated regime: {market_regime} (confidence {regime_confidence}%)"
+                )
+                llm_reasoning = llm_ask(
+                    system_prompt=(
+                        "Sei un analista macro esperto di swing trading. "
+                        "Analizza i dati di mercato e fornisci una valutazione breve (max 3 frasi) in italiano. "
+                        "Indica: 1) Il regime attuale e perché, 2) Il rischio principale, 3) Suggerimento operativo. "
+                        "Sii diretto e concreto, no disclaimers."
+                    ),
+                    user_prompt=f"Dati di mercato oggi:\n{data_summary}",
+                    max_tokens=200,
+                    temperature=0.3,
+                )
+                if llm_reasoning:
+                    print(f"  🧠 LLM: {llm_reasoning[:100]}...")
+            except Exception as e:
+                print(f"  LLM reasoning error: {e}")
+
+        market_context["llm_reasoning"] = llm_reasoning
+        
         # Log decision
         await self.log_decision(
             decision_type="regime_assessment",
