@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     ALPACA_SECRET_KEY: str = ""
     ALPACA_PAPER: bool = True
     GEMINI_API_KEY: str = ""
+    GROQ_API_KEY: str = ""
 
     class Config:
         env_file = ".env"
