@@ -151,7 +151,7 @@ class Executor(BaseAgent):
         synced = 0
 
         try:
-            orders = await get_orders(status="closed", limit=50, nested=False)
+            orders = await get_orders(status="all", limit=100, nested=False)
             if not orders:
                 return synced
 
