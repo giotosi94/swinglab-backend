@@ -94,7 +94,7 @@ async def get_open_trades():
 @router.delete("/clear-all")
 async def clear_all_trades():
     db = get_db()
-    result = await db.trade_history.delete_many({"side": "sell"})
+    result = await db.trade_history.delete_many({})
     return {"deleted": result.deleted_count}
 from pydantic import BaseModel
 
