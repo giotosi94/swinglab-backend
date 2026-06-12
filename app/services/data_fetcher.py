@@ -331,18 +331,42 @@ async def fetch_bars_from_api(client, symbol, limit=252):
     except Exception:
         return []
 
+async def _fetch_bars_alpaca(client, symbol, limit=252):
+    """Fetch bars directly from Alpaca IEX (historical bulk)."""
+    end = datetime.utcnow() - timedelta(minutes=20)
+    start = end - timedelta(days=400)
+    url = f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/bars"
+    params = {
+        "timeframe": "1Day",
+        "start": start.strftime("%Y-%m-%dT00:00:00Z"),
+        "end": end.strftime("%Y-%m-%dT23:59:59Z"),
+        "limit": limit,
+        "feed": "iex",
+        "adjustment": "split",
+    }
+    try:
+        r = await client.get(url, headers=ALPACA_HEADERS, params=params)
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        return data.get("bars", [])
+    except Exception:
+        return []
 
 async def get_or_fetch_bars(client, db, symbol):
     doc = await db.stock_bars.find_one({"ticker": symbol})
+
     if doc and doc.get("bars") and len(doc["bars"]) >= 20:
-        # Check if bars are stale (last bar > 3 days old)
         last_date = doc["bars"][-1].get("date", "")
         try:
             days_old = (datetime.utcnow() - datetime.strptime(last_date, "%Y-%m-%d")).days
         except:
             days_old = 999
 
-        fetch_limit = min(days_old + 5, 60) if days_old > 3 else 5
+        if days_old <= 1:
+            return _bars_to_df(doc["bars"])
+
+        fetch_limit = min(days_old + 5, 65)
         new_bars_raw = await fetch_bars_from_api(client, symbol, limit=fetch_limit)
         if new_bars_raw:
             existing_dates = {b["date"] for b in doc["bars"]}
@@ -364,20 +388,33 @@ async def get_or_fetch_bars(client, db, symbol):
                     {"$set": {"bars": all_bars, "last_bar_date": last_bar, "updated_at": datetime.utcnow()}}
                 )
                 return _bars_to_df(all_bars)
-            else:
-                return _bars_to_df(doc["bars"])
-        else:
-            return _bars_to_df(doc["bars"])
+        return _bars_to_df(doc["bars"])
+
     else:
-        bars_raw = await fetch_bars_from_api(client, symbol, limit=252)
-        if not bars_raw:
-            return None
+        # Step 1: Bulk historical from Alpaca IEX
+        alpaca_bars_raw = await _fetch_bars_alpaca(client, symbol, limit=252)
         bars = []
-        for b in bars_raw:
+        for b in (alpaca_bars_raw or []):
             bars.append({
                 "date": b["t"][:10],
                 "o": b["o"], "h": b["h"], "l": b["l"], "c": b["c"], "v": b["v"],
             })
+
+        # Step 2: Fill recent gap with Twelve Data
+        recent_raw = await fetch_bars_from_api(client, symbol, limit=45)
+        if recent_raw:
+            existing_dates = {b["date"] for b in bars}
+            for b in recent_raw:
+                bar_date = b["t"][:10]
+                if bar_date not in existing_dates:
+                    bars.append({
+                        "date": bar_date,
+                        "o": b["o"], "h": b["h"], "l": b["l"], "c": b["c"], "v": b["v"],
+                    })
+
+        if not bars:
+            return None
+
         bars.sort(key=lambda x: x["date"])
         bars = bars[-MAX_STORED_BARS:]
         last_bar = bars[-1]["date"] if bars else ""
