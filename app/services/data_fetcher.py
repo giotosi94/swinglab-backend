@@ -307,7 +307,6 @@ async def get_or_fetch_bars(client, db, symbol):
     if doc and doc.get("bars") and len(doc["bars"]) >= 20:
         # Check if bars are stale (last bar > 3 days old)
         last_date = doc["bars"][-1].get("date", "")
-        from datetime import datetime
         try:
             days_old = (datetime.utcnow() - datetime.strptime(last_date, "%Y-%m-%d")).days
         except:
