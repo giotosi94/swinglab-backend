@@ -159,6 +159,7 @@ class Executor(BaseAgent):
             cutoff = datetime.utcnow() - timedelta(days=30)
             buy_trades = await db.trade_history.find({
                 "side": "buy",
+                "agent": {"$in": ["executor", "manual_fix"]},
                 "date": {"$gte": cutoff}
             }).to_list(500)
 
