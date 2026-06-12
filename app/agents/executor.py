@@ -473,7 +473,7 @@ class Executor(BaseAgent):
         print(f"\n⚡ Executor: {len(executed_buys)} buys, {len(executed_sells)} sells, "
               f"{len(trailing_adjustments)} trailing stops, {cancelled} stale cancelled")
 
-       return {
+        return {
             "executed_buys": executed_buys, "executed_sells": executed_sells,
             "failed_orders": failed_orders, "cancelled_stale": cancelled,
             "trailing_adjustments": trailing_adjustments,
