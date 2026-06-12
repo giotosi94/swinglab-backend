@@ -202,3 +202,10 @@ async def test_bars(symbol: str):
         if bars:
             return {"count": len(bars), "last": bars[-1]["t"][:10], "bars": bars}
         return {"count": 0, "error": "No bars returned"}
+
+@router.delete("/trades/{trade_id}")
+async def delete_trade(trade_id: str):
+    from bson import ObjectId
+    db = get_db()
+    result = await db.trade_history.delete_one({"_id": ObjectId(trade_id)})
+    return {"deleted": result.deleted_count}
