@@ -424,6 +424,38 @@ class Executor(BaseAgent):
                     summary += f"  📈 {t['ticker']} stop -> ${t['new_stop']}\n"
             await self._send_notification(summary, params)
 
+# ============================================
+        # LLM REASONING (optional)
+        # ============================================
+        from app.services.llm_service import llm_ask, llm_available
+        executor_reasoning = None
+        if llm_available():
+            try:
+                exec_summary = (
+                    f"Market: {market_status['session']} ({market_status['eastern_time']})\n"
+                    f"Buys executed: {len(executed_buys)} ({', '.join(b['ticker'] for b in executed_buys)})\n"
+                    f"Sells executed: {len(executed_sells)} ({', '.join(s['ticker'] for s in executed_sells)})\n"
+                    f"Failed: {len(failed_orders)} ({', '.join(f['ticker']+': '+f['reason'] for f in failed_orders)})\n"
+                    f"Trailing stops adjusted: {len(trailing_adjustments)}\n"
+                    f"Stale orders cancelled: {cancelled}\n"
+                    f"Regime: {regime}"
+                )
+                executor_reasoning = llm_ask(
+                    system_prompt=(
+                        "Sei un execution specialist di swing trading. "
+                        "Valuta le esecuzioni appena fatte in max 2 frasi in italiano. "
+                        "Indica se le esecuzioni sono state ottimali e cosa migliorare. "
+                        "Sii diretto, concreto, no disclaimers."
+                    ),
+                    user_prompt=f"Execution report:\n{exec_summary}",
+                    max_tokens=150,
+                    temperature=0.3,
+                )
+                if executor_reasoning:
+                    print(f"  🧠 Executor LLM: {executor_reasoning[:80]}...")
+            except Exception as e:
+                print(f"  Executor LLM error: {e}")
+        
         # Log decision
         await self.log_decision(
             decision_type="execution_complete",
@@ -441,11 +473,12 @@ class Executor(BaseAgent):
         print(f"\n⚡ Executor: {len(executed_buys)} buys, {len(executed_sells)} sells, "
               f"{len(trailing_adjustments)} trailing stops, {cancelled} stale cancelled")
 
-        return {
+       return {
             "executed_buys": executed_buys, "executed_sells": executed_sells,
             "failed_orders": failed_orders, "cancelled_stale": cancelled,
             "trailing_adjustments": trailing_adjustments,
             "market_status": market_status,
+            "llm_reasoning": executor_reasoning,
         }
 
     async def learn(self) -> dict:
