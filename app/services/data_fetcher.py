@@ -289,7 +289,7 @@ async def fetch_bars_from_api(client, symbol, limit=252):
         "start": start.strftime("%Y-%m-%dT00:00:00Z"),
         "end": end.strftime("%Y-%m-%dT23:59:59Z"),
         "limit": limit,
-        "feed": "iex",
+        "feed": "sip",
         "adjustment": "split",
     }
     try:
