@@ -182,17 +182,34 @@ class Executor(BaseAgent):
                 reason = "TP_OR_SL"
 
                 if orders:
+                    # Cerca il SELL filled più recente per questo ticker
+                    sell_candidates = []
                     for o in orders:
                         if (o.get("symbol") == ticker and
                             o.get("side") == "sell" and
                             o.get("status") == "filled" and
                             o.get("filled_avg_price")):
-                            exit_price = float(o["filled_avg_price"])
-                            if o.get("type") == "stop":
-                                reason = "STOP_LOSS"
-                            elif o.get("type") == "limit":
-                                reason = "TAKE_PROFIT"
-                            break
+                            fill_price = float(o["filled_avg_price"])
+                            entry = buy.get("entry_price", 0)
+                            # Valida: il fill price deve essere ragionevole
+                            # (entro ±30% dal prezzo di entry)
+                            if entry > 0 and abs(fill_price - entry) / entry > 0.30:
+                                continue  # Skip prezzi anomali
+                            sell_candidates.append({
+                                "price": fill_price,
+                                "type": o.get("type", ""),
+                                "time": o.get("filled_at", o.get("updated_at", "")),
+                            })
+
+                    if sell_candidates:
+                        # Prendi il più recente
+                        sell_candidates.sort(key=lambda x: x["time"], reverse=True)
+                        best = sell_candidates[0]
+                        exit_price = best["price"]
+                        if best["type"] == "stop":
+                            reason = "STOP_LOSS"
+                        elif best["type"] == "limit":
+                            reason = "TAKE_PROFIT"
 
                 if exit_price <= 0:
                     from app.services.alpaca_trader import get_latest_price
