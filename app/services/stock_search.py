@@ -109,6 +109,12 @@ async def search_and_analyze_stock(ticker):
                 "source": "search",
             }
 
+            # Preserve LLM analysis if exists
+            existing = await db.assets.find_one({"ticker": ticker}, {"llm_analysis": 1, "llm_analysis_at": 1})
+            if existing and existing.get("llm_analysis"):
+                asset_doc["llm_analysis"] = existing["llm_analysis"]
+                asset_doc["llm_analysis_at"] = existing.get("llm_analysis_at", "")
+
             await db.assets.update_one(
                 {"ticker": ticker}, {"$set": asset_doc}, upsert=True
             )
