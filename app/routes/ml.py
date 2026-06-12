@@ -52,7 +52,6 @@ async def ml_predict_all():
         "top_20": sorted_preds[:20],
         "model_status": await ml_model.get_status(),
     }
-    from app.ml.trend_model import trend_predictor
 
 
 @router.get("/trend/status")
@@ -75,7 +74,7 @@ async def trend_predict_ticker(ticker: str):
 @router.get("/trend/all")
 async def trend_predict_all():
     results = await trend_predictor.predict_all()
-  return {
+    return {
         "total": len(results),
         "predictions": results,
         "model_status": await trend_predictor.get_status(),
