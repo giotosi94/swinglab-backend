@@ -163,6 +163,19 @@ class Executor(BaseAgent):
                 "date": {"$gte": cutoff}
             }).to_list(500)
 
+            # Filtra: tieni solo BUY che hanno un ordine FILLED su Alpaca
+            all_orders = await get_orders(status="all", limit=200, nested=False)
+            filled_buy_tickers = set()
+            if all_orders:
+                for o in all_orders:
+                    if (o.get("side") == "buy" and
+                        o.get("status") == "filled" and
+                        o.get("filled_avg_price")):
+                        filled_buy_tickers.add(o.get("symbol"))
+
+            # Filtra buy_trades: solo quelli effettivamente filled
+            buy_trades = [b for b in buy_trades if b.get("ticker") in filled_buy_tickers]
+
             for buy in buy_trades:
                 ticker = buy.get("ticker", "")
                 if not ticker:
