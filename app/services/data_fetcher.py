@@ -283,7 +283,7 @@ def get_pattern_score_bonus(patterns):
 async def fetch_bars_from_api(client, symbol, limit=252):
     """Fetch bars: Twelve Data for recent, Alpaca IEX for historical."""
     # For small requests (incremental refresh), use Twelve Data (more accurate)
-    if limit <= 10:
+    if limit <= 65:
         try:
             url = "https://api.twelvedata.com/time_series"
             params = {
