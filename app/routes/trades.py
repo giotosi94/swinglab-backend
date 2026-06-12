@@ -91,3 +91,8 @@ async def get_open_trades():
             open_trades.append(b)
 
     return open_trades
+@router.delete("/clear-all")
+async def clear_all_trades():
+    db = get_db()
+    result = await db.trade_history.delete_many({"side": "sell"})
+    return {"deleted": result.deleted_count}
