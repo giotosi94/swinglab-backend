@@ -281,6 +281,36 @@ def get_pattern_score_bonus(patterns):
 # ============================================
 
 async def fetch_bars_from_api(client, symbol, limit=252):
+    """Fetch bars: Twelve Data for recent, Alpaca IEX for historical."""
+    # For small requests (incremental refresh), use Twelve Data (more accurate)
+    if limit <= 10:
+        try:
+            url = "https://api.twelvedata.com/time_series"
+            params = {
+                "symbol": symbol,
+                "interval": "1day",
+                "outputsize": str(limit),
+                "apikey": settings.TWELVEDATA_API_KEY,
+            }
+            r = await client.get(url, params=params, timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                if "values" in data:
+                    bars = []
+                    for v in reversed(data["values"]):
+                        bars.append({
+                            "t": v["datetime"] + "T00:00:00Z",
+                            "o": float(v["open"]),
+                            "h": float(v["high"]),
+                            "l": float(v["low"]),
+                            "c": float(v["close"]),
+                            "v": int(v["volume"]),
+                        })
+                    return bars
+        except Exception:
+            pass
+
+    # Fallback / bulk: use Alpaca IEX
     end = datetime.utcnow() - timedelta(minutes=20)
     start = end - timedelta(days=400)
     url = f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/bars"
@@ -289,7 +319,7 @@ async def fetch_bars_from_api(client, symbol, limit=252):
         "start": start.strftime("%Y-%m-%dT00:00:00Z"),
         "end": end.strftime("%Y-%m-%dT23:59:59Z"),
         "limit": limit,
-        "feed": "sip",
+        "feed": "iex",
         "adjustment": "split",
     }
     try:
