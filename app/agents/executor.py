@@ -155,7 +155,12 @@ class Executor(BaseAgent):
             positions = await get_positions() or []
             open_tickers = {p.get("symbol") for p in positions}
 
-            buy_trades = await db.trade_history.find({"side": "buy"}).to_list(500)
+            # Solo BUY recenti (ultimi 30 giorni)
+            cutoff = datetime.utcnow() - timedelta(days=30)
+            buy_trades = await db.trade_history.find({
+                "side": "buy",
+                "date": {"$gte": cutoff}
+            }).to_list(500)
 
             for buy in buy_trades:
                 ticker = buy.get("ticker", "")
