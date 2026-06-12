@@ -305,7 +305,16 @@ async def fetch_bars_from_api(client, symbol, limit=252):
 async def get_or_fetch_bars(client, db, symbol):
     doc = await db.stock_bars.find_one({"ticker": symbol})
     if doc and doc.get("bars") and len(doc["bars"]) >= 20:
-        new_bars_raw = await fetch_bars_from_api(client, symbol, limit=5)
+        # Check if bars are stale (last bar > 3 days old)
+        last_date = doc["bars"][-1].get("date", "")
+        from datetime import datetime
+        try:
+            days_old = (datetime.utcnow() - datetime.strptime(last_date, "%Y-%m-%d")).days
+        except:
+            days_old = 999
+
+        fetch_limit = min(days_old + 5, 60) if days_old > 3 else 5
+        new_bars_raw = await fetch_bars_from_api(client, symbol, limit=fetch_limit)
         if new_bars_raw:
             existing_dates = {b["date"] for b in doc["bars"]}
             new_bars = []
