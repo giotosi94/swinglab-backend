@@ -281,7 +281,7 @@ def get_pattern_score_bonus(patterns):
 # ============================================
 
 async def fetch_bars_from_api(client, symbol, limit=252):
-    end = datetime.utcnow()
+    end = datetime.utcnow() - timedelta(minutes=20)
     start = end - timedelta(days=400)
     url = f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/bars"
     params = {
