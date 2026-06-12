@@ -96,3 +96,24 @@ async def clear_all_trades():
     db = get_db()
     result = await db.trade_history.delete_many({"side": "sell"})
     return {"deleted": result.deleted_count}
+from pydantic import BaseModel
+
+class TradeInsert(BaseModel):
+    ticker: str
+    side: str
+    entry_price: float = 0
+    shares: int = 0
+    setup_type: str = "unknown"
+    sector: str = "unknown"
+    rsi_at_entry: float = 50
+    market_regime: str = "NEUTRAL"
+    agent: str = "manual"
+
+@router.post("/insert")
+async def insert_trade(trade: TradeInsert):
+    db = get_db()
+    from datetime import datetime
+    doc = trade.dict()
+    doc["date"] = datetime.utcnow()
+    await db.trade_history.insert_one(doc)
+    return {"inserted": trade.ticker}
