@@ -290,6 +290,44 @@ class RiskManager(BaseAgent):
             "cash_reserve": round(cash_reserve, 2),
         }
 
+# ============================================
+        # 6. LLM REASONING (optional)
+        # ============================================
+        from app.services.llm_service import llm_ask, llm_available
+        llm_reasoning = None
+        if llm_available():
+            try:
+                risk_summary = (
+                    f"Equity: ${equity:.0f} | Cash: ${cash:.0f}\n"
+                    f"Positions: {num_positions}/{max_positions}\n"
+                    f"Exposure: {risk_report['total_exposure_pct']:.1f}%\n"
+                    f"Regime: {market_ctx.get('market_regime', 'NEUTRAL')} (multiplier {final_multiplier:.1f}x)\n"
+                    f"Daily P&L: {loss_check['daily_pnl_pct']:.2f}% | Weekly: {loss_check['weekly_pnl_pct']:.2f}%\n"
+                    f"Sector exposure: {sector_exposure}\n"
+                    f"Approved: {len(approved_trades)} trades ({', '.join(t['ticker'] for t in approved_trades)})\n"
+                    f"Rejected: {len(rejected_trades)} ({', '.join(t['ticker']+': '+t['reason'] for t in rejected_trades[:3])})\n"
+                    f"Sells: {len(approved_sells)} ({', '.join(s['ticker']+': '+s['reason'] for s in approved_sells)})\n"
+                    f"Risk per trade: ${risk_per_trade:.0f}\n"
+                    f"New exposure: ${new_exposure:.0f}"
+                )
+                llm_reasoning = llm_ask(
+                    system_prompt=(
+                        "Sei un risk manager esperto di swing trading. "
+                        "Valuta il portafoglio e le decisioni di rischio in max 3 frasi in italiano. "
+                        "Indica: 1) Se l'esposizione è adeguata, 2) Il rischio principale, 3) Suggerimento. "
+                        "Sii diretto, concreto, no disclaimers."
+                    ),
+                    user_prompt=f"Risk report:\n{risk_summary}",
+                    max_tokens=200,
+                    temperature=0.3,
+                )
+                if llm_reasoning:
+                    print(f"  🧠 Risk LLM: {llm_reasoning[:80]}...")
+            except Exception as e:
+                print(f"  Risk LLM error: {e}")
+
+        risk_report["llm_reasoning"] = llm_reasoning
+        
         # Log decisions
         for t in approved_trades:
             await self.log_decision(
