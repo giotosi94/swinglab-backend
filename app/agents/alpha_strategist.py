@@ -518,6 +518,10 @@ class AlphaStrategist(BaseAgent):
                     if analysis:
                         candidate["llm_analysis"] = analysis
                         print(f"    🧠 {candidate['ticker']}: {analysis[:60]}...")
+                        await db.assets.update_one(
+                            {"ticker": candidate["ticker"]},
+                            {"$set": {"llm_analysis": analysis, "llm_analysis_at": datetime.utcnow().isoformat()}}
+                        )
                 except Exception as e:
                     print(f"    LLM error {candidate.get('ticker')}: {e}")
         
