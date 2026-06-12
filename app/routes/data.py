@@ -186,3 +186,9 @@ async def alpaca_cancel_all_orders():
 async def alpaca_cancel(order_id: str):
     result = await cancel_order(order_id)
     return result or {"error": "Cancel failed"}
+
+@router.delete("/reset-bars")
+async def reset_all_bars():
+    db = get_db()
+    result = await db.stock_bars.delete_many({})
+    return {"deleted": result.deleted_count, "message": "All bars deleted. Next refresh will re-download."}
