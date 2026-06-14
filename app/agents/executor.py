@@ -144,22 +144,21 @@ class Executor(BaseAgent):
 
     async def _sync_closed_trades(self):
         """
-        Sincronizza i trade chiusi confrontando posizioni Alpaca con trade_history.
-        SOLO i BUY che risultano FILLED su Alpaca vengono considerati.
+        Trade Sync v3 DEFINITIVO.
+        Sincronizza SOLO i SELL filled da Alpaca.
+        Un solo SELL per ticker — mai duplicati.
         """
         db = get_db()
         synced = 0
 
         try:
-            # 1. Prendi posizioni attuali e ordini da Alpaca
             positions = await get_positions() or []
             open_tickers = {p.get("symbol") for p in positions}
-            
+
             all_orders = await get_orders(status="all", limit=200, nested=False)
             if not all_orders:
                 return synced
 
-            # 2. Trova SELL filled (TP/SL scattati)
             for order in all_orders:
                 if order.get("side") != "sell" or order.get("status") != "filled":
                     continue
@@ -167,26 +166,29 @@ class Executor(BaseAgent):
                 ticker = order.get("symbol", "")
                 filled_price = float(order.get("filled_avg_price") or 0)
                 order_id = order.get("id", "")
-                order_type = order.get("type", "")
 
-                if not ticker or filled_price <= 0:
+                if not ticker or not order_id or filled_price <= 0:
                     continue
 
-                # Skip se ancora in posizione
                 if ticker in open_tickers:
                     continue
 
-                # Skip se già registrato (per order_id O per ticker+exit_price)
-                existing = await db.trade_history.find_one({
-                    "$or": [
-                        {"order_id": order_id, "side": "sell"},
-                        {"ticker": ticker, "side": "sell", "exit_price": filled_price},
-                    ]
+                # Check 1: questo order_id è già registrato?
+                existing_oid = await db.trade_history.find_one({
+                    "order_id": order_id, "side": "sell",
                 })
-                if existing:
+                if existing_oid:
                     continue
 
-                # Trova il BUY corrispondente in trade_history
+                # Check 2: esiste GIÀ un SELL per questo ticker?
+                # Un solo SELL per ticker — mai duplicati
+                existing_ticker = await db.trade_history.find_one({
+                    "ticker": ticker, "side": "sell",
+                })
+                if existing_ticker:
+                    continue
+
+                # Trova il BUY corrispondente
                 buy_trade = await db.trade_history.find_one(
                     {"ticker": ticker, "side": "buy"},
                     sort=[("date", -1)]
@@ -195,33 +197,30 @@ class Executor(BaseAgent):
                     continue
 
                 entry_price = buy_trade.get("entry_price", 0)
-                
-                # Valida: exit price deve essere ragionevole (entro ±30%)
+
+                # Valida: exit price ragionevole (entro ±30%)
                 if entry_price > 0 and abs(filled_price - entry_price) / entry_price > 0.30:
                     continue
 
                 shares = buy_trade.get("shares", 0)
                 buy_date = buy_trade.get("date", datetime.utcnow())
 
-                # Calcola P&L
-                if entry_price > 0:
-                    pnl_pct = round(((filled_price - entry_price) / entry_price) * 100, 2)
-                    pnl_dollar = round(pnl_pct / 100 * entry_price * shares, 2)
-                else:
-                    pnl_pct = 0
-                    pnl_dollar = 0
+                pnl_pct = round(((filled_price - entry_price) / entry_price) * 100, 2) if entry_price > 0 else 0
+                pnl_dollar = round(pnl_pct / 100 * entry_price * shares, 2)
 
-                # Determina reason
-                if order_type == "stop" or order_type == "stop_limit":
+                order_type = order.get("type", "")
+                if order_type == "stop":
                     reason = "STOP_LOSS"
                 elif order_type == "limit":
                     reason = "TAKE_PROFIT"
+                elif order_type == "market":
+                    reason = "MARKET_SELL"
                 else:
                     reason = "TP_OR_SL"
 
                 days_held = max(1, (datetime.utcnow() - buy_date).days) if buy_date else 1
 
-                trade_doc = {
+                await db.trade_history.insert_one({
                     "ticker": ticker, "side": "sell",
                     "entry_price": entry_price, "exit_price": round(filled_price, 2),
                     "shares": shares, "pnl_pct": pnl_pct, "pnl_dollar": pnl_dollar,
@@ -230,22 +229,14 @@ class Executor(BaseAgent):
                     "sector": buy_trade.get("sector", "unknown"),
                     "rsi_at_entry": buy_trade.get("rsi_at_entry", 50),
                     "market_regime": buy_trade.get("market_regime", "UNKNOWN"),
-                    "order_id": order_id, "agent": "executor_sync",
-                    "date": datetime.utcnow(), "synced": True,
-                }
-
-                await db.trade_history.insert_one(trade_doc)
-                await db.trailing_stops.delete_one({"ticker": ticker})
+                    "order_id": order_id,
+                    "agent": "executor_sync",
+                    "date": datetime.utcnow(),
+                    "synced": True,
+                })
 
                 emoji = "🟢" if pnl_pct > 0 else "🔴"
-                print(f"  {emoji} SYNCED {reason} {ticker}: {pnl_pct:+.2f}% (${pnl_dollar:+.0f}) {days_held}d")
-
-                msg = (f"{emoji} <b>SYNCED {reason} {ticker}</b>\n"
-                       f"Entry: ${entry_price} -> Exit: ${filled_price}\n"
-                       f"P&L: {pnl_pct:+.2f}% (${pnl_dollar:+.0f})\n"
-                       f"Days: {days_held} | Setup: {buy_trade.get('setup_type', '')}")
-                await self._send_notification(msg, await self.get_params())
-
+                print(f"  {emoji} SYNCED {reason} {ticker}: {pnl_pct:+.2f}% (${pnl_dollar:+.0f}) {days_held}d [oid:{order_id[:8]}]")
                 synced += 1
 
         except Exception as e:
