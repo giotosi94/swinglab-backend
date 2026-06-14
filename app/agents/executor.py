@@ -307,6 +307,7 @@ class Executor(BaseAgent):
                         "sector": s.get("sector", "unknown"),
                         "market_regime": regime,
                         "agent": "executor",
+                        "order_id": "executor_direct_" + ticker + "_" + datetime.utcnow().strftime("%Y%m%d"),
                         "date": datetime.utcnow(),
                     })
 
