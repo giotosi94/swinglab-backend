@@ -297,6 +297,21 @@ class RiskManager(BaseAgent):
         llm_reasoning = None
         if llm_available():
             try:
+# Read other agents' reasoning
+                agents_context = ""
+                try:
+                    from app.agents.shared_brain import brain
+                    brain_data = await brain.get_full_state()
+                    macro_r = brain_data.get("market", {}).get("llm_reasoning", "")
+                    if macro_r:
+                        agents_context += f"\nMacro says: {macro_r[:150]}"
+                    candidates = brain_data.get("candidates", {}).get("buy", [])
+                    if candidates:
+                        top_tickers = ", ".join(c.get("ticker", "") for c in candidates[:3])
+                        agents_context += f"\nAlpha top picks: {top_tickers}"
+                except:
+                    pass
+                
                 risk_summary = (
                     f"Equity: ${equity:.0f} | Cash: ${cash:.0f}\n"
                     f"Positions: {num_positions}/{max_positions}\n"
@@ -317,7 +332,7 @@ class RiskManager(BaseAgent):
                         "Indica: 1) Se l'esposizione è adeguata, 2) Il rischio principale, 3) Suggerimento. "
                         "Sii diretto, concreto, no disclaimers."
                     ),
-                    user_prompt=f"Risk report:\n{risk_summary}",
+                    user_prompt=f"Risk report:\n{risk_summary}{agents_context}",
                     max_tokens=200,
                     temperature=0.3,
                 )
