@@ -504,14 +504,27 @@ class AlphaStrategist(BaseAgent):
                         f"Regime mercato: {market_ctx.get('market_regime', 'NEUTRAL')}"
                     )
 
+                    # Fetch news for earnings context
+                    earnings_context = ""
+                    try:
+                        from app.services.news_service import fetch_news
+                        news = await fetch_news(candidate["ticker"], limit=3)
+                        if news:
+                            headlines = "; ".join([n["headline"] for n in news])
+                            earnings_context = f"\nNews recenti: {headlines}"
+                    except:
+                        pass
+
                     analysis = llm_ask(
                         system_prompt=(
                             "Sei un analista di swing trading esperto. "
-                            "Valuta questo candidato BUY in max 2 frasi in italiano. "
-                            "Indica se è un buon entry e perché. "
+                            "Valuta questo candidato BUY in max 3 frasi in italiano. "
+                            "Indica: 1) se è un buon entry e perché, "
+                            "2) se dalle news emergono earnings/trimestrali imminenti o catalyst importanti. "
+                            "Se ci sono earnings entro 7 giorni, AVVISA esplicitamente. "
                             "Sii diretto, concreto, no disclaimers."
                         ),
-                        user_prompt=stock_data,
+                        user_prompt=stock_data + earnings_context,
                         max_tokens=150,
                         temperature=0.3,
                     )
