@@ -423,6 +423,21 @@ class Executor(BaseAgent):
         executor_reasoning = None
         if llm_available():
             try:
+
+# Read other agents' context
+                agents_context = ""
+                try:
+                    from app.agents.shared_brain import brain
+                    brain_data = await brain.get_full_state()
+                    macro_r = brain_data.get("market", {}).get("llm_reasoning", "")
+                    risk_r = brain_data.get("approved", {}).get("risk_report", {}).get("llm_reasoning", "")
+                    if macro_r:
+                        agents_context += f"\nMacro: {macro_r[:100]}"
+                    if risk_r:
+                        agents_context += f"\nRisk: {risk_r[:100]}"
+                except:
+                    pass
+                
                 exec_summary = (
                     f"Market: {market_status['session']} ({market_status['eastern_time']})\n"
                     f"Buys executed: {len(executed_buys)} ({', '.join(b['ticker'] for b in executed_buys)})\n"
@@ -439,7 +454,7 @@ class Executor(BaseAgent):
                         "Indica se le esecuzioni sono state ottimali e cosa migliorare. "
                         "Sii diretto, concreto, no disclaimers."
                     ),
-                    user_prompt=f"Execution report:\n{exec_summary}",
+                    user_prompt=f"Execution report:\n{exec_summary}{agents_context}",
                     max_tokens=150,
                     temperature=0.3,
                 )
