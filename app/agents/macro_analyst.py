@@ -459,7 +459,8 @@ class MacroAnalyst(BaseAgent):
                         "Sei un analista macro esperto di swing trading. "
                         "Analizza i dati di mercato e fornisci una valutazione breve (max 3 frasi) in italiano. "
                         "Indica: 1) Il regime attuale e perché, 2) Il rischio principale, 3) Suggerimento operativo. "
-                        "Sii diretto e concreto, no disclaimers."
+                        "Se siamo in periodo di earnings season (gen/apr/lug/ott), menzionalo. "
+                    "Sii diretto e concreto, no disclaimers."
                     ),
                     user_prompt=f"Dati di mercato oggi:\n{data_summary}",
                     max_tokens=200,
