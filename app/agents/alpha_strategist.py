@@ -490,6 +490,16 @@ class AlphaStrategist(BaseAgent):
                     factors_pass = [f["name"] for f in candidate.get("confluence_detail", {}).get("factors", []) if f.get("pass")]
                     factors_fail = [f["name"] for f in candidate.get("confluence_detail", {}).get("factors", []) if not f.get("pass")]
 
+# Read Macro reasoning from shared brain
+                    macro_reasoning = ""
+                    try:
+                        from app.agents.shared_brain import brain
+                        brain_market = await brain.get_market()
+                        if brain_market.get("llm_reasoning"):
+                            macro_reasoning = f"\nAnalisi Macro: {brain_market['llm_reasoning'][:200]}"
+                    except:
+                        pass
+                    
                     stock_data = (
                         f"Ticker: {candidate['ticker']} ({candidate.get('sector', '')})\n"
                         f"Prezzo: ${candidate['price']}\n"
@@ -524,7 +534,7 @@ class AlphaStrategist(BaseAgent):
                             "Se ci sono earnings entro 7 giorni, AVVISA esplicitamente. "
                             "Sii diretto, concreto, no disclaimers."
                         ),
-                        user_prompt=stock_data + earnings_context,
+                        user_prompt=stock_data + earnings_context + macro_reasoning,
                         max_tokens=150,
                         temperature=0.3,
                     )
