@@ -209,3 +209,8 @@ async def delete_trade(trade_id: str):
     db = get_db()
     result = await db.trade_history.delete_one({"_id": ObjectId(trade_id)})
     return {"deleted": result.deleted_count}
+
+@router.get("/news/{symbol}")
+async def get_stock_news(symbol: str):
+    from app.services.news_service import get_stock_news_with_sentiment
+    return await get_stock_news_with_sentiment(symbol.upper())
