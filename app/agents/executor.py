@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from app.agents.base_agent import BaseAgent
 from app.db.mongodb import get_db
 from app.services.alpaca_trader import (
@@ -10,12 +11,14 @@ from app.services.telegram_bot import send_telegram
 
 class Executor(BaseAgent):
     """
-    ⚡ AGENTE 4: Executor
+    ⚡ AGENTE 4: Executor v2.0
     Esegue trade, trailing stop, notifiche Telegram, cancella ordini stale.
+    Trade Sync v4: link sell→buy con sell_linked flag.
+    Timezone dinamico con zoneinfo.
     """
 
     def __init__(self):
-        super().__init__(name="executor", version="1.1")
+        super().__init__(name="executor", version="2.0")
 
     def default_params(self) -> dict:
         return {
@@ -23,24 +26,21 @@ class Executor(BaseAgent):
             "stale_order_hours": 24,
             "send_telegram": True,
             "allow_premarket": False,
-            # Trailing stop levels
-            "trailing_level_1_pct": 5.0,   # P&L > 5% -> stop at break-even
-            "trailing_level_2_pct": 8.0,   # P&L > 8% -> stop at entry + 4%
-            "trailing_level_3_pct": 12.0,  # P&L > 12% -> stop at entry + 8%
+            "trailing_level_1_pct": 5.0,
+            "trailing_level_2_pct": 8.0,
+            "trailing_level_3_pct": 12.0,
         }
 
+    # ==========================================
+    # FIX 19B: Timezone dinamico con zoneinfo
+    # ==========================================
     @staticmethod
     def is_market_open() -> dict:
-        utc_now = datetime.utcnow()
-        et_offset = timedelta(hours=-4)
-        et_now = utc_now + et_offset
+        et_now = datetime.now(ZoneInfo("America/New_York"))
         is_weekday = et_now.weekday() < 5
 
-        # Extended hours: 4:00 AM - 8:00 PM ET
         extended_open = et_now.replace(hour=4, minute=0, second=0, microsecond=0)
         extended_close = et_now.replace(hour=20, minute=0, second=0, microsecond=0)
-
-        # Regular hours: 9:30 AM - 4:00 PM ET
         regular_open = et_now.replace(hour=9, minute=30, second=0, microsecond=0)
         regular_close = et_now.replace(hour=16, minute=0, second=0, microsecond=0)
 
@@ -82,9 +82,8 @@ class Executor(BaseAgent):
             await send_telegram(message)
 
     async def _calc_days_held(self, db, ticker: str) -> int:
-        """Calcola i giorni di holding cercando il BUY corrispondente."""
         buy_trade = await db.trade_history.find_one(
-            {"ticker": ticker, "side": "buy"},
+            {"ticker": ticker, "side": "buy", "sell_linked": {"$ne": True}},
             sort=[("date", -1)]
         )
         if buy_trade and buy_trade.get("date"):
@@ -93,7 +92,6 @@ class Executor(BaseAgent):
         return 0
 
     async def _manage_trailing_stops(self, positions: list, params: dict) -> list:
-        """Gestisce i trailing stop per le posizioni aperte."""
         db = get_db()
         adjustments = []
         level1 = params.get("trailing_level_1_pct", 5.0)
@@ -109,7 +107,6 @@ class Executor(BaseAgent):
             if entry_price <= 0:
                 continue
 
-            # Determine new stop level
             new_stop = None
             reason = None
 
@@ -124,10 +121,9 @@ class Executor(BaseAgent):
                 reason = f"Trailing L1: P&L {pnl_pct:.1f}% > {level1}%, stop -> break-even"
 
             if new_stop and new_stop < current_price:
-                # Check if we already adjusted this stop
                 existing = await db.trailing_stops.find_one({"ticker": symbol})
                 if existing and existing.get("stop_price", 0) >= new_stop:
-                    continue  # Already at a higher stop, skip
+                    continue
 
                 result = await update_stop_loss(symbol, new_stop)
                 if result:
@@ -142,11 +138,14 @@ class Executor(BaseAgent):
 
         return adjustments
 
+    # ==========================================
+    # FIX 19A: Trade Sync v4 — link sell→buy
+    # ==========================================
     async def _sync_closed_trades(self):
         """
-        Trade Sync v3 DEFINITIVO.
-        Sincronizza SOLO i SELL filled da Alpaca.
-        Un solo SELL per ticker — mai duplicati.
+        Trade Sync v4 DEFINITIVO.
+        Ogni SELL viene linkato al BUY corrispondente tramite sell_linked flag.
+        Supporta ticker ripetuti (compra AAPL, vendi, ricompra, rivendi).
         """
         db = get_db()
         synced = 0
@@ -165,6 +164,7 @@ class Executor(BaseAgent):
 
                 ticker = order.get("symbol", "")
                 filled_price = float(order.get("filled_avg_price") or 0)
+                filled_qty = float(order.get("filled_qty") or order.get("qty") or 0)
                 order_id = order.get("id", "")
 
                 if not ticker or not order_id or filled_price <= 0:
@@ -174,23 +174,17 @@ class Executor(BaseAgent):
                     continue
 
                 # Check 1: questo order_id è già registrato?
-                existing_oid = await db.trade_history.find_one({
-                    "order_id": order_id, "side": "sell",
-                })
+                existing_oid = await db.trade_history.find_one({"order_id": order_id})
                 if existing_oid:
                     continue
 
-                # Check 2: esiste GIÀ un SELL per questo ticker?
-                # Un solo SELL per ticker — mai duplicati
-                existing_ticker = await db.trade_history.find_one({
-                    "ticker": ticker, "side": "sell",
-                })
-                if existing_ticker:
-                    continue
-
-                # Trova il BUY corrispondente
+                # Check 2: trova il BUY corrispondente NON ancora linkato
                 buy_trade = await db.trade_history.find_one(
-                    {"ticker": ticker, "side": "buy"},
+                    {
+                        "ticker": ticker,
+                        "side": "buy",
+                        "sell_linked": {"$ne": True}
+                    },
                     sort=[("date", -1)]
                 )
                 if not buy_trade:
@@ -202,11 +196,11 @@ class Executor(BaseAgent):
                 if entry_price > 0 and abs(filled_price - entry_price) / entry_price > 0.30:
                     continue
 
-                shares = buy_trade.get("shares", 0)
+                shares = int(filled_qty) if filled_qty > 0 else buy_trade.get("shares", 0)
                 buy_date = buy_trade.get("date", datetime.utcnow())
 
                 pnl_pct = round(((filled_price - entry_price) / entry_price) * 100, 2) if entry_price > 0 else 0
-                pnl_dollar = round(pnl_pct / 100 * entry_price * shares, 2)
+                pnl_dollar = round((filled_price - entry_price) * shares, 2) if entry_price > 0 else 0
 
                 order_type = order.get("type", "")
                 if order_type == "stop":
@@ -220,6 +214,7 @@ class Executor(BaseAgent):
 
                 days_held = max(1, (datetime.utcnow() - buy_date).days) if buy_date else 1
 
+                # Inserisci SELL con link al BUY
                 await db.trade_history.insert_one({
                     "ticker": ticker, "side": "sell",
                     "entry_price": entry_price, "exit_price": round(filled_price, 2),
@@ -230,10 +225,18 @@ class Executor(BaseAgent):
                     "rsi_at_entry": buy_trade.get("rsi_at_entry", 50),
                     "market_regime": buy_trade.get("market_regime", "UNKNOWN"),
                     "order_id": order_id,
+                    "buy_order_id": buy_trade.get("order_id", ""),
                     "agent": "executor_sync",
                     "date": datetime.utcnow(),
                     "synced": True,
+                    "source": "trade_sync_v4",
                 })
+
+                # Marca il BUY come linkato
+                await db.trade_history.update_one(
+                    {"_id": buy_trade["_id"]},
+                    {"$set": {"sell_linked": True, "sell_order_id": order_id}}
+                )
 
                 emoji = "🟢" if pnl_pct > 0 else "🔴"
                 print(f"  {emoji} SYNCED {reason} {ticker}: {pnl_pct:+.2f}% (${pnl_dollar:+.0f}) {days_held}d [oid:{order_id[:8]}]")
@@ -246,7 +249,9 @@ class Executor(BaseAgent):
             print(f"  📥 Synced {synced} closed trades from Alpaca")
 
         return synced
-    
+        # ==========================================
+    # ANALYZE — Esecuzione principale
+    # ==========================================
     async def analyze(self, context: dict) -> dict:
         db = get_db()
         params = await self.get_params()
@@ -258,7 +263,7 @@ class Executor(BaseAgent):
         market_status = self.is_market_open()
         allow_premarket = params.get("allow_premarket", False)
 
-        # 0.5 SYNC CLOSED TRADES (always runs, even when market closed)
+        # 0.5 SYNC CLOSED TRADES (always runs)
         synced = await self._sync_closed_trades()
 
         if not market_status["is_open"] and not allow_premarket:
@@ -268,8 +273,9 @@ class Executor(BaseAgent):
                 "executed_buys": [], "executed_sells": [], "failed_orders": [],
                 "cancelled_stale": 0, "trailing_adjustments": [],
                 "market_status": market_status, "message": msg,
+                "synced_trades": synced,
             }
-             
+
         # 1. CANCEL STALE ORDERS
         cancelled = await self._cancel_stale_orders(params)
 
@@ -277,7 +283,7 @@ class Executor(BaseAgent):
         positions = await get_positions() or []
         trailing_adjustments = await self._manage_trailing_stops(positions, params)
 
-        # 2. EXECUTE SELLS
+        # 2. EXECUTE SELLS (FIX 19C + 19D)
         executed_sells = []
         failed_sells = []
         regime = market_ctx.get("market_regime", "UNKNOWN")
@@ -285,42 +291,82 @@ class Executor(BaseAgent):
         for s in approved_sells:
             ticker = s["ticker"]
             try:
+                # FIX 19D: recupera info posizione PRIMA di chiuderla
+                position_info = None
+                try:
+                    pos_list = await get_positions() or []
+                    for pos in pos_list:
+                        if pos.get("symbol") == ticker:
+                            position_info = pos
+                            break
+                except Exception:
+                    pass
+
+                entry_price = float(position_info.get("avg_entry_price", 0)) if position_info else s.get("entry_price", 0)
+                current_price = float(position_info.get("current_price", 0)) if position_info else s.get("current_price", 0)
+                shares = int(float(position_info.get("qty", 0))) if position_info else s.get("shares", 0)
+
+                # Calcola P&L completo
+                pnl_pct = round(((current_price - entry_price) / entry_price) * 100, 2) if entry_price > 0 else round(s.get("pnl_pct", 0), 2)
+                pnl_dollar = round((current_price - entry_price) * shares, 2) if entry_price > 0 and shares > 0 else 0
+
                 result = await close_position(ticker)
                 if result is not None:
                     days_held = await self._calc_days_held(db, ticker)
 
+                    # Trova il BUY corrispondente non linkato
+                    buy_trade = await db.trade_history.find_one(
+                        {"ticker": ticker, "side": "buy", "sell_linked": {"$ne": True}},
+                        sort=[("date", -1)]
+                    )
+
                     executed_sells.append({
                         "ticker": ticker, "reason": s.get("reason", ""),
-                        "pnl_pct": s.get("pnl_pct", 0), "days_held": days_held,
+                        "pnl_pct": pnl_pct, "pnl_dollar": pnl_dollar,
+                        "shares": shares, "days_held": days_held,
                         "executed_at": datetime.utcnow().isoformat(),
                     })
 
+                    # FIX 19C: order_id con HHMMSS
+                    sell_order_id = f"executor_direct_{ticker}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+
                     await db.trade_history.insert_one({
                         "ticker": ticker, "side": "sell",
-                        "entry_price": s.get("entry_price", 0),
-                        "exit_price": s.get("current_price", 0),
-                        "pnl_pct": round(s.get("pnl_pct", 0), 2),
+                        "entry_price": entry_price,
+                        "exit_price": current_price,
+                        "shares": shares,
+                        "pnl_pct": pnl_pct,
+                        "pnl_dollar": pnl_dollar,
                         "days_held": days_held,
                         "reason": s.get("reason", ""),
-                        "rsi_at_entry": s.get("rsi", 50),
-                        "setup_type": s.get("setup_type", "unknown"),
-                        "sector": s.get("sector", "unknown"),
+                        "rsi_at_entry": s.get("rsi", buy_trade.get("rsi_at_entry", 50) if buy_trade else 50),
+                        "setup_type": buy_trade.get("setup_type", "unknown") if buy_trade else s.get("setup_type", "unknown"),
+                        "sector": buy_trade.get("sector", "unknown") if buy_trade else s.get("sector", "unknown"),
                         "market_regime": regime,
                         "agent": "executor",
-                        "order_id": "executor_direct_" + ticker + "_" + datetime.utcnow().strftime("%Y%m%d"),
+                        "order_id": sell_order_id,
+                        "buy_order_id": buy_trade.get("order_id", "") if buy_trade else "",
                         "date": datetime.utcnow(),
+                        "source": "executor_direct",
                     })
+
+                    # Marca il BUY come linkato
+                    if buy_trade:
+                        await db.trade_history.update_one(
+                            {"_id": buy_trade["_id"]},
+                            {"$set": {"sell_linked": True, "sell_order_id": sell_order_id}}
+                        )
 
                     # Clean up trailing stop record
                     await db.trailing_stops.delete_one({"ticker": ticker})
 
-                    emoji = "🟢" if s.get("pnl_pct", 0) > 0 else "🔴"
+                    emoji = "🟢" if pnl_pct > 0 else "🔴"
                     msg = (f"{emoji} <b>SELL {ticker}</b>\n"
                            f"Reason: {s.get('reason', '')}\n"
-                           f"P&L: {s.get('pnl_pct', 0):.1f}% | Days: {days_held}\n"
-                           f"Regime: {regime}")
+                           f"P&L: {pnl_pct:+.1f}% (${pnl_dollar:+.0f}) | {shares} shares\n"
+                           f"Days: {days_held} | Regime: {regime}")
                     await self._send_notification(msg, params)
-                    print(f"  ✅ SOLD {ticker}: {s.get('reason')} (P&L {s.get('pnl_pct', 0):.1f}%, {days_held}d)")
+                    print(f"  ✅ SOLD {ticker}: {s.get('reason')} (P&L {pnl_pct:+.1f}%, ${pnl_dollar:+.0f}, {days_held}d)")
                 else:
                     failed_sells.append({"ticker": ticker, "reason": "Close failed"})
             except Exception as e:
@@ -331,7 +377,6 @@ class Executor(BaseAgent):
         failed_buys = []
         buffer_pct = params.get("limit_price_buffer_pct", 0.5) / 100
 
-        # Check existing open orders to avoid duplicates
         open_orders = await get_orders(status="open", limit=100)
         open_buy_tickers = set()
         if open_orders:
@@ -342,7 +387,6 @@ class Executor(BaseAgent):
         for t in approved_trades:
             ticker = t["ticker"]
 
-            # Skip if already has open buy order
             if ticker in open_buy_tickers:
                 print(f"  ⏭ Skip {ticker}: already has open buy order")
                 continue
@@ -380,6 +424,7 @@ class Executor(BaseAgent):
                         "market_regime": regime,
                         "agent": "executor", "order_id": order_id,
                         "date": datetime.utcnow(),
+                        "sell_linked": False,
                     })
 
                     from app.services.stock_names import get_stock_name
@@ -409,22 +454,20 @@ class Executor(BaseAgent):
                 summary += f"\n<b>Sells ({len(executed_sells)}):</b>\n"
                 for s in executed_sells:
                     e = "🟢" if s.get('pnl_pct', 0) > 0 else "🔴"
-                    summary += f"  {e} {s['ticker']} ({s.get('pnl_pct',0):+.1f}%, {s.get('days_held',0)}d)\n"
+                    summary += f"  {e} {s['ticker']} ({s.get('pnl_pct',0):+.1f}%, ${s.get('pnl_dollar',0):+.0f})\n"
             if trailing_adjustments:
                 summary += f"\n<b>Trailing Stops ({len(trailing_adjustments)}):</b>\n"
                 for t in trailing_adjustments:
                     summary += f"  📈 {t['ticker']} stop -> ${t['new_stop']}\n"
             await self._send_notification(summary, params)
 
-# ============================================
-        # LLM REASONING (optional)
+        # ============================================
+        # LLM REASONING
         # ============================================
         from app.services.llm_service import llm_ask, llm_available
         executor_reasoning = None
         if llm_available():
             try:
-
-# Read other agents' context
                 agents_context = ""
                 try:
                     from app.agents.shared_brain import brain
@@ -435,9 +478,9 @@ class Executor(BaseAgent):
                         agents_context += f"\nMacro: {macro_r[:100]}"
                     if risk_r:
                         agents_context += f"\nRisk: {risk_r[:100]}"
-                except:
+                except Exception:
                     pass
-                
+
                 exec_summary = (
                     f"Market: {market_status['session']} ({market_status['eastern_time']})\n"
                     f"Buys executed: {len(executed_buys)} ({', '.join(b['ticker'] for b in executed_buys)})\n"
@@ -445,6 +488,7 @@ class Executor(BaseAgent):
                     f"Failed: {len(failed_orders)} ({', '.join(f['ticker']+': '+f['reason'] for f in failed_orders)})\n"
                     f"Trailing stops adjusted: {len(trailing_adjustments)}\n"
                     f"Stale orders cancelled: {cancelled}\n"
+                    f"Trades synced: {synced}\n"
                     f"Regime: {regime}"
                 )
                 executor_reasoning = llm_ask(
@@ -462,7 +506,7 @@ class Executor(BaseAgent):
                     print(f"  🧠 Executor LLM: {executor_reasoning[:80]}...")
             except Exception as e:
                 print(f"  Executor LLM error: {e}")
-        
+
         # Log decision
         await self.log_decision(
             decision_type="execution_complete",
@@ -470,24 +514,29 @@ class Executor(BaseAgent):
                 "buys": len(executed_buys), "sells": len(executed_sells),
                 "failed": len(failed_orders), "cancelled_stale": cancelled,
                 "trailing_adjustments": len(trailing_adjustments),
+                "synced_trades": synced,
                 "market_open": market_status["is_open"], "regime": regime,
             },
             reasoning=f"Executed {len(executed_buys)} buys, {len(executed_sells)} sells, "
-                      f"{len(trailing_adjustments)} trailing stops adjusted",
+                      f"{len(trailing_adjustments)} trailing stops, synced {synced}",
             confidence=80,
         )
 
         print(f"\n⚡ Executor: {len(executed_buys)} buys, {len(executed_sells)} sells, "
-              f"{len(trailing_adjustments)} trailing stops, {cancelled} stale cancelled")
+              f"{len(trailing_adjustments)} trailing stops, {cancelled} stale cancelled, {synced} synced")
 
         return {
             "executed_buys": executed_buys, "executed_sells": executed_sells,
             "failed_orders": failed_orders, "cancelled_stale": cancelled,
             "trailing_adjustments": trailing_adjustments,
+            "synced_trades": synced,
             "market_status": market_status,
             "llm_reasoning": executor_reasoning,
         }
 
+    # ==========================================
+    # LEARN
+    # ==========================================
     async def learn(self) -> dict:
         db = get_db()
         params = await self.get_params()
@@ -497,18 +546,22 @@ class Executor(BaseAgent):
         }).to_list(100)
         if len(recent_buys) < 3:
             return {"message": "Not enough data", "orders": len(recent_buys)}
+
         failed_decisions = await self._col_decisions().find({
             "type": "execution_complete",
             "created_at": {"$gte": datetime.utcnow() - timedelta(days=30)},
         }).to_list(100)
+
         total_failed = sum(d.get("data", {}).get("failed", 0) for d in failed_decisions)
         total_executed = sum(d.get("data", {}).get("buys", 0) + d.get("data", {}).get("sells", 0) for d in failed_decisions)
         fill_rate = (total_executed / (total_executed + total_failed) * 100) if (total_executed + total_failed) > 0 else 100
+
         buffer = params.get("limit_price_buffer_pct", 0.5)
         if fill_rate < 70:
             buffer = min(1.5, buffer + 0.2)
         elif fill_rate > 95 and buffer > 0.3:
             buffer = max(0.2, buffer - 0.1)
+
         params["limit_price_buffer_pct"] = round(buffer, 2)
         await self.save_params(params)
         await self.save_performance({"fill_rate": round(fill_rate, 1), "buffer": buffer})
