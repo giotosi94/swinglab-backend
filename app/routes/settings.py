@@ -31,11 +31,15 @@ async def get_settings():
 async def save_settings(s: SettingsModel):
     db = get_db()
     data = s.dict()
+
+    # 1. Salva settings principali
     await db.app_settings.update_one(
         {"_id": "risk_params"},
         {"$set": data},
         upsert=True,
     )
+
+    # 2. RiskManager — tutti i parametri di rischio
     await db.agent_memory_risk_manager.update_one(
         {"_id": "params"},
         {"$set": {
@@ -49,4 +53,36 @@ async def save_settings(s: SettingsModel):
         }},
         upsert=True,
     )
-    return {"message": "Settings saved", "settings": data}
+
+    # ===== FIX 19F: Propaga a TUTTI gli agenti =====
+
+    # 3. AlphaStrategist — max_positions influenza quanti candidati genera
+    await db.agent_memory_alpha_strategist.update_one(
+        {"_id": "params"},
+        {"$set": {
+            "max_candidates": s.max_positions * 2,
+            "max_positions": s.max_positions,
+        }},
+        upsert=True,
+    )
+
+    # 4. Executor — max_positions per limitare ordini + risk params
+    await db.agent_memory_executor.update_one(
+        {"_id": "params"},
+        {"$set": {
+            "max_positions": s.max_positions,
+        }},
+        upsert=True,
+    )
+
+    # 5. MacroAnalyst — starting_capital per calcoli percentuali
+    await db.agent_memory_macro_analyst.update_one(
+        {"_id": "params"},
+        {"$set": {
+            "starting_capital": s.starting_capital,
+        }},
+        upsert=True,
+    )
+
+    print(f"✅ Settings propagated to all 4 agents: max_pos={s.max_positions}, risk={s.risk_pct_per_trade}%, capital=${s.starting_capital}")
+    return {"message": "Settings saved & propagated to all agents", "settings": data}
