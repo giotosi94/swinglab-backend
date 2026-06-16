@@ -5,7 +5,7 @@ from app.services.auto_trader import run_auto_trader, reset_auto_trader, get_aut
 from app.services.alpaca_trader import (
     get_alpaca_summary, place_order, place_bracket_order,
     cancel_order, close_position, close_all_positions, get_account,
-    get_live_prices, get_portfolio_periods
+    get_live_prices, get_portfolio_periods, cancel_all_orders
 )
 from app.db.mongodb import get_db
 
@@ -64,23 +64,14 @@ async def reset_trader(capital: float = Query(default=10000)):
 async def get_market_data():
     db = get_db()
     symbols = [
-        # Indici
         "SPY", "QQQ", "IWM", "DIA",
-        # Volatilità
         "VIXY", "VXX",
-        # Bonds & Credit
         "TLT", "HYG", "LQD",
-        # Commodities
         "GLD", "USO",
-        # Breadth & Style
         "RSP", "IWO",
-        # Dollar & FX
         "FXE", "UUP",
-        # Emerging
         "EEM",
-        # Transport (economia reale)
         "IYT",
-        # Crypto
         "BTC/USD", "ETH/USD",
     ]
     result = {}
@@ -107,13 +98,11 @@ async def live_prices():
 
 @router.get("/agent/brain")
 async def get_brain():
-    """Retrocompatibile: ora legge i parametri dall'AlphaStrategist agent."""
     db = get_db()
     params = await db.agent_memory_alpha_strategist.find_one({"_id": "params"})
     if params:
         params["_id"] = str(params["_id"])
         return params
-    # Fallback: prova il vecchio agent_brain
     old_params = await db.agent_brain.find_one({"_id": "learned_params"})
     if old_params:
         old_params["_id"] = str(old_params["_id"])
@@ -123,7 +112,6 @@ async def get_brain():
 
 @router.get("/agent/decisions")
 async def get_decisions():
-    """Retrocompatibile: aggrega decisioni da tutti e 4 gli agenti."""
     db = get_db()
     all_decisions = []
     for agent_name in ["macro_analyst", "alpha_strategist", "risk_manager", "executor"]:
@@ -133,7 +121,6 @@ async def get_decisions():
             d["_id"] = str(d["_id"])
             d["agent"] = agent_name
         all_decisions.extend(decisions)
-    # Ordina per data decrescente
     all_decisions.sort(key=lambda x: x.get("created_at", ""), reverse=True)
     return all_decisions[:50]
 
@@ -177,21 +164,25 @@ async def alpaca_close_all():
     result = await close_all_positions()
     return result or {"error": "Close all failed"}
 
+
 @router.delete("/alpaca/orders-all")
 async def alpaca_cancel_all_orders():
     result = await cancel_all_orders()
     return result or {"message": "All orders cancelled"}
+
 
 @router.delete("/alpaca/order/{order_id}")
 async def alpaca_cancel(order_id: str):
     result = await cancel_order(order_id)
     return result or {"error": "Cancel failed"}
 
+
 @router.delete("/reset-bars")
 async def reset_all_bars():
     db = get_db()
     result = await db.stock_bars.delete_many({})
     return {"deleted": result.deleted_count, "message": "All bars deleted. Next refresh will re-download."}
+
 
 @router.get("/test-bars/{symbol}")
 async def test_bars(symbol: str):
@@ -203,6 +194,7 @@ async def test_bars(symbol: str):
             return {"count": len(bars), "last": bars[-1]["t"][:10], "bars": bars}
         return {"count": 0, "error": "No bars returned"}
 
+
 @router.delete("/trades/{trade_id}")
 async def delete_trade(trade_id: str):
     from bson import ObjectId
@@ -210,19 +202,30 @@ async def delete_trade(trade_id: str):
     result = await db.trade_history.delete_one({"_id": ObjectId(trade_id)})
     return {"deleted": result.deleted_count}
 
+
 @router.get("/news/{symbol}")
 async def get_stock_news(symbol: str):
     from app.services.news_service import get_stock_news_with_sentiment
     return await get_stock_news_with_sentiment(symbol.upper())
 
+
 @router.get("/benchmark/spy")
-async def get_spy_benchmark():
-    """SPY performance for benchmark comparison."""
+async def get_spy_benchmark(period: str = "1M"):
+    """SPY performance matching the selected period."""
     db = get_db()
     spy_bars = await db.stock_bars.find_one({"ticker": "SPY"})
     if not spy_bars or not spy_bars.get("bars"):
         return {"error": "No SPY data"}
+
     bars = spy_bars["bars"]
+
+    # Filter bars by period
+    period_days = {"1D": 1, "1W": 7, "1M": 30, "3M": 90, "6M": 180, "1Y": 365, "YTD": 365}
+    days = period_days.get(period, 30)
+
+    if len(bars) > days:
+        bars = bars[-days:]
+
     points = []
     if bars:
         start_price = bars[0]["c"]
@@ -233,8 +236,10 @@ async def get_spy_benchmark():
                 "price": round(b["c"], 2),
                 "pct_change": pct,
             })
+
     return {
         "ticker": "SPY",
+        "period": period,
         "points": points,
         "total_return": points[-1]["pct_change"] if points else 0,
         "current_price": points[-1]["price"] if points else 0,
