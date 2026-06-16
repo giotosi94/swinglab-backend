@@ -153,7 +153,7 @@ async def get_portfolio_history(period="1M", timeframe="1D"):
 async def get_alpaca_summary():
     account = await get_account()
     positions = await get_positions()
-    orders = await get_orders(status="all", limit=20)
+    orders = await get_orders(status="all", limit=50)
     history = await get_portfolio_history()
 
     if not account:
