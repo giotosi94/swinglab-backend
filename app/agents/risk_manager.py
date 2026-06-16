@@ -206,6 +206,13 @@ class RiskManager(BaseAgent):
         else:
             available_buying_power = buying_power - cash_reserve
 
+            # Calculate already committed capital
+            committed = sum(float(p.get("market_value", 0)) for p in positions)
+            real_available = equity - committed - cash_reserve
+            if real_available < 0:
+                real_available = 0
+            available_buying_power = min(available_buying_power, real_available)
+
             for c in candidates:
                 ticker = c["ticker"]
                 price = c["price"]
@@ -241,6 +248,11 @@ class RiskManager(BaseAgent):
                     rejected_trades.append({**c, "reason": sizing.get("reason", "Zero shares")})
                     continue
 
+                # Check cash — NEVER go negative
+                if cash - sum(t["total_value"] for t in approved_trades) - sizing["total_value"] < 0:
+                    rejected_trades.append({**c, "reason": "Cash would go negative"})
+                    continue
+                
                 # Check buying power
                 if sizing["total_value"] > available_buying_power:
                     rejected_trades.append({**c, "reason": "Insufficient buying power"})
