@@ -208,7 +208,25 @@ class RiskManager(BaseAgent):
 
             # Calculate already committed capital
             committed = sum(float(p.get("market_value", 0)) for p in positions)
-            real_available = equity - committed - cash_reserve
+            
+            # Account for pending buy orders (not yet filled)
+            from app.services.alpaca_trader import get_orders as get_alpaca_orders
+            pending_value = 0
+            try:
+                open_orders = await get_alpaca_orders(status="open", limit=100)
+                if open_orders:
+                    for o in open_orders:
+                        if o.get("side") == "buy" and o.get("status") in ("new", "accepted", "pending_new"):
+                            qty = float(o.get("qty", 0))
+                            price = float(o.get("limit_price", 0) or 0)
+                            pending_value += qty * price
+            except:
+                pass
+            
+            real_available = equity - committed - pending_value - cash_reserve
+            if real_available < 0:
+                real_available = 0
+            available_buying_power = min(available_buying_power, real_available)
             if real_available < 0:
                 real_available = 0
             available_buying_power = min(available_buying_power, real_available)
