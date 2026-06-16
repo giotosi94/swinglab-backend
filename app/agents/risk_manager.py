@@ -225,11 +225,8 @@ class RiskManager(BaseAgent):
             
             real_available = equity - committed - pending_value - cash_reserve
             if real_available < 0:
-                real_available = 0
-            available_buying_power = min(available_buying_power, real_available)
-            if real_available < 0:
-                real_available = 0
-            available_buying_power = min(available_buying_power, real_available)
+    real_available = 0
+available_buying_power = min(available_buying_power, real_available)
 
             for c in candidates:
                 ticker = c["ticker"]
