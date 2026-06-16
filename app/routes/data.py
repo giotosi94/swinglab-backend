@@ -214,3 +214,28 @@ async def delete_trade(trade_id: str):
 async def get_stock_news(symbol: str):
     from app.services.news_service import get_stock_news_with_sentiment
     return await get_stock_news_with_sentiment(symbol.upper())
+
+@router.get("/benchmark/spy")
+async def get_spy_benchmark():
+    """SPY performance for benchmark comparison."""
+    db = get_db()
+    spy_bars = await db.stock_bars.find_one({"ticker": "SPY"})
+    if not spy_bars or not spy_bars.get("bars"):
+        return {"error": "No SPY data"}
+    bars = spy_bars["bars"]
+    points = []
+    if bars:
+        start_price = bars[0]["c"]
+        for b in bars:
+            pct = round(((b["c"] - start_price) / start_price) * 100, 2)
+            points.append({
+                "date": b["date"],
+                "price": round(b["c"], 2),
+                "pct_change": pct,
+            })
+    return {
+        "ticker": "SPY",
+        "points": points,
+        "total_return": points[-1]["pct_change"] if points else 0,
+        "current_price": points[-1]["price"] if points else 0,
+    }
