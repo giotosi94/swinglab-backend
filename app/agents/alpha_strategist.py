@@ -537,6 +537,7 @@ class AlphaStrategist(BaseAgent):
                         user_prompt=stock_data + earnings_context + macro_reasoning,
                         max_tokens=150,
                         temperature=0.3,
+                        agent_name="alpha_strategist",
                     )
                     if analysis:
                         candidate["llm_analysis"] = analysis
