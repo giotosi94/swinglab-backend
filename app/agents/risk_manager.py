@@ -362,6 +362,7 @@ class RiskManager(BaseAgent):
                     user_prompt=f"Risk report:\n{risk_summary}{agents_context}",
                     max_tokens=200,
                     temperature=0.3,
+                    agent_name="risk_manager",
                 )
                 if llm_reasoning:
                     print(f"  🧠 Risk LLM: {llm_reasoning[:80]}...")
