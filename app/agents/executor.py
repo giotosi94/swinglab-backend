@@ -501,6 +501,7 @@ class Executor(BaseAgent):
                     user_prompt=f"Execution report:\n{exec_summary}{agents_context}",
                     max_tokens=150,
                     temperature=0.3,
+                    agent_name="executor",
                 )
                 if executor_reasoning:
                     print(f"  🧠 Executor LLM: {executor_reasoning[:80]}...")
