@@ -465,6 +465,7 @@ class MacroAnalyst(BaseAgent):
                     user_prompt=f"Dati di mercato oggi:\n{data_summary}",
                     max_tokens=200,
                     temperature=0.3,
+                    agent_name="macro_analyst",
                 )
                 if llm_reasoning:
                     print(f"  🧠 LLM: {llm_reasoning[:100]}...")
