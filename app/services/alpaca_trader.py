@@ -73,6 +73,62 @@ async def place_order(symbol, qty, side, order_type="market", time_in_force="day
     return result
 
 
+async def place_oco_order(
+    symbol: str,
+    qty: int,
+    take_profit_price: float,
+    stop_loss_price: float,
+    time_in_force: str = "gtc",
+):
+    """
+    🎯 Piazza un ordine OCO (One-Cancels-Other) di vendita.
+    
+    Due ordini linkati: quando uno triggera, l'altro viene cancellato.
+    - Take Profit (limit sell)
+    - Stop Loss (stop sell)
+    
+    Returns:
+        Dict con l'ordine padre OCO (contenente "legs"), oppure None se errore.
+    """
+    payload = {
+        "symbol": symbol,
+        "qty": str(qty),
+        "side": "sell",
+        "type": "limit",
+        "time_in_force": time_in_force,
+        "limit_price": str(round(take_profit_price, 2)),
+        "order_class": "oco",
+        "stop_loss": {
+            "stop_price": str(round(stop_loss_price, 2))
+        },
+        "take_profit": {
+            "limit_price": str(round(take_profit_price, 2))
+        }
+    }
+    
+    result = await alpaca_request("POST", "{}/v2/orders".format(ALPACA_BASE), json=payload)
+    
+    if result:
+        print(f"✅ OCO {symbol}: TP={take_profit_price:.2f} SL={stop_loss_price:.2f} id={result.get('id', '')[:8]}")
+        db = get_db()
+        await db.alpaca_orders.insert_one({
+            "order_id": result.get("id"),
+            "symbol": symbol,
+            "qty": qty,
+            "side": "sell",
+            "type": "oco",
+            "status": result.get("status"),
+            "take_profit_price": round(take_profit_price, 2),
+            "stop_loss_price": round(stop_loss_price, 2),
+            "created_at": datetime.utcnow(),
+            "raw": result,
+        })
+    else:
+        print(f"❌ OCO {symbol} FAILED: TP={take_profit_price:.2f} SL={stop_loss_price:.2f}")
+    
+    return result
+
+
 async def place_bracket_order(symbol, qty, limit_price, take_profit, stop_loss):
     order = {
         "symbol": symbol,
@@ -102,6 +158,7 @@ async def close_position(symbol):
 
 async def close_all_positions():
     return await alpaca_request("DELETE", "{}/v2/positions".format(ALPACA_BASE))
+
 
 async def update_stop_loss(symbol, new_stop_price):
     """Update stop loss by cancelling old SL and placing new one."""
