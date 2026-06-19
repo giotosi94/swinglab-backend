@@ -2,6 +2,8 @@
 auto_trader.py — Wrapper retrocompatibile.
 Ora usa il Multi-Agent Orchestrator internamente.
 Le route /api/data/autotrader/* continuano a funzionare come prima.
+
+v2.0 — Reset completo e pulito per ripartenza da zero.
 """
 from datetime import datetime
 from app.db.mongodb import get_db
@@ -33,24 +35,177 @@ async def get_auto_trader_state():
     return state
 
 
-async def reset_auto_trader(initial_capital=10000):
-    """Reset completo: chiude posizioni e pulisce history e brain di tutti gli agenti."""
+async def reset_auto_trader(initial_capital: float = 10000):
+    """
+    🔄 RESET COMPLETO v2.0
+    
+    Pulisce TUTTO lo stato operativo per ripartire da zero, MANTENENDO:
+    - stock_bars (cache prezzi storici)
+    - assets (universo configurato)
+    - sectors (definizione settori)
+    - market_regime (dati macro storici)
+    - watchlist
+    
+    PULISCE:
+    - Ordini aperti su Alpaca + posizioni aperte su Alpaca
+    - trade_history (storico trade)
+    - trailing_stops (gestione stop dinamici)
+    - shared_brain (stato condiviso agenti)
+    - alpaca_orders (log ordini interno)
+    - auto_trader.alpaca_state (stato pipeline)
+    - market_context (contesto macro corrente)
+    - Brain, decisioni e performance di TUTTI gli agenti
+    - Collection legacy: agent_brain, agent_decisions
+    
+    AGGIORNA:
+    - app_settings.risk_params.starting_capital al nuovo valore
+    """
     from app.services.alpaca_trader import close_all_positions, cancel_all_orders
-    await cancel_all_orders()
-    await close_all_positions()
-
+    
     db = get_db()
-    # Pulisci trade history
-    await db.trade_history.delete_many({})
-
-    # Pulisci TUTTI i brain e le decisioni degli agenti
-    for agent_name in ["macro_analyst", "alpha_strategist", "risk_manager", "executor"]:
-        await db[f"agent_memory_{agent_name}"].delete_many({})
-        await db[f"agent_decisions_{agent_name}"].delete_many({})
-        await db[f"agent_performance_{agent_name}"].delete_many({})
-
-    # Pulisci anche il vecchio agent_brain (retrocompatibilita')
-    await db.agent_brain.delete_many({})
-    await db.agent_decisions.delete_many({})
-
-    return {"message": f"All positions closed, all agent brains and history cleared"}
+    report = {
+        "alpaca": {},
+        "cleaned": {},
+        "updated": {},
+        "errors": [],
+        "started_at": datetime.utcnow().isoformat(),
+    }
+    
+    print("=" * 60)
+    print("🔄 SWINGLAB RESET v2.0 — Starting...")
+    print(f"   Target capital: ${initial_capital:,.0f}")
+    print("=" * 60)
+    
+    # ============================================
+    # FASE 1: ALPACA — Cancella ordini e chiudi posizioni
+    # ============================================
+    print("\n📡 [1/4] Cleaning Alpaca account...")
+    try:
+        cancel_result = await cancel_all_orders()
+        report["alpaca"]["orders_cancelled"] = "ok" if cancel_result is not None else "skipped"
+        print(f"  ✅ Orders cancelled: {report['alpaca']['orders_cancelled']}")
+    except Exception as e:
+        report["errors"].append(f"cancel_all_orders: {str(e)}")
+        report["alpaca"]["orders_cancelled"] = f"error: {str(e)}"
+        print(f"  ❌ Cancel orders error: {e}")
+    
+    try:
+        close_result = await close_all_positions()
+        report["alpaca"]["positions_closed"] = "ok" if close_result is not None else "skipped"
+        print(f"  ✅ Positions closed: {report['alpaca']['positions_closed']}")
+    except Exception as e:
+        report["errors"].append(f"close_all_positions: {str(e)}")
+        report["alpaca"]["positions_closed"] = f"error: {str(e)}"
+        print(f"  ❌ Close positions error: {e}")
+    
+    # ============================================
+    # FASE 2: TRADE HISTORY + TRAILING STOPS + ORDERS LOG
+    # ============================================
+    print("\n🗑️  [2/4] Cleaning trade data...")
+    
+    collections_trade = [
+        "trade_history",        # Storico completo trade (buy/sell)
+        "trailing_stops",       # Gestione trailing stop dinamici
+        "alpaca_orders",        # Log interno ordini Alpaca
+        "auto_trader",          # Pipeline state (alpaca_state)
+        "market_context",       # Contesto macro corrente
+        "shared_brain",         # Stato condiviso agenti
+    ]
+    
+    for coll_name in collections_trade:
+        try:
+            result = await db[coll_name].delete_many({})
+            report["cleaned"][coll_name] = result.deleted_count
+            print(f"  ✅ {coll_name}: {result.deleted_count} docs deleted")
+        except Exception as e:
+            report["errors"].append(f"{coll_name}: {str(e)}")
+            report["cleaned"][coll_name] = f"error: {str(e)}"
+            print(f"  ❌ {coll_name} error: {e}")
+    
+    # ============================================
+    # FASE 3: AGENT BRAINS, DECISIONS, PERFORMANCE
+    # ============================================
+    print("\n🧠 [3/4] Cleaning agent brains...")
+    
+    agent_names = ["macro_analyst", "alpha_strategist", "risk_manager", "executor"]
+    for agent_name in agent_names:
+        for prefix in ["agent_memory", "agent_decisions", "agent_performance"]:
+            coll_name = f"{prefix}_{agent_name}"
+            try:
+                result = await db[coll_name].delete_many({})
+                report["cleaned"][coll_name] = result.deleted_count
+                print(f"  ✅ {coll_name}: {result.deleted_count} docs")
+            except Exception as e:
+                report["errors"].append(f"{coll_name}: {str(e)}")
+                print(f"  ❌ {coll_name} error: {e}")
+    
+    # Collection legacy (retrocompat)
+    print("\n🗑️  Cleaning legacy collections...")
+    legacy_collections = ["agent_brain", "agent_decisions"]
+    for coll_name in legacy_collections:
+        try:
+            result = await db[coll_name].delete_many({})
+            report["cleaned"][f"legacy_{coll_name}"] = result.deleted_count
+            print(f"  ✅ {coll_name} (legacy): {result.deleted_count} docs")
+        except Exception as e:
+            report["errors"].append(f"legacy_{coll_name}: {str(e)}")
+            print(f"  ❌ legacy {coll_name} error: {e}")
+    
+    # ============================================
+    # FASE 4: AGGIORNA SETTINGS CON NUOVO CAPITALE
+    # ============================================
+    print(f"\n⚙️  [4/4] Updating settings — starting_capital=${initial_capital:,.0f}...")
+    try:
+        # Aggiorna settings principali
+        settings_update = await db.app_settings.update_one(
+            {"_id": "risk_params"},
+            {"$set": {
+                "starting_capital": float(initial_capital),
+                "updated_at": datetime.utcnow(),
+            }},
+            upsert=True,
+        )
+        report["updated"]["app_settings"] = {
+            "matched": settings_update.matched_count,
+            "modified": settings_update.modified_count,
+            "upserted": settings_update.upserted_id is not None,
+        }
+        print(f"  ✅ app_settings.risk_params updated")
+        
+        # Propaga il nuovo capitale anche al MacroAnalyst (lo usa per calcoli %)
+        await db.agent_memory_macro_analyst.update_one(
+            {"_id": "params"},
+            {"$set": {"starting_capital": float(initial_capital)}},
+            upsert=True,
+        )
+        report["updated"]["macro_analyst_capital"] = "ok"
+        print(f"  ✅ macro_analyst.starting_capital synced")
+        
+    except Exception as e:
+        report["errors"].append(f"settings update: {str(e)}")
+        print(f"  ❌ Settings update error: {e}")
+    
+    # ============================================
+    # FINAL REPORT
+    # ============================================
+    report["finished_at"] = datetime.utcnow().isoformat()
+    report["initial_capital"] = float(initial_capital)
+    report["status"] = "success" if not report["errors"] else "partial"
+    
+    total_deleted = sum(v for v in report["cleaned"].values() if isinstance(v, int))
+    
+    print("\n" + "=" * 60)
+    print(f"🏁 RESET COMPLETE")
+    print(f"   Total docs deleted: {total_deleted}")
+    print(f"   Errors: {len(report['errors'])}")
+    print(f"   New capital: ${initial_capital:,.0f}")
+    if report["errors"]:
+        print(f"   ⚠️  Errors: {report['errors']}")
+    print("=" * 60)
+    
+    report["message"] = (
+        f"Reset complete: {total_deleted} docs deleted, "
+        f"capital set to ${initial_capital:,.0f}"
+    )
+    
+    return report
