@@ -13,6 +13,8 @@ from app.services.alpaca_trader import (
     get_positions,
     get_orders,
     place_order,
+    place_oco_order,
+    cancel_order,
 )
 
 router = APIRouter()
@@ -322,6 +324,240 @@ async def restore_stops(dry_run: bool = Query(default=True)):
         "tp_to_place" if dry_run else "tp_placed": len(report["tp_restored"]),
         "sl_already_ok": len(report["sl_already_active"]),
         "tp_already_ok": len(report["tp_already_active"]),
+        "errors": len(report["errors"]),
+        "skipped": len(report["skipped"]),
+    }
+    return report
+    
+
+@router.post("/cancel-orphan-stops")
+async def cancel_orphan_stops(dry_run: bool = Query(default=True)):
+    """
+    🧹 Cancella tutti gli ordini SELL stop "orfani" (cioè non parte di OCO/bracket).
+    
+    Serve a ripulire prima di piazzare nuovi OCO orders.
+    
+    Args:
+        dry_run: se True simula, se False cancella veramente.
+    """
+    report = {
+        "dry_run": dry_run,
+        "timestamp": datetime.utcnow().isoformat(),
+        "cancelled": [],
+        "skipped": [],
+        "errors": [],
+    }
+
+    open_orders = await get_orders(status="open", limit=100) or []
+    valid_statuses = ("new", "accepted", "pending_new", "held", "partially_filled")
+    
+    for o in open_orders:
+        if o.get("side") != "sell":
+            continue
+        if o.get("type") not in ("stop", "stop_limit", "limit"):
+            continue
+        if o.get("status") not in valid_statuses:
+            continue
+        
+        order_class = o.get("order_class", "")
+        # SKIP se fa parte di OCO o bracket (non vogliamo rompere quelli buoni)
+        if order_class in ("oco", "bracket", "oto"):
+            report["skipped"].append({
+                "ticker": o.get("symbol"),
+                "order_id": o.get("id"),
+                "reason": f"Belongs to {order_class}",
+            })
+            continue
+        
+        action = {
+            "ticker": o.get("symbol"),
+            "order_id": o.get("id"),
+            "type": o.get("type"),
+            "stop_price": o.get("stop_price"),
+            "limit_price": o.get("limit_price"),
+        }
+        
+        if dry_run:
+            action["status"] = "WOULD_CANCEL"
+        else:
+            try:
+                result = await cancel_order(o.get("id"))
+                action["status"] = "CANCELLED" if result is not None else "FAILED"
+                if result is None:
+                    report["errors"].append({
+                        "ticker": o.get("symbol"),
+                        "order_id": o.get("id"),
+                        "error": "cancel_order returned None"
+                    })
+            except Exception as e:
+                action["status"] = "EXCEPTION"
+                report["errors"].append({
+                    "ticker": o.get("symbol"),
+                    "error": str(e)
+                })
+        
+        report["cancelled"].append(action)
+
+    report["summary"] = {
+        "cancelled": len([c for c in report["cancelled"] if c.get("status") in ("CANCELLED", "WOULD_CANCEL")]),
+        "skipped_oco_bracket": len(report["skipped"]),
+        "errors": len(report["errors"]),
+    }
+    return report
+
+
+@router.post("/restore-stops-oco")
+async def restore_stops_oco(dry_run: bool = Query(default=True)):
+    """
+    🎯 Ripristina SL+TP usando OCO orders (One-Cancels-Other).
+    
+    Per ogni posizione su Alpaca:
+    1. Recupera stop_loss e target dal DB (trade_history)
+    2. Verifica se esiste già un OCO attivo
+    3. Se mancano entrambi → piazza un OCO con SL+TP linkati
+    
+    PRE-REQUISITO: devi prima cancellare gli SL/TP orfani con cancel-orphan-stops.
+    """
+    db = get_db()
+    report = {
+        "dry_run": dry_run,
+        "timestamp": datetime.utcnow().isoformat(),
+        "positions_checked": 0,
+        "oco_placed": [],
+        "already_protected": [],
+        "skipped": [],
+        "errors": [],
+    }
+
+    positions = await get_positions() or []
+    open_orders = await get_orders(status="open", limit=100) or []
+    report["positions_checked"] = len(positions)
+
+    if not positions:
+        report["message"] = "Nessuna posizione aperta."
+        return report
+
+    valid_statuses = ("new", "accepted", "pending_new", "held", "partially_filled")
+    
+    # Indicizza OCO/bracket attivi per ticker
+    protected_tickers = set()
+    for o in open_orders:
+        if o.get("status") not in valid_statuses:
+            continue
+        if o.get("side") != "sell":
+            continue
+        if o.get("order_class") in ("oco", "bracket"):
+            protected_tickers.add(o.get("symbol"))
+
+    for pos in positions:
+        ticker = pos.get("symbol")
+        try:
+            qty = int(float(pos.get("qty", 0)))
+            current_price = float(pos.get("current_price", 0))
+            avg_entry = float(pos.get("avg_entry_price", 0))
+
+            if qty <= 0:
+                report["skipped"].append({"ticker": ticker, "reason": "qty=0"})
+                continue
+
+            # Se già protetto da OCO/bracket → skip
+            if ticker in protected_tickers:
+                report["already_protected"].append({
+                    "ticker": ticker,
+                    "reason": "OCO/bracket already active"
+                })
+                continue
+
+            buy_trade = await db.trade_history.find_one(
+                {"ticker": ticker, "side": "buy", "sell_linked": {"$ne": True}},
+                sort=[("date", -1)]
+            )
+            if not buy_trade:
+                report["skipped"].append({
+                    "ticker": ticker,
+                    "reason": "No BUY trade in DB"
+                })
+                continue
+
+            stored_sl = float(buy_trade.get("stop_loss", 0) or 0)
+            stored_tp = float(buy_trade.get("target", 0) or 0)
+
+            trailing = await db.trailing_stops.find_one({"ticker": ticker})
+            trailing_sl = float(trailing.get("stop_price", 0)) if trailing else 0
+            effective_sl = max(stored_sl, trailing_sl)
+
+            # OCO richiede SIA SL SIA TP > 0
+            if effective_sl <= 0 or stored_tp <= 0:
+                report["skipped"].append({
+                    "ticker": ticker,
+                    "reason": f"Missing SL or TP (SL={effective_sl}, TP={stored_tp})"
+                })
+                continue
+
+            # Validità prezzi: SL < current < TP
+            if effective_sl >= current_price:
+                report["errors"].append({
+                    "ticker": ticker,
+                    "type": "SL_ALREADY_VIOLATED",
+                    "current_price": current_price,
+                    "stop_loss": effective_sl,
+                    "action": "MANUAL_REVIEW_REQUIRED",
+                })
+                continue
+            
+            if stored_tp <= current_price:
+                report["errors"].append({
+                    "ticker": ticker,
+                    "type": "TP_ALREADY_REACHED",
+                    "current_price": current_price,
+                    "target": stored_tp,
+                    "action": "MANUAL_REVIEW_REQUIRED",
+                })
+                continue
+
+            action = {
+                "ticker": ticker,
+                "qty": qty,
+                "stop_loss": round(effective_sl, 2),
+                "take_profit": round(stored_tp, 2),
+                "current_price": current_price,
+                "entry_price": avg_entry,
+            }
+            
+            if dry_run:
+                action["status"] = "WOULD_PLACE_OCO"
+            else:
+                result = await place_oco_order(
+                    symbol=ticker,
+                    qty=qty,
+                    take_profit_price=stored_tp,
+                    stop_loss_price=effective_sl,
+                    time_in_force="gtc",
+                )
+                if result:
+                    action["order_id"] = result.get("id", "")
+                    action["status"] = "PLACED"
+                else:
+                    action["status"] = "FAILED"
+                    report["errors"].append({
+                        "ticker": ticker,
+                        "type": "OCO_PLACE_FAILED",
+                        "details": "Alpaca returned None"
+                    })
+                    continue
+            
+            report["oco_placed"].append(action)
+
+        except Exception as e:
+            report["errors"].append({
+                "ticker": ticker,
+                "type": "EXCEPTION",
+                "details": str(e),
+            })
+
+    report["summary"] = {
+        "oco_to_place" if dry_run else "oco_placed": len(report["oco_placed"]),
+        "already_protected": len(report["already_protected"]),
         "errors": len(report["errors"]),
         "skipped": len(report["skipped"]),
     }
