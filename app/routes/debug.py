@@ -15,6 +15,7 @@ from app.services.alpaca_trader import (
     place_order,
     place_oco_order,
     cancel_order,
+    close_position,
 )
 
 router = APIRouter()
@@ -561,4 +562,103 @@ async def restore_stops_oco(dry_run: bool = Query(default=True)):
         "errors": len(report["errors"]),
         "skipped": len(report["skipped"]),
     }
+    return report
+    
+
+@router.post("/close-position/{ticker}")
+async def close_position_endpoint(ticker: str, dry_run: bool = Query(default=True)):
+    """
+    🚨 Chiude immediatamente una posizione a mercato.
+    
+    1. Cancella prima eventuali ordini sell aperti (SL/TP/OCO) per il ticker
+    2. Chiama close_position di Alpaca (vende tutto a mercato)
+    3. Marca il BUY originale come sell_linked=True nel DB
+    
+    Args:
+        ticker: simbolo della posizione (es. "BMY")
+        dry_run: se True simula, se False chiude veramente.
+    """
+    db = get_db()
+    ticker = ticker.upper()
+    report = {
+        "ticker": ticker,
+        "dry_run": dry_run,
+        "timestamp": datetime.utcnow().isoformat(),
+        "actions": [],
+        "errors": [],
+    }
+
+    positions = await get_positions() or []
+    target_pos = next((p for p in positions if p.get("symbol") == ticker), None)
+    if not target_pos:
+        report["errors"].append(f"No open position for {ticker}")
+        return report
+
+    qty = int(float(target_pos.get("qty", 0)))
+    current_price = float(target_pos.get("current_price", 0))
+    entry_price = float(target_pos.get("avg_entry_price", 0))
+    pnl_pct = float(target_pos.get("unrealized_plpc", 0)) * 100
+    
+    report["position"] = {
+        "qty": qty,
+        "current_price": current_price,
+        "entry_price": entry_price,
+        "pnl_pct": round(pnl_pct, 2),
+    }
+
+    open_orders = await get_orders(status="open", limit=100) or []
+    sell_orders = [
+        o for o in open_orders
+        if o.get("symbol") == ticker and o.get("side") == "sell"
+    ]
+    
+    for o in sell_orders:
+        action = {
+            "type": "CANCEL_ORDER",
+            "order_id": o.get("id"),
+            "order_type": o.get("type"),
+            "order_class": o.get("order_class", ""),
+        }
+        if dry_run:
+            action["status"] = "WOULD_CANCEL"
+        else:
+            try:
+                result = await cancel_order(o.get("id"))
+                action["status"] = "CANCELLED" if result is not None else "FAILED"
+            except Exception as e:
+                action["status"] = "EXCEPTION"
+                report["errors"].append(f"Cancel error: {e}")
+        report["actions"].append(action)
+
+    close_action = {
+        "type": "CLOSE_POSITION",
+        "ticker": ticker,
+        "qty": qty,
+        "current_price": current_price,
+        "estimated_pnl_pct": round(pnl_pct, 2),
+    }
+    
+    if dry_run:
+        close_action["status"] = "WOULD_CLOSE"
+    else:
+        try:
+            result = await close_position(ticker)
+            if result is not None:
+                close_action["status"] = "CLOSED"
+                close_action["order_id"] = result.get("id", "")
+                
+                update_result = await db.trade_history.update_one(
+                    {"ticker": ticker, "side": "buy", "sell_linked": {"$ne": True}},
+                    {"$set": {"sell_linked": True, "sell_linked_at": datetime.utcnow()}},
+                    upsert=False
+                )
+                close_action["db_updated"] = update_result.modified_count > 0
+            else:
+                close_action["status"] = "FAILED"
+                report["errors"].append("close_position returned None")
+        except Exception as e:
+            close_action["status"] = "EXCEPTION"
+            report["errors"].append(f"Close error: {e}")
+    
+    report["actions"].append(close_action)
     return report
