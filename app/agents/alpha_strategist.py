@@ -417,9 +417,26 @@ class AlphaStrategist(BaseAgent):
             if rsi > max_rsi or rsi < min_rsi:
                 skipped_reasons["rsi_filter"] += 1
                 continue
+            # 🆕 v1.1 — Volume filter SMART
+            # Distingue tra breakout legittimi (volume + price up) e
+            # news/panic (volume + price down) o pump estremi.
+            change_pct = a.get("change_pct", 0)
+            
             if rel_vol >= max_rv:
-                skipped_reasons["volume_filter"] += 1
-                continue
+                # Caso 1: Breakout bullish moderato → ACCETTA
+                if rel_vol < 5.0 and 2.0 <= change_pct <= 8.0:
+                    pass  # Volume + price up moderato = breakout valido
+                # Caso 2: Pump estremo (volume >5x + price >8%) → scarta (overextended)
+                elif rel_vol >= 5.0 or change_pct > 8.0:
+                    skipped_reasons["volume_filter"] += 1
+                    continue
+                # Caso 3: Volume alto ma price negativo o flat → scarta (news/panic)
+                elif change_pct < 2.0:
+                    skipped_reasons["volume_filter"] += 1
+                    continue
+                else:
+                    skipped_reasons["volume_filter"] += 1
+                    continue
             if best_setups and stype not in best_setups:
                 skipped_reasons["setup_filter"] += 1
                 continue
