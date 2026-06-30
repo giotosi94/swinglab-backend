@@ -662,3 +662,80 @@ async def close_position_endpoint(ticker: str, dry_run: bool = Query(default=Tru
     
     report["actions"].append(close_action)
     return report
+
+
+# ============================================
+# 🆕 v2.1 — POPULATE FRACTIONABLE FLAG
+# ============================================
+
+@router.post("/populate-fractionable")
+async def populate_fractionable():
+    """
+    🔧 One-shot admin endpoint.
+    Per ogni asset in db.assets, controlla su Alpaca se è fractionable
+    e salva il flag in DB.
+    
+    Da chiamare UNA volta dopo il deploy del Fix #3.
+    Poi il RiskManager userà sempre la cache DB senza chiamare Alpaca.
+    
+    Returns:
+        report con totali, errori, e dettagli
+    """
+    from datetime import datetime
+    from app.services.alpaca_trader import is_fractionable
+    from app.db.mongodb import get_db
+    
+    db = get_db()
+    
+    # Carica tutti i ticker
+    assets = await db.assets.find({}, {"ticker": 1}).to_list(500)
+    if not assets:
+        return {"error": "No assets in db", "checked": 0}
+    
+    tickers = [a["ticker"] for a in assets if a.get("ticker")]
+    
+    report = {
+        "started_at": datetime.utcnow().isoformat(),
+        "total_assets": len(tickers),
+        "fractionable": [],
+        "not_fractionable": [],
+        "errors": [],
+    }
+    
+    print(f"🔍 Populating fractionable flag for {len(tickers)} assets...")
+    
+    for ticker in tickers:
+        try:
+            is_frac = await is_fractionable(ticker)
+            
+            await db.assets.update_one(
+                {"ticker": ticker},
+                {"$set": {
+                    "fractionable": bool(is_frac),
+                    "fractionable_checked_at": datetime.utcnow(),
+                }}
+            )
+            
+            if is_frac:
+                report["fractionable"].append(ticker)
+            else:
+                report["not_fractionable"].append(ticker)
+            
+            print(f"  {'✅' if is_frac else '❌'} {ticker}: fractionable={is_frac}")
+        
+        except Exception as e:
+            report["errors"].append({"ticker": ticker, "error": str(e)})
+            print(f"  ⚠️ {ticker} error: {e}")
+    
+    report["finished_at"] = datetime.utcnow().isoformat()
+    report["summary"] = {
+        "fractionable_count": len(report["fractionable"]),
+        "not_fractionable_count": len(report["not_fractionable"]),
+        "errors_count": len(report["errors"]),
+    }
+    
+    print(f"\n🏁 DONE: {report['summary']['fractionable_count']} fractionable, "
+          f"{report['summary']['not_fractionable_count']} not, "
+          f"{report['summary']['errors_count']} errors")
+    
+    return report
