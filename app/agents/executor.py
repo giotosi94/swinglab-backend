@@ -66,24 +66,57 @@ class Executor(BaseAgent):
         }
 
     async def _cancel_stale_orders(self, params: dict) -> int:
+        """
+        🔧 v3.1 — Cancella SOLO ordini BUY stale (entry non eseguiti).
+        Non cancella mai SL/TP di posizioni aperte (che sono ordini sell con type=stop/limit).
+        
+        Logica:
+        - side=buy + status non filled da >24h → ENTRY MAI PARTITO → cancella
+        - side=sell + type=stop/limit → SL o TP di posizione aperta → MAI cancellare
+        - Tutto il resto → log e skip
+        """
         stale_hours = params.get("stale_order_hours", 24)
         cutoff = datetime.utcnow() - timedelta(hours=stale_hours)
         cancelled = 0
+        skipped_sl_tp = 0
+        
         orders = await get_orders(status="open", limit=50)
         if not orders:
             return 0
+        
         for order in orders:
+            side = order.get("side", "")
+            order_type = order.get("type", "")
+            symbol = order.get("symbol", "?")
+            order_id = order.get("id", "")
+            
+            # 🛡️ PROTEZIONE: mai cancellare SL/TP (sell stop/limit)
+            if side == "sell" and order_type in ("stop", "limit", "stop_limit", "trailing_stop"):
+                skipped_sl_tp += 1
+                continue
+            
+            # 🔧 Cancella solo BUY entry stale
+            if side != "buy":
+                continue
+            
             created = order.get("created_at", "")
-            if created:
-                try:
-                    order_time = datetime.fromisoformat(created.replace("Z", "+00:00"))
-                    if order_time.replace(tzinfo=None) < cutoff:
-                        result = await cancel_order(order["id"])
-                        if result is not None:
-                            cancelled += 1
-                            print(f"  Cancelled stale order: {order.get('symbol')} ({order.get('id')[:8]}...)")
-                except (ValueError, TypeError):
-                    pass
+            if not created:
+                continue
+            
+            try:
+                order_time = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                if order_time.replace(tzinfo=None) < cutoff:
+                    result = await cancel_order(order_id)
+                    if result is not None:
+                        cancelled += 1
+                        print(f"  ⏰ Cancelled stale BUY: {symbol} ({order_id[:8]}...)")
+            except (ValueError, TypeError) as e:
+                print(f"  ⚠️ Parse date error for {symbol}: {e}")
+                continue
+        
+        if skipped_sl_tp > 0:
+            print(f"  🛡️ Protected {skipped_sl_tp} SL/TP orders from stale cancellation")
+        
         return cancelled
 
     async def _send_notification(self, message: str, params: dict):
