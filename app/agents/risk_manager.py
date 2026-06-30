@@ -303,8 +303,22 @@ class RiskManager(BaseAgent):
                 real_available = 0
             available_buying_power = min(available_buying_power, real_available)
 
-            # 🆕 Cache fractionable check (per non chiamare Alpaca 10 volte)
+            # 🆕 v2.1 — Fractionable check: legge dal DB (cache persistita)
+            # Se mancante in DB, fa il check Alpaca UNA volta e salva.
+            # Cache in-memory solo per evitare doppi check nello stesso run.
             fractionable_cache = {}
+
+            # Pre-carica fractionable da DB per tutti i candidati in una sola query
+            candidate_tickers = [c["ticker"] for c in candidates]
+            if candidate_tickers and fractionable_only:
+                cursor = db.assets.find(
+                    {"ticker": {"$in": candidate_tickers}},
+                    {"ticker": 1, "fractionable": 1, "fractionable_checked_at": 1}
+                )
+                async for doc in cursor:
+                    t = doc.get("ticker")
+                    if "fractionable" in doc:
+                        fractionable_cache[t] = doc.get("fractionable", False)
 
             for c in candidates:
                 ticker = c["ticker"]
@@ -331,16 +345,34 @@ class RiskManager(BaseAgent):
                     rejected_trades.append({**c, "reason": f"R/R too low: {rr} < {min_rr}"})
                     continue
 
-                # 🆕 Check fractionable
+                # 🆕 v2.1 — Check fractionable da DB con fallback Alpaca
                 if fractionable_only:
-                    if ticker not in fractionable_cache:
+                    # 1) Prova cache (in-memory + DB pre-load)
+                    is_frac = fractionable_cache.get(ticker)
+                    
+                    # 2) Se mancante, chiama Alpaca UNA volta e salva in DB
+                    if is_frac is None:
                         try:
                             from app.services.alpaca_trader import is_fractionable
-                            fractionable_cache[ticker] = await is_fractionable(ticker)
-                        except Exception:
+                            is_frac = await is_fractionable(ticker)
+                            fractionable_cache[ticker] = is_frac
+                            
+                            # 💾 Salva in DB per le prossime run
+                            await db.assets.update_one(
+                                {"ticker": ticker},
+                                {"$set": {
+                                    "fractionable": is_frac,
+                                    "fractionable_checked_at": datetime.utcnow(),
+                                }},
+                                upsert=False  # solo se ticker esiste già
+                            )
+                            print(f"  🔍 Fractionable check {ticker}: {is_frac} (saved to DB)")
+                        except Exception as e:
+                            print(f"  ⚠️ Fractionable check error {ticker}: {e}")
+                            is_frac = False
                             fractionable_cache[ticker] = False
                     
-                    if not fractionable_cache[ticker]:
+                    if not is_frac:
                         rejected_trades.append({**c, "reason": "Not fractionable"})
                         continue
 
