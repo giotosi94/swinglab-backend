@@ -69,18 +69,29 @@ class MacroAnalyst(BaseAgent):
         spy_rsi = spy.get("rsi", 50) if spy else 50
         spy_return_20d = spy.get("return_20d", 0) if spy else 0
 
-        # Trend score SPY (0-100)
-        spy_trend_score = 50
-        if spy_price > spy_ema20 > spy_ema50:
-            spy_trend_score = 85  # Strong uptrend
-        elif spy_price > spy_ema50 > 0:
-            spy_trend_score = 65  # Mild uptrend
-        elif spy_price > spy_ema50 * 0.97 if spy_ema50 > 0 else False:
-            spy_trend_score = 45  # Near support
+        # ============================================
+        # 🔧 v1.1 — Trend score SPY (0-100) esplicito
+        # Logica chiara senza if ternari ambigui.
+        # Gestisce esplicitamente il caso EMA50 mancante.
+        # ============================================
+        if spy_ema50 <= 0 or spy_price <= 0:
+            # Dati mancanti → neutro, non assumiamo nulla
+            spy_trend_score = 50
+        elif spy_price > spy_ema20 > spy_ema50 and spy_ema20 > 0:
+            # Strong uptrend: price > EMA20 > EMA50 (allineamento perfetto)
+            spy_trend_score = 85
+        elif spy_price > spy_ema50:
+            # Mild uptrend: price sopra EMA50 ma senza allineamento perfetto
+            spy_trend_score = 65
+        elif spy_price > (spy_ema50 * 0.97):
+            # Near support: price entro -3% dalla EMA50 (possibile pullback)
+            spy_trend_score = 45
         elif spy_price < spy_ema50 and spy_rsi > 35:
-            spy_trend_score = 30  # Downtrend
+            # Downtrend ma non ipervenduto: ancora margine di discesa
+            spy_trend_score = 30
         else:
-            spy_trend_score = 15  # Strong downtrend / crash
+            # Strong downtrend / crash: sotto EMA50 e RSI estremo
+            spy_trend_score = 15
 
         # RSI score (0-100): meglio se tra 40-65
         if 40 <= spy_rsi <= 65:
