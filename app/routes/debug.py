@@ -739,3 +739,250 @@ async def populate_fractionable():
           f"{report['summary']['errors_count']} errors")
     
     return report
+
+
+
+# ============================================
+# 🆕 v3.4 — FIX V TARGET (post-fill mismatch)
+# ============================================
+
+@router.post("/fix-position-targets")
+async def fix_position_targets():
+    """
+    🔧 One-shot admin endpoint.
+    Ricalcola stop_loss e target per tutte le posizioni aperte
+    in base al filled_avg_price REALE (non al prezzo Alpha).
+    
+    Utile quando ci sono state posizioni con slippage alto
+    (es. V che è stata comprata a $349.80 con target vecchio $341.73).
+    """
+    from datetime import datetime
+    from app.services.alpaca_trader import get_positions
+    from app.db.mongodb import get_db
+    
+    db = get_db()
+    positions = await get_positions() or []
+    
+    if not positions:
+        return {"message": "No open positions", "fixed": 0}
+    
+    report = {
+        "started_at": datetime.utcnow().isoformat(),
+        "checked": 0,
+        "fixed": [],
+        "skipped": [],
+        "errors": [],
+    }
+    
+    for pos in positions:
+        symbol = pos.get("symbol")
+        entry_price = float(pos.get("avg_entry_price", 0))
+        
+        if not symbol or entry_price <= 0:
+            report["errors"].append({"ticker": symbol, "error": "Invalid position data"})
+            continue
+        
+        report["checked"] += 1
+        
+        # Trova il BUY corrispondente in trade_history
+        buy_trade = await db.trade_history.find_one(
+            {
+                "ticker": symbol,
+                "side": "buy",
+                "sell_linked": {"$ne": True}
+            },
+            sort=[("date", -1)]
+        )
+        
+        if not buy_trade:
+            report["skipped"].append({"ticker": symbol, "reason": "No buy_trade found"})
+            continue
+        
+        old_stop = float(buy_trade.get("stop_loss", 0) or 0)
+        old_target = float(buy_trade.get("target", 0) or 0)
+        
+        # Verifica se SL/TP sono coerenti con entry_price REALE
+        needs_fix = False
+        new_stop = old_stop
+        new_target = old_target
+        
+        # SL check
+        if old_stop >= entry_price:
+            new_stop = round(entry_price * 0.96, 2)  # -4% da fill reale
+            needs_fix = True
+        elif old_stop < entry_price * 0.85:  # SL troppo lontano (>15%)
+            new_stop = round(entry_price * 0.96, 2)
+            needs_fix = True
+        elif old_stop > entry_price * 0.99:  # SL troppo vicino (<1%)
+            new_stop = round(entry_price * 0.96, 2)
+            needs_fix = True
+        
+        # TP check
+        if old_target <= entry_price:
+            new_target = round(entry_price * 1.08, 2)  # +8% da fill reale
+            needs_fix = True
+        elif old_target < entry_price * 1.02:  # TP troppo vicino (<2%)
+            new_target = round(entry_price * 1.08, 2)
+            needs_fix = True
+        
+        if not needs_fix:
+            report["skipped"].append({
+                "ticker": symbol,
+                "reason": "SL/TP already correct",
+                "entry": entry_price,
+                "stop_loss": old_stop,
+                "target": old_target,
+            })
+            continue
+        
+        # Applica il fix nel DB
+        try:
+            await db.trade_history.update_one(
+                {"_id": buy_trade["_id"]},
+                {"$set": {
+                    "stop_loss": new_stop,
+                    "target": new_target,
+                    "original_stop_loss": old_stop,
+                    "original_target": old_target,
+                    "target_fixed_at": datetime.utcnow(),
+                    "target_fix_reason": "post_fill_recalc",
+                }}
+            )
+            
+            report["fixed"].append({
+                "ticker": symbol,
+                "entry_price": entry_price,
+                "old_stop": old_stop,
+                "new_stop": new_stop,
+                "old_target": old_target,
+                "new_target": new_target,
+            })
+            print(f"  ✅ Fixed {symbol}: SL ${old_stop:.2f}→${new_stop:.2f}, TP ${old_target:.2f}→${new_target:.2f}")
+        
+        except Exception as e:
+            report["errors"].append({"ticker": symbol, "error": str(e)})
+            print(f"  ❌ Fix error {symbol}: {e}")
+    
+    report["finished_at"] = datetime.utcnow().isoformat()
+    report["summary"] = {
+        "checked": report["checked"],
+        "fixed_count": len(report["fixed"]),
+        "skipped_count": len(report["skipped"]),
+        "errors_count": len(report["errors"]),
+    }
+    
+    print(f"\n🏁 Fix positions done: {report['summary']['fixed_count']} fixed, "
+          f"{report['summary']['skipped_count']} OK, {report['summary']['errors_count']} errors")
+    
+    return report
+
+
+# ============================================
+# 🆕 v3.4 — POSITIONS WITH SL/TP DETAILS
+# ============================================
+
+@router.get("/positions-detail")
+async def positions_detail():
+    """
+    🆕 Ritorna le posizioni aperte con SL/TP presi dal DB.
+    Combina dati Alpaca (prezzo, market value) con dati DB (SL/TP, setup, days).
+    """
+    from datetime import datetime
+    from app.services.alpaca_trader import get_positions
+    from app.db.mongodb import get_db
+    
+    db = get_db()
+    positions = await get_positions() or []
+    
+    if not positions:
+        return {"positions": [], "count": 0}
+    
+    detailed = []
+    
+    for pos in positions:
+        symbol = pos.get("symbol")
+        current_price = float(pos.get("current_price", 0))
+        entry_price = float(pos.get("avg_entry_price", 0))
+        qty = float(pos.get("qty", 0))
+        market_value = float(pos.get("market_value", 0))
+        pnl = float(pos.get("unrealized_pl", 0))
+        pnl_pct = float(pos.get("unrealized_plpc", 0)) * 100
+        
+        # Fetch dati dal DB
+        buy_trade = await db.trade_history.find_one(
+            {
+                "ticker": symbol,
+                "side": "buy",
+                "sell_linked": {"$ne": True}
+            },
+            sort=[("date", -1)]
+        )
+        
+        stop_loss = 0
+        target = 0
+        setup_type = "unknown"
+        sector = "unknown"
+        confluence = 0
+        days_held = 0
+        buy_date = None
+        
+        if buy_trade:
+            stop_loss = float(buy_trade.get("stop_loss", 0) or 0)
+            target = float(buy_trade.get("target", 0) or 0)
+            setup_type = buy_trade.get("setup_type", "unknown")
+            sector = buy_trade.get("sector", "unknown")
+            confluence = buy_trade.get("confluence", 0)
+            buy_date = buy_trade.get("date")
+            if buy_date:
+                days_held = max(1, (datetime.utcnow() - buy_date).days)
+        
+        # Trailing stop (se esiste, overriding stop_loss iniziale)
+        trailing = await db.trailing_stops.find_one({"ticker": symbol})
+        trailing_stop = None
+        if trailing:
+            trailing_stop = float(trailing.get("stop_price", 0))
+        
+        # Effective SL (trailing se esiste e più alto del stop iniziale)
+        effective_stop = stop_loss
+        if trailing_stop and trailing_stop > stop_loss:
+            effective_stop = trailing_stop
+        
+        # Distanza in % da SL e TP
+        stop_distance_pct = 0
+        target_distance_pct = 0
+        if entry_price > 0:
+            stop_distance_pct = round(((effective_stop - current_price) / current_price) * 100, 2) if effective_stop > 0 else 0
+            target_distance_pct = round(((target - current_price) / current_price) * 100, 2) if target > 0 else 0
+        
+        # Risk/Reward
+        risk = abs(current_price - effective_stop) if effective_stop > 0 else 0
+        reward = abs(target - current_price) if target > 0 else 0
+        rr = round(reward / risk, 2) if risk > 0 else 0
+        
+        detailed.append({
+            "ticker": symbol,
+            "qty": qty,
+            "entry_price": round(entry_price, 2),
+            "current_price": round(current_price, 2),
+            "market_value": round(market_value, 2),
+            "pnl": round(pnl, 2),
+            "pnl_pct": round(pnl_pct, 2),
+            "stop_loss": round(effective_stop, 2),
+            "stop_loss_initial": round(stop_loss, 2),
+            "trailing_stop": round(trailing_stop, 2) if trailing_stop else None,
+            "target": round(target, 2),
+            "stop_distance_pct": stop_distance_pct,
+            "target_distance_pct": target_distance_pct,
+            "risk_reward": rr,
+            "setup_type": setup_type,
+            "sector": sector,
+            "confluence": confluence,
+            "days_held": days_held,
+            "buy_date": buy_date.isoformat() if buy_date else None,
+        })
+    
+    return {
+        "positions": detailed,
+        "count": len(detailed),
+        "calculated_at": datetime.utcnow().isoformat(),
+    }
