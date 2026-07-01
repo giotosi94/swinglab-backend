@@ -35,13 +35,17 @@ async def get_auto_trader_state():
     return state
 
 
-async def reset_auto_trader(initial_capital: float = 10000):
+async def reset_auto_trader(initial_capital: float = None):
     """
-    🔄 RESET COMPLETO v2.0
+    🔄 RESET COMPLETO v2.1
+    
+    ⚠️ IMPORTANTE: initial_capital è opzionale.
+    Se non fornito, viene letto automaticamente da Alpaca (equity attuale).
+    Alpaca è la SINGLE SOURCE OF TRUTH per il capitale.
     
     Pulisce TUTTO lo stato operativo per ripartire da zero, MANTENENDO:
     - stock_bars (cache prezzi storici)
-    - assets (universo configurato)
+    - assets (universo configurato + fractionable cache)
     - sectors (definizione settori)
     - market_regime (dati macro storici)
     - watchlist
@@ -56,11 +60,8 @@ async def reset_auto_trader(initial_capital: float = 10000):
     - market_context (contesto macro corrente)
     - Brain, decisioni e performance di TUTTI gli agenti
     - Collection legacy: agent_brain, agent_decisions
-    
-    AGGIORNA:
-    - app_settings.risk_params.starting_capital al nuovo valore
     """
-    from app.services.alpaca_trader import close_all_positions, cancel_all_orders
+    from app.services.alpaca_trader import close_all_positions, cancel_all_orders, get_account
     
     db = get_db()
     report = {
@@ -71,9 +72,21 @@ async def reset_auto_trader(initial_capital: float = 10000):
         "started_at": datetime.utcnow().isoformat(),
     }
     
+    # 🆕 Se initial_capital non fornito, prendi da Alpaca
+    if initial_capital is None:
+        try:
+            account = await get_account()
+            if account:
+                initial_capital = float(account.get("equity", 100000))
+            else:
+                initial_capital = 100000
+        except Exception as e:
+            report["errors"].append(f"get_account: {str(e)}")
+            initial_capital = 100000
+    
     print("=" * 60)
-    print("🔄 SWINGLAB RESET v2.0 — Starting...")
-    print(f"   Target capital: ${initial_capital:,.0f}")
+    print("🔄 SWINGLAB RESET v2.1 — Starting...")
+    print(f"   Target capital (from Alpaca): ${initial_capital:,.0f}")
     print("=" * 60)
     
     # ============================================
@@ -104,12 +117,12 @@ async def reset_auto_trader(initial_capital: float = 10000):
     print("\n🗑️  [2/4] Cleaning trade data...")
     
     collections_trade = [
-        "trade_history",        # Storico completo trade (buy/sell)
-        "trailing_stops",       # Gestione trailing stop dinamici
-        "alpaca_orders",        # Log interno ordini Alpaca
-        "auto_trader",          # Pipeline state (alpaca_state)
-        "market_context",       # Contesto macro corrente
-        "shared_brain",         # Stato condiviso agenti
+        "trade_history",
+        "trailing_stops",
+        "alpaca_orders",
+        "auto_trader",
+        "market_context",
+        "shared_brain",
     ]
     
     for coll_name in collections_trade:
@@ -139,7 +152,7 @@ async def reset_auto_trader(initial_capital: float = 10000):
                 report["errors"].append(f"{coll_name}: {str(e)}")
                 print(f"  ❌ {coll_name} error: {e}")
     
-    # Collection legacy (retrocompat)
+    # Collection legacy
     print("\n🗑️  Cleaning legacy collections...")
     legacy_collections = ["agent_brain", "agent_decisions"]
     for coll_name in legacy_collections:
@@ -150,6 +163,51 @@ async def reset_auto_trader(initial_capital: float = 10000):
         except Exception as e:
             report["errors"].append(f"legacy_{coll_name}: {str(e)}")
             print(f"  ❌ legacy {coll_name} error: {e}")
+    
+    # ============================================
+    # FASE 4: NOTE — NON aggiorniamo più starting_capital
+    # ============================================
+    # 🆕 v2.1: starting_capital NON viene più salvato in app_settings.
+    # Fonte di verità = Alpaca (endpoint /api/data/starting-capital)
+    print(f"\n⚙️  [4/4] Skipping starting_capital update (now from Alpaca)")
+    
+    # ✅ Rimuovi vecchio starting_capital residuo dai settings
+    try:
+        settings_update = await db.app_settings.update_one(
+            {"_id": "risk_params"},
+            {"$unset": {"starting_capital": ""}},
+            upsert=False,
+        )
+        if settings_update.modified_count > 0:
+            print(f"  🧹 Removed old starting_capital from app_settings")
+    except Exception as e:
+        print(f"  ⚠️ Cleanup old starting_capital: {e}")
+    
+    # ============================================
+    # FINAL REPORT
+    # ============================================
+    report["finished_at"] = datetime.utcnow().isoformat()
+    report["initial_capital"] = float(initial_capital)
+    report["capital_source"] = "alpaca"
+    report["status"] = "success" if not report["errors"] else "partial"
+    
+    total_deleted = sum(v for v in report["cleaned"].values() if isinstance(v, int))
+    
+    print("\n" + "=" * 60)
+    print(f"🏁 RESET COMPLETE")
+    print(f"   Total docs deleted: {total_deleted}")
+    print(f"   Errors: {len(report['errors'])}")
+    print(f"   Capital (from Alpaca): ${initial_capital:,.0f}")
+    if report["errors"]:
+        print(f"   ⚠️  Errors: {report['errors']}")
+    print("=" * 60)
+    
+    report["message"] = (
+        f"Reset complete: {total_deleted} docs deleted, "
+        f"capital from Alpaca: ${initial_capital:,.0f}"
+    )
+    
+    return report
     
     # ============================================
     # FASE 4: AGGIORNA SETTINGS CON NUOVO CAPITALE
