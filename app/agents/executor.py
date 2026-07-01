@@ -537,6 +537,57 @@ class Executor(BaseAgent):
         
         print(f"  ✅ {ticker} FILLED: {filled_qty:.4f} shares @ ${filled_avg_price:.2f}")
         
+        # 🆕 v3.4 — RECALC target/SL post-fill se slippage > 3%
+        # Prezzo di fill può essere molto diverso da quello di Alpha (mercato mosso)
+        # Se target <= filled_price O stop_loss >= filled_price → ricalcola da fill_price
+        original_target = target
+        original_stop = stop
+        recalc_triggered = False
+        
+        # Recalc SL se stop >= filled_price (SL sopra entry = bug)
+        if stop >= filled_avg_price:
+            new_stop = round(filled_avg_price * 0.96, 2)  # -4% da fill reale
+            print(f"  🔧 RECALC SL {ticker}: ${stop:.2f} -> ${new_stop:.2f} (fill was ${filled_avg_price:.2f})")
+            stop = new_stop
+            recalc_triggered = True
+        
+        # Recalc TP se target <= filled_price (TP sotto entry = bug)
+        if target <= filled_avg_price:
+            new_target = round(filled_avg_price * 1.08, 2)  # +8% da fill reale
+            print(f"  🔧 RECALC TP {ticker}: ${target:.2f} -> ${new_target:.2f} (fill was ${filled_avg_price:.2f})")
+            target = new_target
+            recalc_triggered = True
+        
+        # Recalc soft se slippage entry > 3% (target/SL potrebbero non riflettere fill reale)
+        # Anche se non è invalid, meglio ricalibrare
+        if not recalc_triggered:
+            slippage_pct = abs(filled_avg_price - target + target) / filled_avg_price * 100
+            # Verifica: SL è a distanza ragionevole (2-10%)?
+            sl_distance_pct = abs(filled_avg_price - stop) / filled_avg_price * 100
+            tp_distance_pct = abs(target - filled_avg_price) / filled_avg_price * 100
+            
+            # Se SL è molto vicino (<1%) o troppo lontano (>15%) → ricalibra
+            if sl_distance_pct < 1.0 or sl_distance_pct > 15.0:
+                new_stop = round(filled_avg_price * 0.96, 2)  # -4%
+                print(f"  🔧 RECALIBRATE SL {ticker}: ${stop:.2f} -> ${new_stop:.2f} (was {sl_distance_pct:.1f}% from fill)")
+                stop = new_stop
+                recalc_triggered = True
+            
+            # Se TP è molto vicino (<2%) → ricalibra
+            if tp_distance_pct < 2.0:
+                new_target = round(filled_avg_price * 1.08, 2)  # +8%
+                print(f"  🔧 RECALIBRATE TP {ticker}: ${target:.2f} -> ${new_target:.2f} (was {tp_distance_pct:.1f}% from fill)")
+                target = new_target
+                recalc_triggered = True
+        
+        # Salva valori aggiornati nel result per il caller
+        result["target"] = target
+        result["stop_loss"] = stop
+        result["recalc_triggered"] = recalc_triggered
+        if recalc_triggered:
+            result["original_target"] = original_target
+            result["original_stop"] = original_stop
+        
         # ===== Step 3: Piazza SL + TP =====
         brackets = await place_brackets_after_fill(
             symbol=ticker,
@@ -720,8 +771,9 @@ class Executor(BaseAgent):
                     if notional_result["success"]:
                         filled_qty = notional_result["filled_qty"]
                         avg_price = notional_result["filled_avg_price"]
-                        target = t["target_price"]
-                        stop = t["stop_loss"]
+                        # 🆕 v3.4 — Usa target/stop RICALCOLATI se sono stati aggiornati
+                        target = notional_result.get("target", t["target_price"])
+                        stop = notional_result.get("stop_loss", t["stop_loss"])
                         notional_usd = notional_result["notional_usd"]
                         buy_order_id = notional_result["buy_order_id"]
                         
