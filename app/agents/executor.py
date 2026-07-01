@@ -585,7 +585,6 @@ class Executor(BaseAgent):
             positions = await get_positions() or []
         
         trailing_adjustments = await self._manage_trailing_stops(positions, params)
-`
 
         # ============================================
         # 2. EXECUTE SELLS (invariato)
