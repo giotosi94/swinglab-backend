@@ -133,6 +133,190 @@ class Executor(BaseAgent):
             return max(days, 1)
         return 0
 
+# ==========================================
+    # 🆕 v3.2 — SOFTWARE SL/TP (per fractional shares)
+    # ==========================================
+    async def _check_software_sl_tp(self, positions: list, params: dict) -> dict:
+        """
+        🆕 v3.2 — Controlla software SL/TP per posizioni con fractional shares.
+        
+        Alpaca NON supporta SL/TP nativi con fractional shares (limit/stop + GTC).
+        Quindi l'Executor gestisce SL/TP "software":
+        - Legge SL/TP salvati in db.trade_history quando il buy è stato piazzato
+        - Ad ogni run confronta prezzo corrente con SL/TP
+        - Se prezzo <= SL → chiude posizione (STOP_LOSS_HIT)
+        - Se prezzo >= TP → chiude posizione (TAKE_PROFIT_HIT)
+        
+        Ritorna dict con:
+        - triggered: lista posizioni chiuse
+        - checked: totale posizioni controllate
+        - errors: lista errori
+        """
+        db = get_db()
+        result = {"triggered": [], "checked": 0, "errors": []}
+        
+        if not positions:
+            return result
+        
+        for pos in positions:
+            symbol = pos.get("symbol")
+            current_price = float(pos.get("current_price", 0))
+            entry_price = float(pos.get("avg_entry_price", 0))
+            shares = float(pos.get("qty", 0))
+            
+            if not symbol or current_price <= 0 or entry_price <= 0:
+                continue
+            
+            # Trova il BUY corrispondente (ultimo, non ancora chiuso)
+            buy_trade = await db.trade_history.find_one(
+                {
+                    "ticker": symbol,
+                    "side": "buy",
+                    "sell_linked": {"$ne": True}
+                },
+                sort=[("date", -1)]
+            )
+            
+            if not buy_trade:
+                # Nessun buy trovato in trade_history → skip
+                continue
+            
+            result["checked"] += 1
+            
+            stop_loss = buy_trade.get("stop_loss", 0)
+            target = buy_trade.get("target", 0)
+            
+            # Trailing stop dinamico (se esiste, sovrascrive SL iniziale)
+            trailing = await db.trailing_stops.find_one({"ticker": symbol})
+            if trailing:
+                trailing_stop = trailing.get("stop_price", 0)
+                if trailing_stop > stop_loss:
+                    stop_loss = trailing_stop
+            
+            # ============================================
+            # CHECK STOP LOSS
+            # ============================================
+            if stop_loss > 0 and current_price <= stop_loss:
+                try:
+                    close_result = await close_position(symbol)
+                    if close_result is not None:
+                        pnl_pct = round(((current_price - entry_price) / entry_price) * 100, 2)
+                        pnl_dollar = round((current_price - entry_price) * shares, 2)
+                        days_held = await self._calc_days_held(db, symbol)
+                        
+                        sell_order_id = f"sw_sl_{symbol}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+                        
+                        # Log in trade_history
+                        await db.trade_history.insert_one({
+                            "ticker": symbol,
+                            "side": "sell",
+                            "entry_price": entry_price,
+                            "exit_price": current_price,
+                            "shares": float(shares),
+                            "pnl_pct": pnl_pct,
+                            "pnl_dollar": pnl_dollar,
+                            "days_held": days_held,
+                            "reason": "SOFTWARE_STOP_LOSS",
+                            "setup_type": buy_trade.get("setup_type", "unknown"),
+                            "sector": buy_trade.get("sector", "unknown"),
+                            "rsi_at_entry": buy_trade.get("rsi_at_entry", 50),
+                            "market_regime": buy_trade.get("market_regime", "UNKNOWN"),
+                            "order_id": sell_order_id,
+                            "buy_order_id": buy_trade.get("order_id", ""),
+                            "agent": "executor_software_sl",
+                            "date": datetime.utcnow(),
+                            "source": "software_sl_tp",
+                            "trigger_price": stop_loss,
+                        })
+                        
+                        # Link buy → sell
+                        await db.trade_history.update_one(
+                            {"_id": buy_trade["_id"]},
+                            {"$set": {"sell_linked": True, "sell_order_id": sell_order_id}}
+                        )
+                        
+                        # Cleanup trailing stop
+                        await db.trailing_stops.delete_one({"ticker": symbol})
+                        
+                        result["triggered"].append({
+                            "ticker": symbol,
+                            "reason": "SOFTWARE_STOP_LOSS",
+                            "trigger_price": stop_loss,
+                            "current_price": current_price,
+                            "pnl_pct": pnl_pct,
+                            "pnl_dollar": pnl_dollar,
+                        })
+                        
+                        print(f"  🛑 SOFTWARE SL HIT {symbol}: ${current_price:.2f} <= ${stop_loss:.2f} "
+                              f"(P&L {pnl_pct:+.2f}%, ${pnl_dollar:+.0f})")
+                        continue  # Skip TP check per questo ticker
+                except Exception as e:
+                    result["errors"].append({"ticker": symbol, "action": "sl", "error": str(e)})
+                    print(f"  ⚠️ SW SL error {symbol}: {e}")
+            
+            # ============================================
+            # CHECK TAKE PROFIT
+            # ============================================
+            if target > 0 and current_price >= target:
+                try:
+                    close_result = await close_position(symbol)
+                    if close_result is not None:
+                        pnl_pct = round(((current_price - entry_price) / entry_price) * 100, 2)
+                        pnl_dollar = round((current_price - entry_price) * shares, 2)
+                        days_held = await self._calc_days_held(db, symbol)
+                        
+                        sell_order_id = f"sw_tp_{symbol}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+                        
+                        await db.trade_history.insert_one({
+                            "ticker": symbol,
+                            "side": "sell",
+                            "entry_price": entry_price,
+                            "exit_price": current_price,
+                            "shares": float(shares),
+                            "pnl_pct": pnl_pct,
+                            "pnl_dollar": pnl_dollar,
+                            "days_held": days_held,
+                            "reason": "SOFTWARE_TAKE_PROFIT",
+                            "setup_type": buy_trade.get("setup_type", "unknown"),
+                            "sector": buy_trade.get("sector", "unknown"),
+                            "rsi_at_entry": buy_trade.get("rsi_at_entry", 50),
+                            "market_regime": buy_trade.get("market_regime", "UNKNOWN"),
+                            "order_id": sell_order_id,
+                            "buy_order_id": buy_trade.get("order_id", ""),
+                            "agent": "executor_software_tp",
+                            "date": datetime.utcnow(),
+                            "source": "software_sl_tp",
+                            "trigger_price": target,
+                        })
+                        
+                        await db.trade_history.update_one(
+                            {"_id": buy_trade["_id"]},
+                            {"$set": {"sell_linked": True, "sell_order_id": sell_order_id}}
+                        )
+                        
+                        await db.trailing_stops.delete_one({"ticker": symbol})
+                        
+                        result["triggered"].append({
+                            "ticker": symbol,
+                            "reason": "SOFTWARE_TAKE_PROFIT",
+                            "trigger_price": target,
+                            "current_price": current_price,
+                            "pnl_pct": pnl_pct,
+                            "pnl_dollar": pnl_dollar,
+                        })
+                        
+                        print(f"  🎯 SOFTWARE TP HIT {symbol}: ${current_price:.2f} >= ${target:.2f} "
+                              f"(P&L {pnl_pct:+.2f}%, ${pnl_dollar:+.0f})")
+                except Exception as e:
+                    result["errors"].append({"ticker": symbol, "action": "tp", "error": str(e)})
+                    print(f"  ⚠️ SW TP error {symbol}: {e}")
+        
+        if result["triggered"]:
+            print(f"  💥 Software SL/TP: {len(result['triggered'])} triggered, "
+                  f"{result['checked']} checked")
+        
+        return result
+    
     async def _manage_trailing_stops(self, positions: list, params: dict) -> list:
         db = get_db()
         adjustments = []
@@ -392,7 +576,16 @@ class Executor(BaseAgent):
 
         # 1.5 TRAILING STOP MANAGEMENT
         positions = await get_positions() or []
+        
+        # 🆕 v3.2 — Software SL/TP check PRIMA del trailing (posizioni potrebbero chiudersi)
+        sl_tp_result = await self._check_software_sl_tp(positions, params)
+        
+        # Se abbiamo chiuso posizioni via SL/TP, ricarichiamo la lista aggiornata
+        if sl_tp_result["triggered"]:
+            positions = await get_positions() or []
+        
         trailing_adjustments = await self._manage_trailing_stops(positions, params)
+`
 
         # ============================================
         # 2. EXECUTE SELLS (invariato)
@@ -722,6 +915,7 @@ class Executor(BaseAgent):
             "failed_orders": failed_orders, "cancelled_stale": cancelled,
             "trailing_adjustments": trailing_adjustments,
             "synced_trades": synced,
+            "software_sl_tp": sl_tp_result,  # 🆕 v3.2
             "market_status": market_status,
             "llm_reasoning": executor_reasoning,
         }
