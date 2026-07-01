@@ -7,6 +7,10 @@ router = APIRouter()
 
 
 class SettingsModel(BaseModel):
+    """
+    🔧 v2.1 — Rimosso starting_capital.
+    Fonte di verità = Alpaca (endpoint /api/data/starting-capital).
+    """
     # ===== RISK MANAGEMENT =====
     max_positions: int = 5
     risk_pct_per_trade: float = 2.0
@@ -16,28 +20,34 @@ class SettingsModel(BaseModel):
     daily_loss_limit_pct: float = -3.0
     weekly_loss_limit_pct: float = -5.0
     
-    # ===== CAPITAL =====
-    starting_capital: float = 10000.0  # 🆕 era 100000
-    
-    # ===== FRACTIONAL / NOTIONAL TRADING (NEW) =====
-    position_sizing_mode: str = "notional"   # 🆕 "notional" | "shares"
-    position_size_pct: float = 20.0          # 🆕 % capitale per posizione
-    fractionable_only: bool = True           # 🆕 solo titoli frazionabili
-    min_notional_per_trade: float = 100.0    # 🆕 minimo $ per trade
+    # ===== FRACTIONAL / NOTIONAL TRADING =====
+    position_sizing_mode: str = "notional"   # "notional" | "shares"
+    position_size_pct: float = 20.0          # % capitale per posizione
+    fractionable_only: bool = True           # solo titoli frazionabili
+    min_notional_per_trade: float = 100.0    # minimo $ per trade
 
 
 @router.get("/")
 async def get_settings():
+    """
+    🔧 v2.1 — Ritorna settings senza starting_capital.
+    Il capitale viene esposto dall'endpoint /api/data/starting-capital (da Alpaca).
+    """
     db = get_db()
     doc = await db.app_settings.find_one({"_id": "risk_params"})
     if doc:
         doc["_id"] = str(doc["_id"])
+        # 🧹 Rimuove eventuale starting_capital residuo (legacy)
+        doc.pop("starting_capital", None)
         return doc
     return SettingsModel().dict()
 
 
 @router.post("/")
 async def save_settings(s: SettingsModel):
+    """
+    🔧 v2.1 — Save settings senza starting_capital.
+    """
     db = get_db()
     data = s.dict()
     
@@ -46,6 +56,12 @@ async def save_settings(s: SettingsModel):
         {"_id": "risk_params"},
         {"$set": data},
         upsert=True,
+    )
+    
+    # 🧹 Rimuove eventuale starting_capital residuo (legacy cleanup)
+    await db.app_settings.update_one(
+        {"_id": "risk_params"},
+        {"$unset": {"starting_capital": ""}},
     )
     
     # 2. RiskManager — tutti i parametri di rischio + sizing
@@ -59,7 +75,7 @@ async def save_settings(s: SettingsModel):
             "max_per_sector": s.max_per_sector,
             "daily_loss_limit_pct": s.daily_loss_limit_pct,
             "weekly_loss_limit_pct": s.weekly_loss_limit_pct,
-            # 🆕 Sizing parameters
+            # Sizing parameters
             "position_sizing_mode": s.position_sizing_mode,
             "position_size_pct": s.position_size_pct,
             "fractionable_only": s.fractionable_only,
@@ -74,7 +90,6 @@ async def save_settings(s: SettingsModel):
         {"$set": {
             "max_candidates": s.max_positions * 2,
             "max_positions": s.max_positions,
-            # 🆕 fractionable filter
             "fractionable_only": s.fractionable_only,
         }},
         upsert=True,
@@ -85,32 +100,29 @@ async def save_settings(s: SettingsModel):
         {"_id": "params"},
         {"$set": {
             "max_positions": s.max_positions,
-            # 🆕 sizing mode (Executor sceglie il flusso bracket vs notional)
             "position_sizing_mode": s.position_sizing_mode,
         }},
         upsert=True,
     )
     
-    # 5. MacroAnalyst — starting_capital per calcoli percentuali
+    # 5. 🧹 MacroAnalyst — cleanup vecchio starting_capital
+    # (Non lo usiamo più; il macro può calcolare % da equity live di Alpaca)
     await db.agent_memory_macro_analyst.update_one(
         {"_id": "params"},
-        {"$set": {
-            "starting_capital": s.starting_capital,
-        }},
-        upsert=True,
+        {"$unset": {"starting_capital": ""}},
     )
     
     print(
         f"✅ Settings propagated to all 4 agents: "
         f"max_pos={s.max_positions}, "
         f"risk={s.risk_pct_per_trade}%, "
-        f"capital=${s.starting_capital:,.0f}, "
         f"sizing_mode={s.position_sizing_mode}, "
         f"pos_size={s.position_size_pct}%, "
         f"fractional={s.fractionable_only}"
     )
     
     return {
-        "message": "Settings saved & propagated to all agents",
+        "message": "Settings saved & propagated to all agents (capital from Alpaca)",
         "settings": data,
+        "capital_source": "alpaca",
     }
