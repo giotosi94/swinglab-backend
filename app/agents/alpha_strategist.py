@@ -459,16 +459,42 @@ class AlphaStrategist(BaseAgent):
                 skipped_reasons["low_confluence"] += 1
                 continue
 
-            # Target e stop loss (hybrid: VA + minimum %)
-            raw_stop = va_low if va_low and va_low < price else round(price * 0.96, 2)
-            raw_target = va_high if va_high and va_high > price else round(price * 1.08, 2)
-
-            # Ensure minimum 4% stop distance and 6% target distance
-            min_stop = round(price * 0.96, 2)
+            # 🔧 v1.2 — Target e stop loss (hybrid: VA + minimum %)
+            # SAFETY: stop_loss DEVE essere < price, target_price DEVE essere > price
+            
+            # STOP LOSS
+            # Regola: preferisci va_low se è sotto price, altrimenti usa -4% da entry
+            if va_low and 0 < va_low < price:
+                raw_stop = va_low
+            else:
+                raw_stop = round(price * 0.96, 2)
+            
+            # Fallback safety: se per qualche motivo raw_stop >= price → forza -4%
+            if raw_stop >= price:
+                raw_stop = round(price * 0.96, 2)
+            
+            # Ensure stop non troppo lontano (max -8% da entry)
+            min_stop = round(price * 0.92, 2)  # cap a -8%
+            stop_loss = max(raw_stop, min_stop)  # prendi lo stop più stretto (più vicino a price)
+            
+            # Safety finale
+            if stop_loss >= price:
+                stop_loss = round(price * 0.96, 2)
+            
+            # TARGET PRICE
+            # Regola: preferisci va_high se è sopra price, altrimenti usa +8% da entry
+            if va_high and va_high > price:
+                raw_target = va_high
+            else:
+                raw_target = round(price * 1.08, 2)
+            
+            # Safety: se raw_target <= price → forza +8%
+            if raw_target <= price:
+                raw_target = round(price * 1.08, 2)
+            
+            # Ensure minimum target distance (+6% minimo)
             min_target = round(price * 1.06, 2)
-
-            stop_loss = max(raw_stop, min_stop)        # tighter stop = better R/R
-            target_price = max(raw_target, min_target)  # higher target = better R/R
+            target_price = max(raw_target, min_target)  # target più alto = meglio
 
             # Risk/Reward ratio
             risk = abs(price - stop_loss)
