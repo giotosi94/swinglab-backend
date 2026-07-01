@@ -54,10 +54,20 @@ async def run_trader():
     return await run_auto_trader()
 
 
+
 @router.post("/autotrader/reset")
-async def reset_trader(capital: float = Query(default=10000)):
-    state = await reset_auto_trader(capital)
-    return {"message": "Reset with ${}".format(capital)}
+async def reset_trader():
+    """
+    🔄 v2.1 — Reset completo.
+    Il capitale iniziale viene preso automaticamente da Alpaca (equity attuale).
+    Non serve più passare il parametro capital.
+    """
+    state = await reset_auto_trader(initial_capital=None)
+    return {
+        "message": "Reset complete (capital from Alpaca)",
+        "state": state
+    }
+
 
 
 @router.get("/market")
