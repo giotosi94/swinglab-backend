@@ -194,6 +194,21 @@ class Executor(BaseAgent):
                     stop_loss = trailing_stop
             
             # ============================================
+            # 🛡️ v3.3 — SANITY CHECKS su SL/TP prima del trigger
+            # ============================================
+            # Se stop_loss >= entry_price → è un bug upstream (Alpha/Risk)
+            # Non triggerare mai lo SL, log warning e skip
+            if stop_loss > 0 and stop_loss >= entry_price:
+                print(f"  ⚠️ INVALID SL for {symbol}: stop_loss ${stop_loss:.2f} >= entry ${entry_price:.2f} (skipping SL check)")
+                stop_loss = 0  # disabilita SL check per questo ticker
+            
+            # Se target <= entry_price → è un bug upstream (Alpha/Risk)
+            # Non triggerare mai il TP, log warning e skip
+            if target > 0 and target <= entry_price:
+                print(f"  ⚠️ INVALID TP for {symbol}: target ${target:.2f} <= entry ${entry_price:.2f} (skipping TP check)")
+                target = 0  # disabilita TP check per questo ticker
+            
+            # ============================================
             # CHECK STOP LOSS
             # ============================================
             if stop_loss > 0 and current_price <= stop_loss:
