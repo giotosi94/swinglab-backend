@@ -244,3 +244,62 @@ async def get_spy_benchmark(period: str = "1M"):
         "total_return": points[-1]["pct_change"] if points else 0,
         "current_price": points[-1]["price"] if points else 0,
     }
+
+
+
+# ============================================
+# 🆕 v2.2 — STARTING CAPITAL FROM ALPACA
+# ============================================
+
+@router.get("/starting-capital")
+async def get_starting_capital():
+    """
+    🆕 Ritorna il capitale di partenza REALE preso da Alpaca.
+    
+    Logica:
+    1. Prende account da Alpaca (equity, last_equity, portfolio_value)
+    2. Cerca il primo trade nel DB per calcolare l'equity iniziale
+    3. Se non ci sono trade, usa il portfolio_value corrente
+    4. Ritorna il valore per analytics/dashboard
+    """
+    from datetime import datetime
+    
+    db = get_db()
+    account = await get_account()
+    
+    if not account:
+        return {"error": "Alpaca not connected", "starting_capital": 100000}
+    
+    current_equity = float(account.get("equity", 0))
+    
+    # Cerca il primo trade per capire da quanto è partito l'account
+    first_trade = await db.trade_history.find_one(
+        {},
+        sort=[("date", 1)]
+    )
+    
+    if first_trade:
+        # Se abbiamo trade history, calcoliamo il capitale iniziale
+        # come equity attuale meno il total P&L cumulato
+        all_sells = await db.trade_history.find(
+            {"side": "sell"}
+        ).to_list(10000)
+        
+        total_pnl = sum(t.get("pnl_dollar", 0) for t in all_sells)
+        starting_capital = round(current_equity - total_pnl, 2)
+    else:
+        # Nessun trade: usa il portfolio_value corrente come baseline
+        starting_capital = round(current_equity, 2)
+    
+    # Total P&L calcolato correttamente
+    total_pnl_dollar = round(current_equity - starting_capital, 2)
+    total_pnl_pct = round((total_pnl_dollar / starting_capital * 100), 2) if starting_capital > 0 else 0
+    
+    return {
+        "starting_capital": starting_capital,
+        "current_equity": current_equity,
+        "total_pnl_dollar": total_pnl_dollar,
+        "total_pnl_pct": total_pnl_pct,
+        "source": "alpaca",
+        "calculated_at": datetime.utcnow().isoformat(),
+    }
