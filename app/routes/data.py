@@ -248,50 +248,52 @@ async def get_spy_benchmark(period: str = "1M"):
 
 
 # ============================================
-# 🆕 v2.2 — STARTING CAPITAL FROM ALPACA
+# 🆕 v2.2 — STARTING CAPITAL FROM ALPACA (v2)
 # ============================================
 
 @router.get("/starting-capital")
 async def get_starting_capital():
     """
-    🆕 Ritorna il capitale di partenza REALE preso da Alpaca.
+    🆕 v2 — Ritorna il capitale iniziale REALE da Alpaca.
     
     Logica:
-    1. Prende account da Alpaca (equity, last_equity, portfolio_value)
-    2. Cerca il primo trade nel DB per calcolare l'equity iniziale
-    3. Se non ci sono trade, usa il portfolio_value corrente
-    4. Ritorna il valore per analytics/dashboard
+    1. Chiama Alpaca Portfolio History con periodo massimo
+    2. Prende il PRIMO valore di equity nella history
+    3. Quello è lo starting_capital vero
+    4. Total P&L calcolato correttamente
     """
     from datetime import datetime
+    from app.services.alpaca_trader import get_portfolio_history, get_account
     
-    db = get_db()
     account = await get_account()
-    
     if not account:
         return {"error": "Alpaca not connected", "starting_capital": 100000}
     
     current_equity = float(account.get("equity", 0))
     
-    # Cerca il primo trade per capire da quanto è partito l'account
-    first_trade = await db.trade_history.find_one(
-        {},
-        sort=[("date", 1)]
-    )
+    # Prende storia completa (period = tutto disponibile)
+    history = await get_portfolio_history(period="1A", timeframe="1D")
     
-    if first_trade:
-        # Se abbiamo trade history, calcoliamo il capitale iniziale
-        # come equity attuale meno il total P&L cumulato
-        all_sells = await db.trade_history.find(
-            {"side": "sell"}
-        ).to_list(10000)
+    starting_capital = None
+    first_date = None
+    
+    if history and history.get("equity"):
+        equities = history.get("equity", [])
+        timestamps = history.get("timestamp", [])
         
-        total_pnl = sum(t.get("pnl_dollar", 0) for t in all_sells)
-        starting_capital = round(current_equity - total_pnl, 2)
-    else:
-        # Nessun trade: usa il portfolio_value corrente come baseline
-        starting_capital = round(current_equity, 2)
+        # Trova il primo equity valido (>0)
+        for i, eq in enumerate(equities):
+            if eq and eq > 0:
+                starting_capital = round(eq, 2)
+                if i < len(timestamps):
+                    first_date = datetime.fromtimestamp(timestamps[i]).strftime("%Y-%m-%d")
+                break
     
-    # Total P&L calcolato correttamente
+    # Fallback: se non troviamo history, usa 100000 (default Alpaca paper)
+    if starting_capital is None or starting_capital <= 0:
+        starting_capital = 100000.0
+        first_date = "unknown"
+    
     total_pnl_dollar = round(current_equity - starting_capital, 2)
     total_pnl_pct = round((total_pnl_dollar / starting_capital * 100), 2) if starting_capital > 0 else 0
     
@@ -300,6 +302,7 @@ async def get_starting_capital():
         "current_equity": current_equity,
         "total_pnl_dollar": total_pnl_dollar,
         "total_pnl_pct": total_pnl_pct,
-        "source": "alpaca",
+        "starting_date": first_date,
+        "source": "alpaca_portfolio_history",
         "calculated_at": datetime.utcnow().isoformat(),
     }
