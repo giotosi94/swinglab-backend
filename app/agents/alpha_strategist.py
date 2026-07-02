@@ -5,18 +5,26 @@ from app.db.mongodb import get_db
 
 class AlphaStrategist(BaseAgent):
     """
-    🎯 AGENTE 2: Alpha Strategist — "Lo Stock Picker"
+    🎯 AGENTE 2: Alpha Strategist v2.0 — "Lo Stock Picker with ML"
     Seleziona le migliori opportunita' di acquisto e identifica segnali di vendita.
     Usa il MarketContext prodotto dal MacroAnalyst per contestualizzare le decisioni.
-
-    Input: market_context (da MacroAnalyst), posizioni aperte Alpaca
+    
+    v2.0 — 🆕 ML Integration:
+    - Factor 14: WIN/LOSS XGBoost predictor
+    - Factor 15: Trend Predictor (5d UP/FLAT/DOWN)
+    
+    Input: market_context, positions, ml_predictions, trend_predictions
     Output: buy_candidates[], sell_signals[], analysis_summary
     """
 
     def __init__(self):
-        super().__init__(name="alpha_strategist", version="1.0")
-        # Confluence max score teorico (per normalizzazione 0-100)
-        self.MAX_RAW_CONFLUENCE = 15.0
+        super().__init__(name="alpha_strategist", version="2.0")
+        # v2.0 — Confluence max score teorico (13 factors + 2 ML)
+        # Original: 15.0 (13 factors)
+        # + Factor 14 (ML WIN/LOSS): 2.5 max
+        # + Factor 15 (Trend Predictor): 2.0 max
+        # = 19.5 total
+        self.MAX_RAW_CONFLUENCE = 19.5
 
     def default_params(self) -> dict:
         return {
@@ -35,13 +43,16 @@ class AlphaStrategist(BaseAgent):
                 "range_position": 1.0,
                 "daily_change": 1.0,
                 "near_high": 1.0,
+                # 🆕 v2.0 — ML factors (pesi bassi perché modelli poco affidabili)
+                "ml_winloss": 0.8,       # WIN/LOSS accuracy 46.7% → peso ridotto
+                "trend_predictor": 0.7,   # Trend accuracy 50.7% → peso ridotto
             },
             # Filtri
-            "min_confluence": 35,     # 0-100 normalizzato (prima era 5.5 raw)
+            "min_confluence": 35,
             "max_rsi_entry": 68,
             "min_rsi_entry": 25,
             "min_price": 2.0,
-            "max_relative_volume": 3.0,  # Evita earnings/news
+            "max_relative_volume": 3.0,
             "max_per_sector": 2,
             # Setup preferences
             "best_setups": ["pullback_to_poc", "ema_bounce", "breakout",
@@ -52,12 +63,61 @@ class AlphaStrategist(BaseAgent):
             "sell_rsi_extreme": 78,
             "sell_score_collapsed": 20,
             "sell_min_pnl_for_rsi_sell": 3.0,
+            # 🆕 v2.0 — ML thresholds
+            "ml_winloss_threshold_strong": 0.75,   # WIN score >75% = forte
+            "ml_winloss_threshold_medium": 0.60,   # WIN score >60% = medio
+            "trend_confidence_threshold_strong": 0.60,  # UP prob >60% = forte
+            "trend_confidence_threshold_medium": 0.50,  # UP prob >50% = medio
+            # 🆕 v2.0 — Sell signal ML
+            "sell_ml_loss_threshold": 0.30,  # se ML dice WIN score <30% + in perdita → sell
         }
 
-    def _calc_confluence(self, asset: dict, market_ctx: dict, params: dict) -> dict:
+    async def _load_ml_predictions(self, db) -> dict:
+        """
+        🆕 v2.0 — Carica ML predictions da MongoDB.
+        Ritorna un dict {ticker: {ml_score, prediction, confidence, trend_pred, up_prob, ...}}
+        """
+        ml_map = {}
+        
+        # Load WIN/LOSS predictions
+        try:
+            ml_predictions = await db.ml_predictions.find({}).to_list(500)
+            for p in ml_predictions:
+                ticker = p.get("ticker")
+                if ticker:
+                    ml_map[ticker] = {
+                        "ml_score": p.get("ml_score", 0),
+                        "ml_prediction": p.get("prediction", "unknown"),
+                        "ml_confidence": p.get("confidence", 0),
+                    }
+        except Exception as e:
+            print(f"  ⚠️ ml_predictions load error: {e}")
+        
+        # Load Trend predictions
+        try:
+            trend_predictions = await db.trend_predictions.find({}).to_list(500)
+            for p in trend_predictions:
+                ticker = p.get("ticker")
+                if not ticker:
+                    continue
+                if ticker not in ml_map:
+                    ml_map[ticker] = {}
+                ml_map[ticker].update({
+                    "trend_prediction": p.get("prediction", "FLAT"),
+                    "trend_up_prob": p.get("up_prob", 0),
+                    "trend_flat_prob": p.get("flat_prob", 0),
+                    "trend_down_prob": p.get("down_prob", 0),
+                    "trend_confidence": p.get("confidence", 0),
+                })
+        except Exception as e:
+            print(f"  ⚠️ trend_predictions load error: {e}")
+        
+        return ml_map
+
+    def _calc_confluence(self, asset: dict, market_ctx: dict, params: dict, ml_data: dict = None) -> dict:
         """
         Calcola il confluence score multi-fattore per un singolo asset.
-        Ritorna dict con raw_score, normalized_score (0-100), e i singoli fattori.
+        v2.0: aggiunge Factor 14 (ML WIN/LOSS) e Factor 15 (Trend Predictor).
         """
         fw = params.get("factor_weights", {})
         factors = []
@@ -222,7 +282,7 @@ class AlphaStrategist(BaseAgent):
             factors.append({"name": "FVG", "pts": 0, "max": 0.5, "detail": "None", "pass": False})
         raw_score += pts
 
-        # --- 11. Range Position (near 52w low = value) ---
+        # --- 11. Range Position ---
         w = fw.get("range_position", 1.0)
         if range_pos < 30:
             pts = 0.5 * w
@@ -232,7 +292,7 @@ class AlphaStrategist(BaseAgent):
             factors.append({"name": "Range", "pts": 0, "max": 0.5, "detail": f"{range_pos:.0f}%", "pass": False})
         raw_score += pts
 
-        # --- 12. Daily Change (positive momentum) ---
+        # --- 12. Daily Change ---
         w = fw.get("daily_change", 1.0)
         if 0 < change_pct <= 5:
             pts = 0.5 * w
@@ -252,6 +312,70 @@ class AlphaStrategist(BaseAgent):
             factors.append({"name": "52wHigh", "pts": 0, "max": 0.5, "detail": f"{pct_from_high}%", "pass": False})
         raw_score += pts
 
+        # ============================================
+        # 🆕 v2.0 — ML FACTORS (Factor 14 + 15)
+        # ============================================
+        
+        # --- 14. ML WIN/LOSS Predictor (XGBoost) ---
+        w = fw.get("ml_winloss", 0.8)
+        ml_threshold_strong = params.get("ml_winloss_threshold_strong", 0.75)
+        ml_threshold_medium = params.get("ml_winloss_threshold_medium", 0.60)
+        
+        if ml_data:
+            ml_score_raw = ml_data.get("ml_score", 0)
+            # ml_score è 0-100 nell'endpoint, normalizziamo a 0-1
+            ml_score = ml_score_raw / 100 if ml_score_raw > 1 else ml_score_raw
+            ml_prediction = ml_data.get("ml_prediction", "unknown")
+            
+            if ml_prediction == "WIN" and ml_score >= ml_threshold_strong:
+                pts = 2.5 * w  # forte segnale ML
+                factors.append({"name": "ML", "pts": pts, "max": 2.5, "detail": f"WIN {ml_score*100:.0f}% (strong)", "pass": True})
+            elif ml_prediction == "WIN" and ml_score >= ml_threshold_medium:
+                pts = 1.5 * w  # medio
+                factors.append({"name": "ML", "pts": pts, "max": 2.5, "detail": f"WIN {ml_score*100:.0f}%", "pass": True})
+            elif ml_prediction == "LOSS" and ml_score >= ml_threshold_medium:
+                pts = -1.0 * w  # penalizza (ML dice LOSS)
+                factors.append({"name": "ML", "pts": pts, "max": 2.5, "detail": f"LOSS {ml_score*100:.0f}%", "pass": False})
+            else:
+                pts = 0
+                factors.append({"name": "ML", "pts": 0, "max": 2.5, "detail": "no signal", "pass": False})
+        else:
+            pts = 0
+            factors.append({"name": "ML", "pts": 0, "max": 2.5, "detail": "N/A", "pass": False})
+        raw_score += pts
+
+        # --- 15. Trend Predictor (5d UP/FLAT/DOWN) ---
+        w = fw.get("trend_predictor", 0.7)
+        trend_strong = params.get("trend_confidence_threshold_strong", 0.60)
+        trend_medium = params.get("trend_confidence_threshold_medium", 0.50)
+        
+        if ml_data:
+            trend_pred = ml_data.get("trend_prediction", "FLAT")
+            up_prob_raw = ml_data.get("trend_up_prob", 0)
+            up_prob = up_prob_raw / 100 if up_prob_raw > 1 else up_prob_raw
+            down_prob_raw = ml_data.get("trend_down_prob", 0)
+            down_prob = down_prob_raw / 100 if down_prob_raw > 1 else down_prob_raw
+            
+            if trend_pred == "UP" and up_prob >= trend_strong:
+                pts = 2.0 * w  # forte trend UP
+                factors.append({"name": "Trend", "pts": pts, "max": 2.0, "detail": f"UP {up_prob*100:.0f}%", "pass": True})
+            elif trend_pred == "UP" and up_prob >= trend_medium:
+                pts = 1.0 * w  # medio trend UP
+                factors.append({"name": "Trend", "pts": pts, "max": 2.0, "detail": f"UP {up_prob*100:.0f}%", "pass": True})
+            elif trend_pred == "DOWN" and down_prob >= trend_medium:
+                pts = -1.5 * w  # penalizza fortemente
+                factors.append({"name": "Trend", "pts": pts, "max": 2.0, "detail": f"DOWN {down_prob*100:.0f}%", "pass": False})
+            elif trend_pred == "FLAT":
+                pts = 0  # neutrale
+                factors.append({"name": "Trend", "pts": 0, "max": 2.0, "detail": "FLAT", "pass": False})
+            else:
+                pts = 0
+                factors.append({"name": "Trend", "pts": 0, "max": 2.0, "detail": trend_pred, "pass": False})
+        else:
+            pts = 0
+            factors.append({"name": "Trend", "pts": 0, "max": 2.0, "detail": "N/A", "pass": False})
+        raw_score += pts
+
         # Normalize to 0-100
         normalized = round(max(0, min(100, (raw_score / self.MAX_RAW_CONFLUENCE) * 100)), 1)
 
@@ -264,11 +388,17 @@ class AlphaStrategist(BaseAgent):
             "factors": factors,
             "passing_factors": passing,
             "total_factors": len(factors),
+            # 🆕 v2.0 — ML contribution breakdown
+            "ml_contribution": round(sum(f["pts"] for f in factors if f["name"] in ("ML", "Trend")), 2),
+            "rules_contribution": round(sum(f["pts"] for f in factors if f["name"] not in ("ML", "Trend")), 2),
         }
 
     async def _check_sells(self, positions: list, assets_map: dict,
-                           market_ctx: dict, params: dict) -> list:
-        """Verifica se le posizioni aperte vanno vendute."""
+                           market_ctx: dict, params: dict, ml_map: dict = None) -> list:
+        """
+        Verifica se le posizioni aperte vanno vendute.
+        v2.0: aggiunge sell signal se ML dice LOSS + in perdita.
+        """
         sell_signals = []
 
         for p in positions:
@@ -287,12 +417,12 @@ class AlphaStrategist(BaseAgent):
             regime = market_ctx.get("market_regime", "NEUTRAL")
 
             sell_reason = None
-            urgency = "normal"  # normal, high, critical
+            urgency = "normal"
 
-            # Thresholds
             rsi_threshold = params.get("sell_rsi_extreme", 78)
             min_pnl_rsi = params.get("sell_min_pnl_for_rsi_sell", 3.0)
             score_threshold = params.get("sell_score_collapsed", 20)
+            ml_loss_threshold = params.get("sell_ml_loss_threshold", 0.30)
 
             # 1. RSI Extreme + in profitto
             if rsi > rsi_threshold and pnl_pct > min_pnl_rsi:
@@ -304,7 +434,7 @@ class AlphaStrategist(BaseAgent):
                 sell_reason = "SCORE_COLLAPSED"
                 urgency = "high"
 
-            # 3. Bearish candlestick pattern + in perdita
+            # 3. Bearish pattern + in perdita
             elif pnl_pct < -1:
                 bearish = [pat for pat in patterns
                           if pat.get("type") == "bearish" and pat.get("strength") == "strong"]
@@ -312,7 +442,7 @@ class AlphaStrategist(BaseAgent):
                     sell_reason = "BEARISH_PATTERN"
                     urgency = "normal"
 
-            # 4. Wyckoff distribution/markdown + in perdita
+            # 4. Wyckoff distribution + in perdita
             elif wyckoff.get("phase") in ("distribution", "markdown") and pnl_pct < 0:
                 sell_reason = "WYCKOFF_BEARISH"
                 urgency = "normal"
@@ -322,10 +452,20 @@ class AlphaStrategist(BaseAgent):
                 sell_reason = "MARKET_CRASH"
                 urgency = "critical"
 
-            # 6. Trailing stop mentale: se era >5% in profitto e ora scende sotto 2%
-            elif pnl_pct < 2 and pnl_pct > 0:
-                # Potremmo tracciare il max P&L, per ora skip
-                pass
+            # 🆕 6. v2.0 — ML LOSS signal + in perdita significativa
+            elif ml_map and symbol in ml_map:
+                ml_data = ml_map[symbol]
+                ml_score_raw = ml_data.get("ml_score", 100)
+                ml_score = ml_score_raw / 100 if ml_score_raw > 1 else ml_score_raw
+                ml_pred = ml_data.get("ml_prediction", "unknown")
+                trend_pred = ml_data.get("trend_prediction", "UP")
+                
+                if ml_pred == "LOSS" and pnl_pct < -1.5:
+                    sell_reason = "ML_LOSS_SIGNAL"
+                    urgency = "high"
+                elif trend_pred == "DOWN" and pnl_pct < -1.0:
+                    sell_reason = "TREND_DOWN_ML"
+                    urgency = "normal"
 
             if sell_reason:
                 sell_signals.append({
@@ -342,16 +482,14 @@ class AlphaStrategist(BaseAgent):
         return sell_signals
 
     async def analyze(self, context: dict) -> dict:
-        """
-        Analisi completa: genera buy candidates e sell signals.
-        context deve contenere:
-        - market_context: output del MacroAnalyst
-        - positions: lista posizioni aperte Alpaca
-        """
         db = get_db()
         params = await self.get_params()
         market_ctx = context.get("market_context", {})
         positions = context.get("positions", [])
+
+        # 🆕 v2.0 — Load ML predictions
+        ml_map = await self._load_ml_predictions(db)
+        print(f"  📊 ML data loaded: {len(ml_map)} tickers with predictions")
 
         # Carica tutti gli asset
         assets = await db.assets.find({}, {
@@ -372,9 +510,9 @@ class AlphaStrategist(BaseAgent):
                 open_sectors.append(a.get("sector_code", ""))
 
         # ============================================
-        # SELL SIGNALS
+        # SELL SIGNALS (con ML)
         # ============================================
-        sell_signals = await self._check_sells(positions, assets_map, market_ctx, params)
+        sell_signals = await self._check_sells(positions, assets_map, market_ctx, params, ml_map)
 
         # ============================================
         # BUY CANDIDATES
@@ -397,7 +535,6 @@ class AlphaStrategist(BaseAgent):
         for a in assets:
             ticker = a.get("ticker", "")
 
-            # Skip se gia' in portafoglio
             if ticker in open_tickers:
                 skipped_reasons["already_open"] += 1
                 continue
@@ -410,33 +547,29 @@ class AlphaStrategist(BaseAgent):
             va_high = a.get("value_area_high")
             va_low = a.get("value_area_low")
 
-            # Filtri di base
+            # Filtri base
             if price < min_price_val:
                 skipped_reasons["price_filter"] += 1
                 continue
             if rsi > max_rsi or rsi < min_rsi:
                 skipped_reasons["rsi_filter"] += 1
                 continue
-            # 🆕 v1.1 — Volume filter SMART
-            # Distingue tra breakout legittimi (volume + price up) e
-            # news/panic (volume + price down) o pump estremi.
+
+            # Volume filter smart
             change_pct = a.get("change_pct", 0)
-            
             if rel_vol >= max_rv:
-                # Caso 1: Breakout bullish moderato → ACCETTA
                 if rel_vol < 5.0 and 2.0 <= change_pct <= 8.0:
-                    pass  # Volume + price up moderato = breakout valido
-                # Caso 2: Pump estremo (volume >5x + price >8%) → scarta (overextended)
+                    pass
                 elif rel_vol >= 5.0 or change_pct > 8.0:
                     skipped_reasons["volume_filter"] += 1
                     continue
-                # Caso 3: Volume alto ma price negativo o flat → scarta (news/panic)
                 elif change_pct < 2.0:
                     skipped_reasons["volume_filter"] += 1
                     continue
                 else:
                     skipped_reasons["volume_filter"] += 1
                     continue
+
             if best_setups and stype not in best_setups:
                 skipped_reasons["setup_filter"] += 1
                 continue
@@ -448,55 +581,38 @@ class AlphaStrategist(BaseAgent):
                 skipped_reasons["sector_full"] += 1
                 continue
 
-            # Penalita' settore debole (non skip, solo penalita')
             sector_penalty = -5 if sector in weak_sectors else 0
 
-            # Calcola confluence
-            conf = self._calc_confluence(a, market_ctx, params)
+            # 🆕 v2.0 — Passa ml_data al calc_confluence
+            ml_data = ml_map.get(ticker)
+            conf = self._calc_confluence(a, market_ctx, params, ml_data)
             conf_score = conf["score"] + sector_penalty
 
             if conf_score < min_conf:
                 skipped_reasons["low_confluence"] += 1
                 continue
 
-            # 🔧 v1.2 — Target e stop loss (hybrid: VA + minimum %)
-            # SAFETY: stop_loss DEVE essere < price, target_price DEVE essere > price
-            
-            # STOP LOSS
-            # Regola: preferisci va_low se è sotto price, altrimenti usa -4% da entry
+            # 🔧 v1.2 — Target e stop loss safety
             if va_low and 0 < va_low < price:
                 raw_stop = va_low
             else:
                 raw_stop = round(price * 0.96, 2)
-            
-            # Fallback safety: se per qualche motivo raw_stop >= price → forza -4%
             if raw_stop >= price:
                 raw_stop = round(price * 0.96, 2)
-            
-            # Ensure stop non troppo lontano (max -8% da entry)
-            min_stop = round(price * 0.92, 2)  # cap a -8%
-            stop_loss = max(raw_stop, min_stop)  # prendi lo stop più stretto (più vicino a price)
-            
-            # Safety finale
+            min_stop = round(price * 0.92, 2)
+            stop_loss = max(raw_stop, min_stop)
             if stop_loss >= price:
                 stop_loss = round(price * 0.96, 2)
-            
-            # TARGET PRICE
-            # Regola: preferisci va_high se è sopra price, altrimenti usa +8% da entry
+
             if va_high and va_high > price:
                 raw_target = va_high
             else:
                 raw_target = round(price * 1.08, 2)
-            
-            # Safety: se raw_target <= price → forza +8%
             if raw_target <= price:
                 raw_target = round(price * 1.08, 2)
-            
-            # Ensure minimum target distance (+6% minimo)
             min_target = round(price * 1.06, 2)
-            target_price = max(raw_target, min_target)  # target più alto = meglio
+            target_price = max(raw_target, min_target)
 
-            # Risk/Reward ratio
             risk = abs(price - stop_loss)
             reward = abs(target_price - price)
             rr_ratio = round(reward / risk, 2) if risk > 0 else 0
@@ -515,16 +631,18 @@ class AlphaStrategist(BaseAgent):
                 "target_price": round(target_price, 2),
                 "risk_reward": rr_ratio,
                 "wyckoff_phase": a.get("wyckoff", {}).get("phase", "unknown"),
+                # 🆕 v2.0 — ML info
+                "ml_prediction": ml_data.get("ml_prediction", "N/A") if ml_data else "N/A",
+                "ml_score": ml_data.get("ml_score", 0) if ml_data else 0,
+                "trend_prediction": ml_data.get("trend_prediction", "N/A") if ml_data else "N/A",
+                "trend_up_prob": ml_data.get("trend_up_prob", 0) if ml_data else 0,
             })
 
-        # Ordina per confluence decrescente
         candidates.sort(key=lambda x: x["confluence"], reverse=True)
-
-        # Prendi i top (max 10 candidati)
         top_candidates = candidates[:10]
 
-# ============================================
-        # LLM REASONING per ogni candidato (optional)
+        # ============================================
+        # LLM REASONING per top candidates
         # ============================================
         from app.services.llm_service import llm_ask, llm_available
         if llm_available() and top_candidates:
@@ -533,7 +651,6 @@ class AlphaStrategist(BaseAgent):
                     factors_pass = [f["name"] for f in candidate.get("confluence_detail", {}).get("factors", []) if f.get("pass")]
                     factors_fail = [f["name"] for f in candidate.get("confluence_detail", {}).get("factors", []) if not f.get("pass")]
 
-# Read Macro reasoning from shared brain
                     macro_reasoning = ""
                     try:
                         from app.agents.shared_brain import brain
@@ -542,6 +659,12 @@ class AlphaStrategist(BaseAgent):
                             macro_reasoning = f"\nAnalisi Macro: {brain_market['llm_reasoning'][:200]}"
                     except:
                         pass
+                    
+                    # 🆕 v2.0 — Include ML data in prompt
+                    ml_info = ""
+                    if candidate.get("ml_prediction") != "N/A":
+                        ml_info = f"\nML WIN/LOSS: {candidate['ml_prediction']} ({candidate.get('ml_score', 0):.0f}%)"
+                        ml_info += f"\nTrend 5d: {candidate.get('trend_prediction', 'N/A')} (up_prob {candidate.get('trend_up_prob', 0):.0f}%)"
                     
                     stock_data = (
                         f"Ticker: {candidate['ticker']} ({candidate.get('sector', '')})\n"
@@ -555,9 +678,9 @@ class AlphaStrategist(BaseAgent):
                         f"Fattori positivi: {', '.join(factors_pass)}\n"
                         f"Fattori negativi: {', '.join(factors_fail)}\n"
                         f"Regime mercato: {market_ctx.get('market_regime', 'NEUTRAL')}"
+                        f"{ml_info}"
                     )
 
-                    # Fetch news for earnings context
                     earnings_context = ""
                     try:
                         from app.services.news_service import fetch_news
@@ -572,9 +695,10 @@ class AlphaStrategist(BaseAgent):
                         system_prompt=(
                             "Sei un analista di swing trading esperto. "
                             "Valuta questo candidato BUY in max 3 frasi in italiano. "
+                            "Considera anche i segnali ML (WIN/LOSS e Trend Predictor). "
                             "Indica: 1) se è un buon entry e perché, "
-                            "2) se dalle news emergono earnings/trimestrali imminenti o catalyst importanti. "
-                            "Se ci sono earnings entro 7 giorni, AVVISA esplicitamente. "
+                            "2) se dalle news emergono earnings/trimestrali imminenti. "
+                            "Se ci sono earnings entro 7 giorni, AVVISA. "
                             "Sii diretto, concreto, no disclaimers."
                         ),
                         user_prompt=stock_data + earnings_context + macro_reasoning,
@@ -592,7 +716,6 @@ class AlphaStrategist(BaseAgent):
                 except Exception as e:
                     print(f"    LLM error {candidate.get('ticker')}: {e}")
         
-        # Summary
         summary = {
             "total_assets_scanned": len(assets),
             "buy_candidates": len(top_candidates),
@@ -600,9 +723,10 @@ class AlphaStrategist(BaseAgent):
             "skipped_reasons": skipped_reasons,
             "market_regime": market_ctx.get("market_regime", "UNKNOWN"),
             "top_confluence": top_candidates[0]["confluence"] if top_candidates else 0,
+            # 🆕 v2.0 — ML stats
+            "ml_data_loaded": len(ml_map),
         }
 
-        # Log decision
         await self.log_decision(
             decision_type="scan_complete",
             data={
@@ -611,15 +735,16 @@ class AlphaStrategist(BaseAgent):
                 "top_tickers": [c["ticker"] for c in top_candidates[:5]],
                 "sell_tickers": [s["ticker"] for s in sell_signals],
                 "skipped": skipped_reasons,
+                "ml_data_loaded": len(ml_map),
             },
             reasoning=f"Found {len(top_candidates)} buys, {len(sell_signals)} sells. "
                       f"Regime={market_ctx.get('market_regime')} "
-                      f"Min confluence={min_conf}",
+                      f"Min confluence={min_conf} ML={len(ml_map)}",
             confidence=min(100, summary["top_confluence"]) if top_candidates else 20,
         )
 
-        print(f"🎯 AlphaStrategist: {len(top_candidates)} candidates, "
-              f"{len(sell_signals)} sell signals")
+        print(f"🎯 AlphaStrategist v2.0: {len(top_candidates)} candidates, "
+              f"{len(sell_signals)} sell signals (ML: {len(ml_map)} tickers)")
 
         return {
             "buy_candidates": top_candidates,
@@ -628,16 +753,11 @@ class AlphaStrategist(BaseAgent):
         }
 
     async def learn(self) -> dict:
-        """
-        Learning loop dell'AlphaStrategist.
-        Analizza quali fattori di confluence hanno contribuito ai trade vincenti vs perdenti.
-        Aggiusta i factor_weights di conseguenza.
-        """
+        """Learning loop (invariato dalla v1.0)."""
         db = get_db()
         params = await self.get_params()
         fw = params.get("factor_weights", self.default_params()["factor_weights"])
 
-        # Prendi trade chiusi (sell) con tutti i dettagli
         trades = await db.trade_history.find({"side": "sell"}).to_list(500)
 
         if len(trades) < self.min_decisions_to_learn:
@@ -648,7 +768,6 @@ class AlphaStrategist(BaseAgent):
         total = len(trades)
         win_rate = len(wins) / total * 100 if total > 0 else 50
 
-        # ---- Analisi per setup type ----
         setup_stats = {}
         for t in trades:
             st = t.get("setup_type", "unknown")
@@ -675,7 +794,6 @@ class AlphaStrategist(BaseAgent):
                 elif w_wr < 35:
                     worst_setups.append(st)
 
-        # ---- Analisi per settore ----
         sector_stats = {}
         for t in trades:
             sec = t.get("sector", "unknown")
@@ -695,7 +813,6 @@ class AlphaStrategist(BaseAgent):
                 if (stats["w_wins"] / w_total) < 0.35:
                     weak_sectors.append(sec)
 
-        # ---- Analisi per confluence level ----
         conf_buckets = {"high": {"w": 0, "l": 0}, "mid": {"w": 0, "l": 0}, "low": {"w": 0, "l": 0}}
         for t in trades:
             conf = t.get("confluence", 50)
@@ -705,7 +822,6 @@ class AlphaStrategist(BaseAgent):
             else:
                 conf_buckets[bucket]["l"] += 1
 
-        # Aggiusta min_confluence
         min_conf = params.get("min_confluence", 35)
         low_total = conf_buckets["low"]["w"] + conf_buckets["low"]["l"]
         mid_total = conf_buckets["mid"]["w"] + conf_buckets["mid"]["l"]
@@ -721,7 +837,6 @@ class AlphaStrategist(BaseAgent):
             if mid_wr > 0.65:
                 min_conf = max(min_conf - 2, 25)
 
-        # ---- RSI analysis ----
         rsi_losses = [t.get("rsi_at_entry", 50) for t in losses if t.get("rsi_at_entry")]
         max_rsi = params.get("max_rsi_entry", 68)
         if rsi_losses:
@@ -731,7 +846,6 @@ class AlphaStrategist(BaseAgent):
             elif avg_loss_rsi > 55:
                 max_rsi = 65
 
-        # Update params
         params["best_setups"] = best_setups if best_setups else self.default_params()["best_setups"]
         params["worst_setups"] = worst_setups
         params["weak_sectors"] = weak_sectors
@@ -764,3 +878,4 @@ class AlphaStrategist(BaseAgent):
               f"best={best_setups}, worst={worst_setups}")
 
         return learn_result
+``
