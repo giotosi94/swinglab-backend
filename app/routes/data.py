@@ -25,6 +25,45 @@ async def refresh_stocks():
     return {"message": "Stocks updated", "count": len(results), "auto_trader": trader_result}
 
 
+# ============================================
+# 🆕 v3.5 — ASYNC REFRESH (per cron-job.org free tier)
+# ============================================
+
+@router.post("/refresh/stocks-async")
+async def refresh_stocks_async():
+    """
+    🆕 v3.5 — Fire-and-forget refresh stocks.
+    
+    Avvia la pipeline in background e ritorna 200 OK immediatamente.
+    Utile per cron con timeout stretti (es. cron-job.org free = 30s).
+    
+    Il refresh continua a girare in background senza bloccare il cron.
+    Log dell'esecuzione visibili su Render.
+    """
+    import asyncio
+    from datetime import datetime
+    
+    async def _run_in_background():
+        try:
+            print(f"[ASYNC] Pipeline started at {datetime.utcnow().isoformat()}")
+            results = await fetch_and_analyze_stocks()
+            trader_result = await run_auto_trader()
+            buys = len(trader_result.get('steps', {}).get('executor', {}).get('details', {}).get('executed_buys', []))
+            sells = len(trader_result.get('steps', {}).get('executor', {}).get('details', {}).get('executed_sells', []))
+            print(f"[ASYNC] Pipeline completed: {len(results)} stocks, buys={buys}, sells={sells}")
+        except Exception as e:
+            print(f"[ASYNC] Pipeline error: {e}")
+    
+    # Fire-and-forget task
+    asyncio.create_task(_run_in_background())
+    
+    return {
+        "status": "started",
+        "message": "Pipeline started in background",
+        "started_at": datetime.utcnow().isoformat(),
+    }
+
+
 @router.post("/refresh/all")
 async def refresh_all():
     sectors = await fetch_and_analyze_sectors()
@@ -54,7 +93,6 @@ async def run_trader():
     return await run_auto_trader()
 
 
-
 @router.post("/autotrader/reset")
 async def reset_trader():
     """
@@ -67,7 +105,6 @@ async def reset_trader():
         "message": "Reset complete (capital from Alpaca)",
         "state": state
     }
-
 
 
 @router.get("/market")
@@ -254,7 +291,6 @@ async def get_spy_benchmark(period: str = "1M"):
         "total_return": points[-1]["pct_change"] if points else 0,
         "current_price": points[-1]["price"] if points else 0,
     }
-
 
 
 # ============================================
