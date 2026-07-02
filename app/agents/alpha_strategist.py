@@ -72,45 +72,62 @@ class AlphaStrategist(BaseAgent):
             "sell_ml_loss_threshold": 0.30,  # se ML dice WIN score <30% + in perdita → sell
         }
 
-    async def _load_ml_predictions(self, db) -> dict:
+    async def _load_ml_predictions(self, db, assets: list, market_context: dict) -> dict:
         """
-        🆕 v2.0 — Carica ML predictions da MongoDB.
-        Ritorna un dict {ticker: {ml_score, prediction, confidence, trend_pred, up_prob, ...}}
+        🆕 v2.0 — Carica ML predictions chiamando i modelli direttamente.
+        
+        I modelli (WIN/LOSS XGBoost + Trend Predictor) calcolano le predizioni
+        on-the-fly. Non ci sono collection dedicate in MongoDB.
+        
+        Ritorna un dict {ticker: {ml_score, ml_prediction, trend_prediction, ...}}
         """
         ml_map = {}
         
-        # Load WIN/LOSS predictions
+        # ============================================
+        # 1. Load WIN/LOSS predictions dal modello
+        # ============================================
         try:
-            ml_predictions = await db.ml_predictions.find({}).to_list(500)
-            for p in ml_predictions:
-                ticker = p.get("ticker")
-                if ticker:
+            from app.ml.model import ml_model
+            predictions = await ml_model.predict_batch(assets, market_context)
+            
+            for ticker, pred in predictions.items():
+                if pred and pred.get("ml_score") is not None:
                     ml_map[ticker] = {
-                        "ml_score": p.get("ml_score", 0),
-                        "ml_prediction": p.get("prediction", "unknown"),
-                        "ml_confidence": p.get("confidence", 0),
+                        "ml_score": pred.get("ml_score", 0),
+                        "ml_prediction": pred.get("prediction", "unknown"),
+                        "ml_confidence": pred.get("confidence", 0),
                     }
+            print(f"  📊 ML WIN/LOSS: {len(ml_map)} predictions loaded")
         except Exception as e:
-            print(f"  ⚠️ ml_predictions load error: {e}")
+            print(f"  ⚠️ ml_model predict_batch error: {e}")
         
-        # Load Trend predictions
+        # ============================================
+        # 2. Load Trend predictions dal modello
+        # ============================================
         try:
-            trend_predictions = await db.trend_predictions.find({}).to_list(500)
-            for p in trend_predictions:
-                ticker = p.get("ticker")
+            from app.ml.trend_model import trend_predictor
+            trend_results = await trend_predictor.predict_all()
+            
+            for pred in trend_results:
+                ticker = pred.get("ticker")
                 if not ticker:
                     continue
+                
+                # Se ticker non era in WIN/LOSS, inizializza
                 if ticker not in ml_map:
                     ml_map[ticker] = {}
+                
+                # Aggiungi campi trend
                 ml_map[ticker].update({
-                    "trend_prediction": p.get("prediction", "FLAT"),
-                    "trend_up_prob": p.get("up_prob", 0),
-                    "trend_flat_prob": p.get("flat_prob", 0),
-                    "trend_down_prob": p.get("down_prob", 0),
-                    "trend_confidence": p.get("confidence", 0),
+                    "trend_prediction": pred.get("prediction", "FLAT"),
+                    "trend_up_prob": pred.get("up_prob", 0),
+                    "trend_flat_prob": pred.get("flat_prob", 0),
+                    "trend_down_prob": pred.get("down_prob", 0),
+                    "trend_confidence": pred.get("confidence", 0),
                 })
+            print(f"  📊 Trend Predictor: {len(trend_results)} predictions loaded")
         except Exception as e:
-            print(f"  ⚠️ trend_predictions load error: {e}")
+            print(f"  ⚠️ trend_predictor predict_all error: {e}")
         
         return ml_map
 
@@ -487,14 +504,18 @@ class AlphaStrategist(BaseAgent):
         market_ctx = context.get("market_context", {})
         positions = context.get("positions", [])
 
-        # 🆕 v2.0 — Load ML predictions
-        ml_map = await self._load_ml_predictions(db)
-        print(f"  📊 ML data loaded: {len(ml_map)} tickers with predictions")
-
-        # Carica tutti gli asset
-        assets = await db.assets.find({}, {
+        # 🆕 v2.0 — Load ML predictions (calcolate on-the-fly dai modelli)
+        # NOTA: dobbiamo passare gli assets che caricheremo tra poco
+        # Per efficienza, carichiamo prima gli assets
+        assets_for_ml = await db.assets.find({}, {
             "price_history": 0, "vp_distribution": 0, "multi_tf_vp": 0
         }).to_list(300)
+        
+        ml_map = await self._load_ml_predictions(db, assets_for_ml, market_ctx)
+        print(f"  📊 ML data loaded: {len(ml_map)} tickers with predictions")
+
+        # Riutilizza assets già caricati per ML (ottimizzazione)
+        assets = assets_for_ml
 
         if not assets:
             return {"buy_candidates": [], "sell_signals": [], "error": "No assets data"}
