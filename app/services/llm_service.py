@@ -1,17 +1,23 @@
 """
-SwingLab LLM Service v2.0 — Multi-provider with fallback + quota management
+SwingLab LLM Service v2.1 — Multi-provider with fallback + quota management
 Gemini → Groq → Cerebras → cache/skip
 
 Features:
-- 26A: Caching per agente (skip se contesto invariato)
-- 26B: Cooldown (reasoning ogni N minuti, non ogni run)
+- 26A: Caching per agente + ticker (fix duplicato analisi)
+- 26B: Cooldown intelligente (per agente + ticker separato)
 - 26C: Token budget tracker (blocca prima del limite 429)
 - 26D: Terzo provider fallback (Cerebras)
 - 26E: Graceful degradation (mai error, solo None)
+
+🆕 v2.1 — Fix cache key:
+- Cache ora include ticker se presente nel prompt
+- Cooldown separato tra "reasoning generico" (macro/risk/executor)
+  e "analisi per ticker" (alpha per singolo stock)
 """
 
 import time
 import hashlib
+import re
 from datetime import datetime, timedelta
 from app.config import settings
 
@@ -120,28 +126,30 @@ _daily_usage = {
     "cerebras": {"tokens": 0, "requests": 0, "date": ""},
 }
 
-# Limiti conservativi (80% del reale per margine di sicurezza)
 _DAILY_LIMITS = {
-    "gemini": {"tokens": 800_000, "requests": 1200},     # Free tier ~1500 req/day
-    "groq": {"tokens": 80_000, "requests": 12_000},       # Free tier 100k tokens/day
-    "cerebras": {"tokens": 800_000, "requests": 800},     # Free tier ~1000 req/day
+    "gemini": {"tokens": 800_000, "requests": 1200},
+    "groq": {"tokens": 80_000, "requests": 12_000},
+    "cerebras": {"tokens": 800_000, "requests": 800},
 }
 
-# 26D: Provider priority order
 _PROVIDER_ORDER = ["gemini", "groq", "cerebras"]
 
-# 26B: Cooldown per agent
+# 🆕 v2.1 — Cooldown separato per tipologia
 _COOLDOWN_MINUTES = {
-    "macro_analyst": 25,       # ogni ~30 min (run ogni 30 min → skip 1 su 2 circa)
-    "alpha_strategist": 12,    # ogni ~15 min
-    "risk_manager": 12,        # ogni ~15 min
-    "executor": 8,             # ogni ~10 min
+    "macro_analyst": 25,       # reasoning generico → cooldown lungo
+    "alpha_strategist": 12,    # reasoning generico → cooldown medio
+    "risk_manager": 12,        # reasoning generico → cooldown medio
+    "executor": 8,             # reasoning generico → cooldown breve
     "default": 10,
+    # 🆕 Analisi per ticker specifico → cooldown molto breve (evita duplicati)
+    "alpha_strategist_ticker": 2,  # 2 min tra analisi diverse ticker
 }
 
-# 26A: Cache per agente
+# 🆕 v2.1 — Cache PER (agente + ticker)
 _reasoning_cache = {}
-# Struttura: {agent_name: {"hash": "...", "reasoning": "...", "timestamp": datetime}}
+# Struttura vecchia: {agent_name: {"hash": "...", "reasoning": "...", "timestamp": datetime}}
+# Struttura nuova:   {cache_key: {"hash": "...", "reasoning": "...", "timestamp": datetime}}
+# cache_key = agent_name OR "agent_name:TICKER" se ticker rilevato
 
 
 def _get_today():
@@ -149,7 +157,6 @@ def _get_today():
 
 
 def _reset_daily_if_needed():
-    """Reset contatori se è un nuovo giorno."""
     today = _get_today()
     for provider in _daily_usage:
         if _daily_usage[provider]["date"] != today:
@@ -157,12 +164,10 @@ def _reset_daily_if_needed():
 
 
 def _estimate_tokens(text):
-    """Stima approssimativa tokens (1 token ≈ 4 caratteri)."""
     return len(text) // 4
 
 
 def _check_budget(provider, estimated_tokens):
-    """Controlla se il provider ha budget disponibile."""
     _reset_daily_if_needed()
     usage = _daily_usage[provider]
     limits = _DAILY_LIMITS.get(provider, {"tokens": 999_999, "requests": 999_999})
@@ -175,7 +180,6 @@ def _check_budget(provider, estimated_tokens):
 
 
 def _track_usage(provider, input_text, output_text):
-    """Registra l'uso dopo una chiamata riuscita."""
     _reset_daily_if_needed()
     tokens_used = _estimate_tokens(input_text) + _estimate_tokens(output_text or "")
     _daily_usage[provider]["tokens"] += tokens_used
@@ -183,35 +187,82 @@ def _track_usage(provider, input_text, output_text):
 
 
 # ============================================
-# 26A: CACHE CHECK
+# 🆕 v2.1 — TICKER EXTRACTION
+# ============================================
+def _extract_ticker(user_prompt):
+    """
+    🆕 Estrae il ticker dal user_prompt se presente.
+    Cerca pattern: 'Ticker: XXX' o 'BUY XXX' o simili.
+    Ritorna None se non trovato.
+    """
+    if not user_prompt:
+        return None
+    
+    # Pattern comuni negli agenti
+    patterns = [
+        r'Ticker:\s*([A-Z]{1,6})\b',           # "Ticker: TFC"
+        r'candidato\s+BUY\s+([A-Z]{1,6})\b',   # "candidato BUY TFC"
+        r'BUY\s+([A-Z]{1,6})\s+',              # "BUY TFC "
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, user_prompt, re.IGNORECASE)
+        if match:
+            ticker = match.group(1).upper()
+            # Filtro base: deve essere 1-6 caratteri, tutti maiuscoli
+            if 1 <= len(ticker) <= 6 and ticker.isalpha():
+                return ticker
+    
+    return None
+
+
+def _build_cache_key(agent_name, user_prompt):
+    """
+    🆕 v2.1 — Costruisce cache key intelligente.
+    Se il prompt contiene un ticker → cache key = "agent:TICKER"
+    Altrimenti → cache key = agent_name (comportamento vecchio)
+    """
+    if not agent_name:
+        return None
+    
+    ticker = _extract_ticker(user_prompt)
+    if ticker:
+        return f"{agent_name}:{ticker}"
+    
+    return agent_name
+
+
+# ============================================
+# 26A: CACHE CHECK (v2.1)
 # ============================================
 def _get_context_hash(user_prompt):
-    """Hash del contesto per capire se è cambiato."""
-    # Prendi solo i primi 500 char per hash veloce
-    return hashlib.md5(user_prompt[:500].encode()).hexdigest()
+    """Hash del contesto completo (non solo primi 500 char)."""
+    # 🆕 v2.1 — Usa TUTTO il prompt (non solo primi 500 char)
+    return hashlib.md5(user_prompt.encode()).hexdigest()
 
 
-def _check_cache(agent_name, user_prompt):
+def _check_cache(cache_key, user_prompt):
     """Ritorna il reasoning cachato se il contesto non è cambiato."""
-    if agent_name not in _reasoning_cache:
+    if not cache_key or cache_key not in _reasoning_cache:
         return None
 
-    cached = _reasoning_cache[agent_name]
+    cached = _reasoning_cache[cache_key]
     current_hash = _get_context_hash(user_prompt)
 
-    # Se hash uguale e cache recente (< 20 min) → usa cache
     if cached["hash"] == current_hash:
         age_minutes = (datetime.utcnow() - cached["timestamp"]).total_seconds() / 60
         if age_minutes < 20:
-            print(f"  💾 LLM cache hit for {agent_name} (age: {age_minutes:.0f}min)")
+            print(f"  💾 LLM cache hit for {cache_key} (age: {age_minutes:.0f}min)")
             return cached["reasoning"]
 
     return None
 
 
-def _save_cache(agent_name, user_prompt, reasoning):
+def _save_cache(cache_key, user_prompt, reasoning):
     """Salva il reasoning nella cache."""
-    _reasoning_cache[agent_name] = {
+    if not cache_key:
+        return
+    _reasoning_cache[cache_key] = {
         "hash": _get_context_hash(user_prompt),
         "reasoning": reasoning,
         "timestamp": datetime.utcnow(),
@@ -219,58 +270,82 @@ def _save_cache(agent_name, user_prompt, reasoning):
 
 
 # ============================================
-# 26B: COOLDOWN CHECK
+# 26B: COOLDOWN CHECK (v2.1)
 # ============================================
 _last_llm_call = {}
-# Struttura: {agent_name: datetime}
 
 
-def _check_cooldown(agent_name):
+def _get_cooldown_key(agent_name, ticker):
+    """
+    🆕 v2.1 — Cooldown key intelligente.
+    Se c'è un ticker → cooldown per (agente, ticker) - più breve
+    Altrimenti → cooldown per agente - più lungo
+    """
+    if ticker:
+        return f"{agent_name}_ticker"  # cooldown speciale per ticker
+    return agent_name
+
+
+def _check_cooldown(agent_name, ticker=None):
     """Ritorna True se l'agente può fare una chiamata LLM."""
-    cooldown = _COOLDOWN_MINUTES.get(agent_name, _COOLDOWN_MINUTES["default"])
-    last_call = _last_llm_call.get(agent_name)
+    cooldown_key = _get_cooldown_key(agent_name, ticker)
+    cooldown = _COOLDOWN_MINUTES.get(cooldown_key, _COOLDOWN_MINUTES["default"])
+    
+    # Se c'è un ticker, usa una chiave separata per il tracking dell'ultima call
+    tracking_key = f"{agent_name}:{ticker}" if ticker else agent_name
+    last_call = _last_llm_call.get(tracking_key)
 
     if last_call is None:
         return True
 
     elapsed = (datetime.utcnow() - last_call).total_seconds() / 60
     if elapsed < cooldown:
-        print(f"  ⏳ LLM cooldown for {agent_name}: {elapsed:.0f}/{cooldown}min")
+        print(f"  ⏳ LLM cooldown for {tracking_key}: {elapsed:.0f}/{cooldown}min")
         return False
 
     return True
 
 
-def _update_cooldown(agent_name):
+def _update_cooldown(agent_name, ticker=None):
     """Aggiorna il timestamp dell'ultima chiamata."""
-    _last_llm_call[agent_name] = datetime.utcnow()
+    tracking_key = f"{agent_name}:{ticker}" if ticker else agent_name
+    _last_llm_call[tracking_key] = datetime.utcnow()
 
 
 # ============================================
-# MAIN FUNCTION: llm_ask (v2.0)
+# MAIN FUNCTION: llm_ask (v2.1)
 # ============================================
 def llm_ask(system_prompt, user_prompt, max_tokens=300, temperature=0.3, agent_name=None):
     """
     Try providers in order: Gemini → Groq → Cerebras
-    With: cache, cooldown, budget tracking, graceful degradation.
+    With: cache PER TICKER, cooldown, budget tracking, graceful degradation.
 
     Args:
         agent_name: (optional) nome agente per cache/cooldown (es. "macro_analyst")
     """
-
-    # 26A: Check cache
-    if agent_name:
-        cached = _check_cache(agent_name, user_prompt)
+    # 🆕 v2.1 — Estrai ticker se presente
+    ticker = _extract_ticker(user_prompt)
+    cache_key = _build_cache_key(agent_name, user_prompt)
+    
+    # 26A: Check cache PER TICKER
+    if cache_key:
+        cached = _check_cache(cache_key, user_prompt)
         if cached:
             return cached
 
-    # 26B: Check cooldown
-    if agent_name and not _check_cooldown(agent_name):
-        # Cooldown attivo → ritorna cache vecchia se esiste
-        if agent_name in _reasoning_cache:
-            print(f"  💾 Using stale cache for {agent_name} (cooldown active)")
-            return _reasoning_cache[agent_name]["reasoning"]
-        return None
+    # 26B: Check cooldown (per ticker se presente)
+    if agent_name and not _check_cooldown(agent_name, ticker):
+        # 🆕 v2.1 — Cooldown attivo:
+        # Se c'è ticker → ritorna None (evita duplicati con analisi generica)
+        # Se non c'è ticker → ritorna cache vecchia dell'agente
+        if ticker:
+            print(f"  ⏭ Skipping LLM for {agent_name}:{ticker} (cooldown)")
+            return None
+        else:
+            if cache_key in _reasoning_cache:
+                print(f"  💾 Using stale cache for {cache_key} (cooldown active)")
+                return _reasoning_cache[cache_key]["reasoning"]
+            return None
 
     # Stima token input
     input_text = system_prompt + user_prompt
@@ -284,7 +359,6 @@ def llm_ask(system_prompt, user_prompt, max_tokens=300, temperature=0.3, agent_n
     ]
 
     for provider_name, ask_fn in providers:
-        # 26C: Check budget
         if not _check_budget(provider_name, estimated_tokens):
             remaining = _DAILY_LIMITS[provider_name]["tokens"] - _daily_usage[provider_name]["tokens"]
             print(f"  ⚠️ {provider_name} budget low: ~{remaining} tokens left, skipping")
@@ -293,41 +367,36 @@ def llm_ask(system_prompt, user_prompt, max_tokens=300, temperature=0.3, agent_n
         try:
             result = ask_fn(system_prompt, user_prompt, max_tokens, temperature)
             if result:
-                print(f"  🧠 LLM response via {provider_name.capitalize()}")
+                print(f"  🧠 LLM response via {provider_name.capitalize()}" + (f" ({ticker})" if ticker else ""))
 
-                # Track usage
                 _track_usage(provider_name, input_text, result)
 
-                # Update cooldown
                 if agent_name:
-                    _update_cooldown(agent_name)
-                    _save_cache(agent_name, user_prompt, result)
+                    _update_cooldown(agent_name, ticker)
+                    _save_cache(cache_key, user_prompt, result)
 
                 return result
         except Exception as e:
             error_str = str(e)
             print(f"  {provider_name.capitalize()} error: {error_str}")
 
-            # Se è un 429, segna il provider come esaurito per oggi
             if "429" in error_str or "rate_limit" in error_str or "RESOURCE_EXHAUSTED" in error_str:
                 _daily_usage[provider_name]["tokens"] = _DAILY_LIMITS[provider_name]["tokens"]
                 print(f"  🚫 {provider_name} marked as exhausted for today")
 
-    # 26E: Graceful degradation — return None, non exception
+    # 26E: Graceful degradation
     print("  ⚠️ All LLM providers exhausted — skipping reasoning")
     return None
 
 
 def llm_available():
-    """Check if at least one provider is configured."""
     return _get_gemini() is not None or _get_groq() is not None or _get_cerebras() is not None
 
 
 # ============================================
-# UTILITY: Get usage stats (per debug/monitoring)
+# UTILITY: Get usage stats
 # ============================================
 def get_llm_stats():
-    """Ritorna statistiche uso LLM per oggi."""
     _reset_daily_if_needed()
     stats = {}
     for provider in _PROVIDER_ORDER:
@@ -342,11 +411,10 @@ def get_llm_stats():
             "available": _check_budget(provider, 500),
         }
 
-    # Cache info
     cache_info = {}
-    for agent, data in _reasoning_cache.items():
+    for key, data in _reasoning_cache.items():
         age = (datetime.utcnow() - data["timestamp"]).total_seconds() / 60
-        cache_info[agent] = {
+        cache_info[key] = {
             "age_minutes": round(age, 1),
             "has_cache": True,
         }
@@ -355,4 +423,5 @@ def get_llm_stats():
         "providers": stats,
         "cache": cache_info,
         "date": _get_today(),
+        "version": "v2.1",  # 🆕
     }
