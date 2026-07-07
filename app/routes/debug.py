@@ -986,3 +986,162 @@ async def positions_detail():
         "count": len(detailed),
         "calculated_at": datetime.utcnow().isoformat(),
     }
+
+
+
+# ============================================
+# 🆕 v3.5 — FIX ORPHANED POSITIONS
+# ============================================
+
+@router.post("/fix-orphaned-positions")
+async def fix_orphaned_positions():
+    """
+    🔧 Fix per posizioni orfane (senza SL/TP nel DB).
+    
+    Bug: il Trade Sync v4 aveva legato erroneamente vecchi sell
+    (dal reset) ai nuovi buy notional, marcandoli come sell_linked.
+    Risultato: le posizioni attuali non hanno più SL/TP nel DB.
+    
+    Fix:
+    1. Cerca posizioni aperte su Alpaca
+    2. Per ognuna, trova il buy nel DB (anche se sell_linked=True)
+    3. Verifica shares match (frazionale)
+    4. Rimuove flag sell_linked se buy corretto è marcato erroneamente
+    5. Cancella eventuale sell fittizio con qty mismatch
+    """
+    from datetime import datetime
+    from app.services.alpaca_trader import get_positions
+    from app.db.mongodb import get_db
+    
+    db = get_db()
+    positions = await get_positions() or []
+    
+    if not positions:
+        return {"message": "No open positions", "fixed": 0}
+    
+    report = {
+        "started_at": datetime.utcnow().isoformat(),
+        "checked": 0,
+        "fixed_buys": [],
+        "deleted_sells": [],
+        "already_ok": [],
+        "errors": [],
+    }
+    
+    for pos in positions:
+        symbol = pos.get("symbol")
+        qty = float(pos.get("qty", 0))
+        entry_price = float(pos.get("avg_entry_price", 0))
+        
+        if not symbol or qty <= 0:
+            continue
+        
+        report["checked"] += 1
+        
+        # 1. Cerca l'ultimo buy per questo ticker (anche se sell_linked)
+        buy_trade = await db.trade_history.find_one(
+            {
+                "ticker": symbol,
+                "side": "buy",
+            },
+            sort=[("date", -1)]
+        )
+        
+        if not buy_trade:
+            report["errors"].append({"ticker": symbol, "error": "No buy found in DB"})
+            continue
+        
+        buy_shares = float(buy_trade.get("shares", 0))
+        buy_stop_loss = buy_trade.get("stop_loss", 0)
+        buy_target = buy_trade.get("target", 0)
+        was_sell_linked = buy_trade.get("sell_linked", False)
+        
+        # 2. Verifica se questo buy match con la posizione attuale
+        # Shares devono essere simili (tolleranza 5%)
+        shares_diff_pct = abs(buy_shares - qty) / qty if qty > 0 else 1.0
+        shares_match = shares_diff_pct < 0.05
+        
+        if not shares_match:
+            report["errors"].append({
+                "ticker": symbol,
+                "error": f"Buy shares {buy_shares:.4f} != position {qty:.4f}",
+                "diff_pct": round(shares_diff_pct * 100, 1),
+            })
+            continue
+        
+        # 3. Se non era sell_linked E ha SL/TP validi → già OK
+        if not was_sell_linked and buy_stop_loss > 0 and buy_target > 0:
+            report["already_ok"].append({
+                "ticker": symbol,
+                "stop_loss": buy_stop_loss,
+                "target": buy_target,
+            })
+            continue
+        
+        # 4. FIX: Rimuovi flag sell_linked, ripristina buy come attivo
+        update_result = await db.trade_history.update_one(
+            {"_id": buy_trade["_id"]},
+            {"$unset": {"sell_linked": "", "sell_order_id": ""}}
+        )
+        
+        # 5. Se SL/TP a 0, ricalcola da entry price
+        needs_recalc_sl_tp = (buy_stop_loss <= 0 or buy_target <= 0)
+        if needs_recalc_sl_tp:
+            new_stop = round(entry_price * 0.96, 2)  # -4%
+            new_target = round(entry_price * 1.08, 2)  # +8%
+            
+            await db.trade_history.update_one(
+                {"_id": buy_trade["_id"]},
+                {"$set": {
+                    "stop_loss": new_stop,
+                    "target": new_target,
+                    "recalculated_at": datetime.utcnow(),
+                    "recalc_reason": "orphan_position_fix",
+                }}
+            )
+            
+            report["fixed_buys"].append({
+                "ticker": symbol,
+                "action": "unlinked + recalc SL/TP",
+                "entry": entry_price,
+                "new_stop": new_stop,
+                "new_target": new_target,
+            })
+        else:
+            report["fixed_buys"].append({
+                "ticker": symbol,
+                "action": "unlinked only",
+                "stop_loss": buy_stop_loss,
+                "target": buy_target,
+            })
+        
+        # 6. Cancella eventuale sell fittizio (qty non-fractional per ticker con posizione fractional)
+        if buy_shares != int(buy_shares):  # posizione è frazionale
+            # Cerca sell con qty intera (bug)
+            fake_sells = await db.trade_history.find({
+                "ticker": symbol,
+                "side": "sell",
+                "source": {"$in": ["trade_sync_v4", "trade_sync_v5"]},
+            }).to_list(50)
+            
+            for fake_sell in fake_sells:
+                fake_shares = float(fake_sell.get("shares", 0))
+                # Se è intera e diversa dalla posizione attuale → è artifact
+                if fake_shares == int(fake_shares) and abs(fake_shares - qty) > 1:
+                    await db.trade_history.delete_one({"_id": fake_sell["_id"]})
+                    report["deleted_sells"].append({
+                        "ticker": symbol,
+                        "fake_shares": fake_shares,
+                        "reason": "integer qty on fractional position",
+                    })
+    
+    report["finished_at"] = datetime.utcnow().isoformat()
+    report["summary"] = {
+        "positions_checked": report["checked"],
+        "fixed_count": len(report["fixed_buys"]),
+        "deleted_fake_sells": len(report["deleted_sells"]),
+        "already_ok": len(report["already_ok"]),
+        "errors": len(report["errors"]),
+    }
+    
+    return report
