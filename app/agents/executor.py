@@ -377,15 +377,22 @@ class Executor(BaseAgent):
         return adjustments
 
     # ==========================================
-    # Trade Sync v4 — link sell→buy (qty float)
+    # Trade Sync v5 — Anti-mismatch fractional/integer
     # ==========================================
     async def _sync_closed_trades(self):
         """
-        Trade Sync v4 — supporta qty float (fractional).
-        Ogni SELL viene linkato al BUY corrispondente tramite sell_linked flag.
+        Trade Sync v5 — Robust sync di sell con anti-mismatch bug.
+        
+        🆕 v5 checks (previene bug del RESET):
+        1. QTY mismatch: se sell qty è intera (92) e buy qty è frazionale (45.68) → skip
+        2. TIMESTAMP check: sell PRIMA del buy → skip
+        3. TIME GAP check: sell più di 30 giorni dopo buy → skip
+        4. SIZE tolerance: qty diff > 10% → skip (safety)
         """
         db = get_db()
         synced = 0
+        skipped_mismatch = 0
+        
         try:
             positions = await get_positions() or []
             open_tickers = {p.get("symbol") for p in positions}
@@ -400,8 +407,17 @@ class Executor(BaseAgent):
 
                 ticker = order.get("symbol", "")
                 filled_price = float(order.get("filled_avg_price") or 0)
-                filled_qty = float(order.get("filled_qty") or order.get("qty") or 0)  # 🔧 float
+                filled_qty = float(order.get("filled_qty") or order.get("qty") or 0)
                 order_id = order.get("id", "")
+                
+                # 🆕 v5 — Extract sell timestamp
+                sell_created_str = order.get("created_at", "")
+                sell_date = None
+                if sell_created_str:
+                    try:
+                        sell_date = datetime.fromisoformat(sell_created_str.replace("Z", "+00:00")).replace(tzinfo=None)
+                    except:
+                        pass
 
                 if not ticker or not order_id or filled_price <= 0:
                     continue
@@ -425,12 +441,51 @@ class Executor(BaseAgent):
                     continue
 
                 entry_price = buy_trade.get("entry_price", 0)
+                buy_shares = float(buy_trade.get("shares", 0))
+                buy_date = buy_trade.get("date")
+                
+                # 🆕 v5 CHECK 1 — QTY MISMATCH (fractional vs integer)
+                # Se sell è quantità intera (es. 92.0) e buy è frazionale (45.68)
+                # → è una sell VECCHIA del reset, NON collegare
+                sell_is_integer = (filled_qty == int(filled_qty)) and filled_qty >= 1
+                buy_is_fractional = (buy_shares != int(buy_shares))
+                
+                if sell_is_integer and buy_is_fractional:
+                    print(f"  ⏭️ SKIP {ticker}: sell qty {filled_qty} (integer) != buy qty {buy_shares:.4f} (fractional) — likely reset artifact")
+                    skipped_mismatch += 1
+                    continue
+                
+                # 🆕 v5 CHECK 2 — SIZE MISMATCH (> 10% diff)
+                if buy_shares > 0:
+                    qty_diff_pct = abs(filled_qty - buy_shares) / buy_shares
+                    if qty_diff_pct > 0.10:  # > 10% difference
+                        print(f"  ⏭️ SKIP {ticker}: qty mismatch {filled_qty} vs buy {buy_shares:.4f} ({qty_diff_pct*100:.1f}% diff)")
+                        skipped_mismatch += 1
+                        continue
+                
+                # 🆕 v5 CHECK 3 — TIMESTAMP (sell BEFORE buy)
+                if sell_date and buy_date and sell_date < buy_date:
+                    print(f"  ⏭️ SKIP {ticker}: sell {sell_date.date()} BEFORE buy {buy_date.date()}")
+                    skipped_mismatch += 1
+                    continue
+                
+                # 🆕 v5 CHECK 4 — TIME GAP (> 30 days)
+                if sell_date and buy_date:
+                    days_gap = (sell_date - buy_date).days
+                    if days_gap > 30:
+                        print(f"  ⏭️ SKIP {ticker}: sell {days_gap} days after buy (too old)")
+                        skipped_mismatch += 1
+                        continue
+
+                # Price sanity check (esistente)
                 if entry_price > 0 and abs(filled_price - entry_price) / entry_price > 0.30:
+                    print(f"  ⏭️ SKIP {ticker}: price diff > 30% ({filled_price} vs {entry_price})")
+                    skipped_mismatch += 1
                     continue
 
-                # 🔧 qty come float (fractional)
-                shares = filled_qty if filled_qty > 0 else buy_trade.get("shares", 0)
-                buy_date = buy_trade.get("date", datetime.utcnow())
+                # ✅ Tutti i check passati — procedi con sync
+                shares = filled_qty if filled_qty > 0 else buy_shares
+                buy_date = buy_date or datetime.utcnow()
                 pnl_pct = round(((filled_price - entry_price) / entry_price) * 100, 2) if entry_price > 0 else 0
                 pnl_dollar = round((filled_price - entry_price) * shares, 2) if entry_price > 0 else 0
 
@@ -450,7 +505,7 @@ class Executor(BaseAgent):
                     "ticker": ticker, "side": "sell",
                     "entry_price": entry_price,
                     "exit_price": round(filled_price, 2),
-                    "shares": float(shares),  # 🔧 float
+                    "shares": float(shares),
                     "pnl_pct": pnl_pct,
                     "pnl_dollar": pnl_dollar,
                     "days_held": days_held,
@@ -464,7 +519,7 @@ class Executor(BaseAgent):
                     "agent": "executor_sync",
                     "date": datetime.utcnow(),
                     "synced": True,
-                    "source": "trade_sync_v4",
+                    "source": "trade_sync_v5",
                 })
 
                 await db.trade_history.update_one(
@@ -481,6 +536,8 @@ class Executor(BaseAgent):
 
         if synced > 0:
             print(f"  📥 Synced {synced} closed trades from Alpaca")
+        if skipped_mismatch > 0:
+            print(f"  🛡️ Skipped {skipped_mismatch} sell orders (mismatch prevention)")
         return synced
 
     # ==========================================
