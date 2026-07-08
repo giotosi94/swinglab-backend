@@ -212,3 +212,137 @@ async def agent_params(agent_name: str):
         return {"error": f"Agent '{agent_name}' not found"}
     params = await agent.get_params()
     return {"agent": agent_name, "params": params}
+
+
+# ============================================
+# 🆕 v4.0 — APM ENDPOINTS
+# ============================================
+
+@router.get("/apm/decisions")
+async def apm_decisions(limit: int = 30):
+    """
+    🆕 v4.0 — Ritorna le ultime decisioni APM.
+    Include: HOLD, SCALE_OUT, EXIT, TIGHTEN_STOP.
+    """
+    from app.db.mongodb import get_db
+    from datetime import datetime
+    
+    db = get_db()
+    
+    # Leggi decisioni da agent_decisions_adaptive_position_manager
+    col = db["agent_decisions_adaptive_position_manager"]
+    decisions = await col.find().sort("created_at", -1).to_list(limit)
+    
+    # Serializza + estrai info chiave
+    result = []
+    for d in decisions:
+        data = d.get("data", {})
+        action_taken = data.get("action_taken", False)
+        
+        result.append({
+            "id": str(d.get("_id", "")),
+            "created_at": d.get("created_at").isoformat() if d.get("created_at") else "",
+            "type": d.get("type", "unknown"),  # apm_hold, apm_exit, apm_scale_out, apm_tighten_stop
+            "ticker": data.get("ticker", ""),
+            "decision": data.get("decision", "UNKNOWN"),
+            "reason": data.get("reason", ""),
+            "current_pnl_pct": data.get("current_pnl_pct", 0),
+            "current_price": data.get("current_price", 0),
+            "entry_price": data.get("entry_price", 0),
+            "action_taken": action_taken,
+            "action_details": data.get("action_details", {}),
+            "state_snapshot": data.get("state_snapshot", {}),
+            "confidence": d.get("confidence", 0),
+        })
+    
+    return {
+        "total": len(result),
+        "decisions": result,
+        "fetched_at": datetime.utcnow().isoformat(),
+    }
+
+
+@router.get("/apm/status")
+async def apm_status():
+    """
+    🆕 v4.0 — Ritorna stato APM (last run, prossima esecuzione).
+    """
+    from app.db.mongodb import get_db
+    from datetime import datetime, timedelta
+    
+    db = get_db()
+    
+    # Ultimo run APM
+    last_run_doc = await db.apm_state.find_one({"_id": "last_run"})
+    
+    # Params APM
+    params_doc = await db.agent_memory_adaptive_position_manager.find_one({"_id": "params"})
+    
+    if not last_run_doc:
+        return {
+            "status": "never_run",
+            "last_run": None,
+            "next_check": None,
+            "enabled": params_doc.get("apm_enabled", True) if params_doc else True,
+            "interval_hours": params_doc.get("apm_check_interval_hours", 3) if params_doc else 3,
+        }
+    
+    last_run = last_run_doc.get("timestamp")
+    interval_hours = params_doc.get("apm_check_interval_hours", 3) if params_doc else 3
+    
+    next_check = last_run + timedelta(hours=interval_hours) if last_run else None
+    remaining = None
+    if next_check:
+        remaining_seconds = (next_check - datetime.utcnow()).total_seconds()
+        remaining = round(remaining_seconds / 3600, 2) if remaining_seconds > 0 else 0
+    
+    return {
+        "status": "active",
+        "last_run": last_run.isoformat() if last_run else None,
+        "last_decisions_count": last_run_doc.get("decisions_count", 0),
+        "last_actions_count": last_run_doc.get("actions_count", 0),
+        "next_check": next_check.isoformat() if next_check else None,
+        "remaining_hours": remaining,
+        "enabled": params_doc.get("apm_enabled", True) if params_doc else True,
+        "interval_hours": interval_hours,
+    }
+
+
+@router.get("/apm/summary")
+async def apm_summary(days: int = 7):
+    """
+    🆕 v4.0 — Riepilogo statistiche APM negli ultimi N giorni.
+    """
+    from app.db.mongodb import get_db
+    from datetime import datetime, timedelta
+    
+    db = get_db()
+    cutoff = datetime.utcnow() - timedelta(days=days)
+    
+    col = db["agent_decisions_adaptive_position_manager"]
+    decisions = await col.find({
+        "created_at": {"$gte": cutoff},
+    }).to_list(500)
+    
+    # Conta per tipo
+    counts = {"HOLD": 0, "SCALE_OUT": 0, "EXIT": 0, "TIGHTEN_STOP": 0, "SKIP": 0}
+    actions_taken = 0
+    total_pnl_managed = 0
+    
+    for d in decisions:
+        data = d.get("data", {})
+        decision = data.get("decision", "SKIP")
+        counts[decision] = counts.get(decision, 0) + 1
+        
+        if data.get("action_taken", False):
+            actions_taken += 1
+        
+        total_pnl_managed += abs(data.get("current_pnl_pct", 0))
+    
+    return {
+        "period_days": days,
+        "total_decisions": len(decisions),
+        "actions_taken": actions_taken,
+        "counts": counts,
+        "avg_pnl_managed": round(total_pnl_managed / max(len(decisions), 1), 2),
+    }
