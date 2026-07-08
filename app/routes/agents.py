@@ -218,7 +218,7 @@ async def agent_params(agent_name: str):
 # 🆕 v4.0 — APM ENDPOINTS
 # ============================================
 
-@router.get("/apm/decisions")
+@router.get("/apm-history")
 async def apm_decisions(limit: int = 30):
     """
     🆕 v4.0 — Ritorna le ultime decisioni APM.
