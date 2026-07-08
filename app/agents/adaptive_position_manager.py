@@ -357,14 +357,28 @@ class AdaptivePositionManager(BaseAgent):
         exit_ml_th = params.get("apm_exit_ml_threshold", 40)
         min_negative = params.get("apm_exit_min_negative_factors", 2)
         
+        # 🆕 v1.1 — Detect "ML flat" (bug fix)
+        # Se ML score è sospettosamente uguale per tutti (es. 92.3% overfitted),
+        # ignoriamo il factor ML dalle decisioni.
+        # ML flat = probabilmente modello overfit o non discriminatorio.
+        ml_score_looks_flat = (
+            current_ml_score > 85 and current_ml_score < 95 
+            and abs(current_ml_score - 92.3) < 1.0  # troppo vicino a 92.3%
+        )
+        
         # Conta fattori negativi
         negative_factors = []
         if current_confluence < exit_conf_th:
             negative_factors.append(f"confluence {current_confluence:.0f} < {exit_conf_th}")
-        if current_ml_score < exit_ml_th:
-            negative_factors.append(f"ML {current_ml_score:.0f}% < {exit_ml_th}%")
-        if current_ml_pred == "LOSS":
-            negative_factors.append("ML predicts LOSS")
+        
+        # 🔧 Ignora ML score se sembra "flat" (bug del modello)
+        if not ml_score_looks_flat:
+            if current_ml_score < exit_ml_th:
+                negative_factors.append(f"ML {current_ml_score:.0f}% < {exit_ml_th}%")
+            if current_ml_pred == "LOSS":
+                negative_factors.append("ML predicts LOSS")
+        
+        # Trend è indipendente dal ML score, quindi lo teniamo
         if current_trend_pred == "DOWN":
             negative_factors.append("Trend DOWN")
         
