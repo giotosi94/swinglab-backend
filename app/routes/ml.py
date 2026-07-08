@@ -85,7 +85,7 @@ async def trend_predict_all():
 # 🆕 v1.1 — ML DEBUG ENDPOINTS (permanent)
 # ============================================
 
-@router.get("/debug/{ticker}")
+@router.get("/debug/ticker/{ticker}")
 async def ml_debug_ticker(ticker: str):
     """
     🔧 Debug dettagliato per un singolo ticker.
