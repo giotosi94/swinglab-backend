@@ -248,7 +248,6 @@ class Orchestrator:
         # STEP 4: ⚡ Executor → SharedBrain
         # ============================================
         t4 = time.time()
-`
         try:
             exec_result = await self.executor.analyze({
                 "market_context": market_context,
