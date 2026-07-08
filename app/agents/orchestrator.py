@@ -206,7 +206,11 @@ class Orchestrator:
             try:
                 apm_alpha = self.alpha
                 # Reload ml_map se disponibile
-                apm_assets = await db.assets.find({}, {"ticker": 1}).to_list(300)
+                # 🆕 v4.0 fix — Load COMPLETE assets for ML predictions
+                # ML model needs all features (RSI, MACD, EMA, POC, etc.) not just ticker
+                apm_assets = await db.assets.find({}, {
+                    "price_history": 0, "vp_distribution": 0, "multi_tf_vp": 0
+                }).to_list(300)
                 apm_ml_map = await apm_alpha._load_ml_predictions(db, apm_assets, market_context)
             except Exception as e:
                 print(f"  ⚠️ APM ml_map load error: {e}")
