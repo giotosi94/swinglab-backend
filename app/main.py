@@ -20,8 +20,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="SwingLab API",
-    description="Swing Trading Analysis & Multi-Agent AI System",
-    version="0.3.1",
+    description="Swing Trading Analysis & Multi-Agent AI System with APM v4.0",
+    version="4.0.0",
     lifespan=lifespan
 )
 
@@ -49,9 +49,16 @@ app.include_router(telegram.router, prefix="/api/telegram", tags=["Telegram"])  
 def root():
     return {
         "app": "SwingLab",
-        "description": "Swing Trading Analysis & Multi-Agent AI System",
+        "description": "Swing Trading Analysis & Multi-Agent AI System with APM",
         "status": "ok",
-        "version": "0.3.1"
+        "version": "4.0.0",
+        "features": {
+            "multi_agent": True,
+            "agents_count": 5,
+            "apm_enabled": True,
+            "ml_integration": True,
+            "software_sl_tp": True,
+        }
     }
 
 @app.get("/health")
