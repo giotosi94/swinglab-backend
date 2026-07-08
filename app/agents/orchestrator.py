@@ -4,6 +4,7 @@ from app.agents.macro_analyst import MacroAnalyst
 from app.agents.alpha_strategist import AlphaStrategist
 from app.agents.risk_manager import RiskManager
 from app.agents.executor import Executor
+from app.agents.adaptive_position_manager import AdaptivePositionManager
 from app.agents.shared_brain import brain
 from app.services.alpaca_trader import get_account, get_positions
 from app.db.mongodb import get_db
@@ -26,11 +27,14 @@ class Orchestrator:
         self.alpha = AlphaStrategist()
         self.risk = RiskManager()
         self.executor = Executor()
+        # 🆕 v4.0 — APM (Adaptive Position Manager)
+        self.apm = AdaptivePositionManager()
         self.agents = {
             "macro_analyst": self.macro,
             "alpha_strategist": self.alpha,
             "risk_manager": self.risk,
             "executor": self.executor,
+            "adaptive_position_manager": self.apm,  # 🆕 v4.0
         }
 
     async def run(self) -> dict:
@@ -190,9 +194,61 @@ class Orchestrator:
         report["timing"]["risk_manager"] = round(time.time() - t3, 2)
 
         # ============================================
+        # 🆕 v4.0 — STEP 3.5: 🎯 APM (Adaptive Position Manager)
+        # Rivaluta posizioni aperte ogni 3h e decide HOLD/SCALE/EXIT/TIGHTEN
+        # ============================================
+        t_apm = time.time()
+        apm_result = {}
+        try:
+            # Prepara ml_map per APM (riuso quello di Alpha)
+            from app.agents.alpha_strategist import AlphaStrategist
+            apm_ml_map = {}
+            try:
+                apm_alpha = self.alpha
+                # Reload ml_map se disponibile
+                apm_assets = await db.assets.find({}, {"ticker": 1}).to_list(300)
+                apm_ml_map = await apm_alpha._load_ml_predictions(db, apm_assets, market_context)
+            except Exception as e:
+                print(f"  ⚠️ APM ml_map load error: {e}")
+            
+            apm_result = await self.apm.analyze({
+                "market_context": market_context,
+                "positions": positions,
+                "ml_map": apm_ml_map,
+            })
+            
+            apm_status = apm_result.get("status", "unknown")
+            actions_taken = len(apm_result.get("actions_taken", []))
+            
+            report["steps"]["adaptive_position_manager"] = {
+                "status": "ok",
+                "apm_status": apm_status,
+                "actions_taken": actions_taken,
+                "summary": apm_result.get("summary", {}),
+            }
+            
+            if apm_status == "ok":
+                print(f"  🎯 APM: {actions_taken} actions taken")
+            elif apm_status == "skipped_timer":
+                print(f"  ⏳ APM skipped: {apm_result.get('message', 'timer not elapsed')}")
+            elif apm_status == "disabled":
+                print(f"  ⏸️ APM disabled in settings")
+            
+            # Ricarica positions se APM ha fatto azioni (potrebbe aver chiuso qualcosa)
+            if actions_taken > 0:
+                positions = await get_positions() or []
+                print(f"  📊 Reloaded positions: {len(positions)} still open")
+        except Exception as e:
+            report["errors"].append(f"APM: {str(e)}")
+            report["steps"]["adaptive_position_manager"] = {"status": "error", "error": str(e)}
+            print(f"❌ APM ERROR: {e}")
+        report["timing"]["adaptive_position_manager"] = round(time.time() - t_apm, 2)
+
+        # ============================================
         # STEP 4: ⚡ Executor → SharedBrain
         # ============================================
         t4 = time.time()
+`
         try:
             exec_result = await self.executor.analyze({
                 "market_context": market_context,
