@@ -631,34 +631,202 @@ class AdaptivePositionManager(BaseAgent):
 
     async def learn(self) -> dict:
         """
-        Learning loop APM.
-        Analizza outcome delle decisioni passate per aggiustare soglie.
+        🧬 FASE 3 — APM Learning Loop v1.0
+        
+        Analizza le decisioni APM degli ultimi 30 giorni e auto-aggiusta le soglie:
+        - Se troppe EXIT premature (posizioni sarebbero recuperate) → alza soglia (meno aggressivo)
+        - Se poche EXIT tardive (posizioni scese ancora) → abbassa soglia (più aggressivo)
+        - Analizza performance per tipo decisione
+        
+        Ritorna report con statistiche e aggiornamenti.
         """
         db = get_db()
+        params = await self.get_params()
         
-        # Per la FASE 1 (base), il learning è minimo
-        # Verrà espanso nella FASE 3 (weekend 19-20 luglio)
-        
-        # Recupera decisioni ultimi 30 giorni
+        # Cutoff: ultimi 30 giorni
         cutoff = datetime.utcnow() - timedelta(days=30)
+        
+        # Carica tutte le decisioni APM
         decisions = await self._col_decisions().find({
             "created_at": {"$gte": cutoff},
-        }).to_list(500)
+        }).sort("created_at", -1).to_list(500)
         
-        if len(decisions) < 5:
-            return {"message": "Not enough APM decisions to learn", "count": len(decisions)}
+        if len(decisions) < 10:
+            return {
+                "message": "Not enough decisions to learn (need 10+)",
+                "count": len(decisions),
+            }
         
-        # Conteggi
-        exits = [d for d in decisions if d.get("type") == "apm_exit"]
-        scales = [d for d in decisions if d.get("type") == "apm_scale_out"]
-        tightens = [d for d in decisions if d.get("type") == "apm_tighten_stop"]
-        holds = [d for d in decisions if d.get("type") == "apm_hold"]
+        # ============================================
+        # 1. STATISTICHE PER TIPO DECISIONE
+        # ============================================
+        stats = {
+            "HOLD": {"count": 0, "outcomes": []},
+            "EXIT": {"count": 0, "outcomes": []},
+            "SCALE_OUT": {"count": 0, "outcomes": []},
+            "TIGHTEN_STOP": {"count": 0, "outcomes": []},
+        }
+        
+        for d in decisions:
+            data = d.get("data", {})
+            decision = data.get("decision", "UNKNOWN")
+            if decision in stats:
+                stats[decision]["count"] += 1
+                stats[decision]["outcomes"].append({
+                    "ticker": data.get("ticker"),
+                    "pnl_pct": data.get("current_pnl_pct", 0),
+                    "confluence_now": data.get("state_snapshot", {}).get("confluence_now", 0),
+                    "ml_score_now": data.get("state_snapshot", {}).get("ml_score_now", 0),
+                    "created_at": d.get("created_at"),
+                })
+        
+        # ============================================
+        # 2. ANALISI EXIT — Erano corrette?
+        # ============================================
+        # Per ogni EXIT, verifica se il prezzo è sceso ancora nei giorni successivi
+        # (se sì → decisione corretta. Se no → EXIT prematuro)
+        exit_analysis = {
+            "correct_exits": 0,
+            "premature_exits": 0,
+            "total_analyzed": 0,
+        }
+        
+        for exit_dec in stats["EXIT"]["outcomes"]:
+            ticker = exit_dec["ticker"]
+            exit_time = exit_dec["created_at"]
+            
+            if not exit_time:
+                continue
+            
+            # Cerca trade sell corrispondente in trade_history
+            sell_trade = await db.trade_history.find_one({
+                "ticker": ticker,
+                "side": "sell",
+                "date": {"$gte": exit_time - timedelta(hours=1)},
+                "reason": {"$in": ["APM_EXIT", "SOFTWARE_STOP_LOSS", "SOFTWARE_TAKE_PROFIT"]},
+            })
+            
+            if not sell_trade:
+                continue
+            
+            exit_pnl = sell_trade.get("pnl_pct", 0)
+            exit_analysis["total_analyzed"] += 1
+            
+            # Se P&L era in perdita quando APM ha detto EXIT → corretto
+            # Se P&L era in profit → APM ha "salvato profitto" (corretto)
+            # Se il prezzo poi è risalito molto → prematuro (missed opportunity)
+            if exit_pnl > -1:
+                exit_analysis["correct_exits"] += 1
+            else:
+                exit_analysis["premature_exits"] += 1
+        
+        # ============================================
+        # 3. AUTO-TUNING DELLE SOGLIE
+        # ============================================
+        old_thresholds = {
+            "apm_exit_confluence_threshold": params.get("apm_exit_confluence_threshold", 30),
+            "apm_exit_ml_threshold": params.get("apm_exit_ml_threshold", 40),
+        }
+        new_thresholds = dict(old_thresholds)
+        adjustments = []
+        
+        if exit_analysis["total_analyzed"] >= 3:
+            correct_rate = exit_analysis["correct_exits"] / exit_analysis["total_analyzed"]
+            
+            # Se >70% degli EXIT erano corretti → sistema OK, magari più aggressivo
+            if correct_rate >= 0.70:
+                # Abbassa soglia confluence (esci prima)
+                new_conf = max(20, old_thresholds["apm_exit_confluence_threshold"] - 2)
+                if new_conf != old_thresholds["apm_exit_confluence_threshold"]:
+                    new_thresholds["apm_exit_confluence_threshold"] = new_conf
+                    adjustments.append(f"Exit confluence: {old_thresholds['apm_exit_confluence_threshold']} → {new_conf} (più aggressivo)")
+            
+            # Se <40% degli EXIT erano corretti → sistema troppo aggressivo, alza soglie
+            elif correct_rate < 0.40:
+                new_conf = min(45, old_thresholds["apm_exit_confluence_threshold"] + 3)
+                if new_conf != old_thresholds["apm_exit_confluence_threshold"]:
+                    new_thresholds["apm_exit_confluence_threshold"] = new_conf
+                    adjustments.append(f"Exit confluence: {old_thresholds['apm_exit_confluence_threshold']} → {new_conf} (più conservativo)")
+        
+        # ============================================
+        # 4. STATISTICHE HOLD — Ha senso mantenere?
+        # ============================================
+        hold_stats = {
+            "count": stats["HOLD"]["count"],
+            "avg_pnl": 0,
+            "wins_ratio": 0,
+        }
+        if stats["HOLD"]["outcomes"]:
+            pnls = [o["pnl_pct"] for o in stats["HOLD"]["outcomes"]]
+            wins = sum(1 for p in pnls if p > 0)
+            hold_stats["avg_pnl"] = round(sum(pnls) / len(pnls), 2)
+            hold_stats["wins_ratio"] = round(wins / len(pnls) * 100, 1)
+        
+        # ============================================
+        # 5. SALVA NUOVE SOGLIE + PERFORMANCE
+        # ============================================
+        if adjustments:
+            for key, value in new_thresholds.items():
+                params[key] = value
+            await self.save_params(params)
+        
+        # Salva performance snapshot
+        await self.save_performance({
+            "total_decisions": len(decisions),
+            "hold_count": stats["HOLD"]["count"],
+            "exit_count": stats["EXIT"]["count"],
+            "scale_out_count": stats["SCALE_OUT"]["count"],
+            "tighten_count": stats["TIGHTEN_STOP"]["count"],
+            "exit_correct_rate": round(exit_analysis["correct_exits"] / max(exit_analysis["total_analyzed"], 1) * 100, 1),
+            "avg_hold_pnl": hold_stats["avg_pnl"],
+            "hold_wins_ratio": hold_stats["wins_ratio"],
+            "adjustments_count": len(adjustments),
+        })
+        
+        # ============================================
+        # 6. TELEGRAM REPORT
+        # ============================================
+        try:
+            from app.services.telegram_bot import send_telegram
+            
+            msg = "🧬 <b>APM Learning Loop Report</b>\n\n"
+            msg += f"📊 <b>Ultimi 30 giorni:</b>\n"
+            msg += f"  Total decisioni: {len(decisions)}\n"
+            msg += f"  🟢 HOLD: {stats['HOLD']['count']}\n"
+            msg += f"  🔴 EXIT: {stats['EXIT']['count']}\n"
+            msg += f"  🟡 SCALE_OUT: {stats['SCALE_OUT']['count']}\n"
+            msg += f"  🛡️ TIGHTEN: {stats['TIGHTEN_STOP']['count']}\n\n"
+            
+            if exit_analysis["total_analyzed"] > 0:
+                correct_pct = round(exit_analysis["correct_exits"] / exit_analysis["total_analyzed"] * 100, 1)
+                msg += f"🎯 <b>Exit Accuracy:</b> {correct_pct}%\n"
+                msg += f"  Corretti: {exit_analysis['correct_exits']}/{exit_analysis['total_analyzed']}\n\n"
+            
+            msg += f"📈 <b>HOLD stats:</b>\n"
+            msg += f"  Avg P&L: {hold_stats['avg_pnl']:+.2f}%\n"
+            msg += f"  Wins ratio: {hold_stats['wins_ratio']}%\n\n"
+            
+            if adjustments:
+                msg += f"🔧 <b>Auto-tuning applicato:</b>\n"
+                for adj in adjustments:
+                    msg += f"  • {adj}\n"
+            else:
+                msg += f"✅ <b>Nessun tuning necessario</b>\n"
+                msg += f"  Sistema APM stabile\n"
+            
+            await send_telegram(msg)
+        except Exception as e:
+            print(f"  APM Learning Telegram error: {e}")
+        
+        print(f"🧬 APM LEARN: {len(decisions)} decisions analyzed, {len(adjustments)} adjustments")
         
         return {
             "total_decisions": len(decisions),
-            "exits": len(exits),
-            "scale_outs": len(scales),
-            "tightens": len(tightens),
-            "holds": len(holds),
-            "message": "APM learning loop v1.0 — full analysis in FASE 3",
+            "stats": {k: v["count"] for k, v in stats.items()},
+            "exit_analysis": exit_analysis,
+            "hold_stats": hold_stats,
+            "old_thresholds": old_thresholds,
+            "new_thresholds": new_thresholds,
+            "adjustments": adjustments,
+            "learned_at": datetime.utcnow().isoformat(),
         }
