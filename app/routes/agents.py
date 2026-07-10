@@ -346,3 +346,31 @@ async def apm_summary(days: int = 7):
         "counts": counts,
         "avg_pnl_managed": round(total_pnl_managed / max(len(decisions), 1), 2),
     }
+    
+# ============================================
+# 🧬 FASE 3 — APM LEARNING LOOP ENDPOINT
+# ============================================
+
+@router.post("/apm/learn")
+async def apm_learn():
+    """
+    🧬 Trigger manuale del Learning Loop APM.
+    
+    Analizza le decisioni degli ultimi 30 giorni, auto-aggiusta le soglie
+    e manda report Telegram.
+    
+    Configurabile come cron settimanale (domenica 03:00 CEST).
+    """
+    orch = _get_orch()
+    try:
+        result = await orch.apm.learn()
+        return {
+            "status": "ok",
+            "learning_result": result,
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+        }
+`
