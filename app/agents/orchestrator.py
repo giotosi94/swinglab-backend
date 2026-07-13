@@ -194,6 +194,32 @@ class Orchestrator:
         report["timing"]["risk_manager"] = round(time.time() - t3, 2)
 
         # ============================================
+        # 🆕 v4.2 — STEP 3.4: 🚨 APM URGENT TRIGGERS
+        # Check veloce (millisecondi) SOLO su target hit / drop critico
+        # Bypass timer 1h — chiamato ad OGNI pipeline
+        # ============================================
+        t_urgent = time.time()
+        urgent_result = {}
+        try:
+            urgent_result = await self.apm.check_urgent_triggers({
+                "positions": positions,
+            })
+            urgent_actions = len(urgent_result.get("actions_taken", []))
+            if urgent_actions > 0:
+                print(f"  🚨 APM URGENT: {urgent_actions} actions triggered")
+                # Ricarica positions se APM urgent ha chiuso qualcosa
+                positions = await get_positions() or []
+            report["steps"]["apm_urgent"] = {
+                "status": "ok",
+                "actions_taken": urgent_actions,
+            }
+        except Exception as e:
+            report["errors"].append(f"APM Urgent: {str(e)}")
+            report["steps"]["apm_urgent"] = {"status": "error", "error": str(e)}
+            print(f"❌ APM URGENT ERROR: {e}")
+        report["timing"]["apm_urgent"] = round(time.time() - t_urgent, 2)
+        
+        # ============================================
         # 🆕 v4.0 — STEP 3.5: 🎯 APM (Adaptive Position Manager)
         # Rivaluta posizioni aperte ogni 3h e decide HOLD/SCALE/EXIT/TIGHTEN
         # ============================================
