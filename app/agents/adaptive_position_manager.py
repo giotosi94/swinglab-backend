@@ -62,6 +62,146 @@ class AdaptivePositionManager(BaseAgent):
             "apm_urgent_check_drop_pct": 5.0,        # Se drop > 5% in 1h → urgent
         }
 
+    async def check_urgent_triggers(self, context: dict) -> dict:
+        """
+        🆕 v4.2 — Check veloce SOLO su trigger matematici (target hit, drop).
+        
+        Chiamato ad ogni pipeline (15 min) — bypass timer 1h.
+        Solo eventi CRITICI:
+        - P&L >= target 1/2/3 → SCALE_OUT
+        - Drop >5% in 1h → EXIT
+        
+        Zero LLM, zero confluence recalc. Millisecondi.
+        """
+        db = get_db()
+        params = await self.get_params()
+        
+        if not params.get("apm_enabled", True):
+            return {"status": "disabled", "actions_taken": []}
+        
+        positions = context.get("positions", [])
+        if not positions:
+            return {"status": "no_positions", "actions_taken": []}
+        
+        # Params targets
+        t1_pct = params.get("apm_target_1_pct", 5.0)
+        t2_pct = params.get("apm_target_2_pct", 10.0)
+        t3_pct = params.get("apm_target_3_pct", 20.0)
+        t1_size = params.get("apm_target_1_size", 50)
+        t2_size = params.get("apm_target_2_size", 30)
+        t3_size = params.get("apm_target_3_size", 20)
+        urgent_drop_pct = params.get("apm_urgent_check_drop_pct", 5.0)
+        scaling_enabled = params.get("apm_scaling_enabled", True)
+        
+        actions_taken = []
+        
+        for pos in positions:
+            symbol = pos.get("symbol")
+            current_price = float(pos.get("current_price", 0))
+            entry_price = float(pos.get("avg_entry_price", 0))
+            pnl_pct = float(pos.get("unrealized_plpc", 0)) * 100
+            
+            if not symbol or entry_price <= 0:
+                continue
+            
+            # Trova buy_trade
+            buy_trade = await db.trade_history.find_one(
+                {
+                    "ticker": symbol,
+                    "side": "buy",
+                    "sell_linked": {"$ne": True}
+                },
+                sort=[("date", -1)]
+            )
+            if not buy_trade:
+                continue
+            
+            # Check se già scaled out (per non ripetere stesso target)
+            last_target_hit = buy_trade.get("last_target_hit", 0)
+            
+            action = None
+            reason = None
+            size_pct = 0
+            target_num = 0
+            
+            # ============================================
+            # TRIGGER CHECK (in ordine: T3 → T2 → T1 → drop)
+            # ============================================
+            if scaling_enabled and pnl_pct >= t3_pct and last_target_hit < 3:
+                action = "SCALE_OUT"
+                target_num = 3
+                size_pct = t3_size
+                reason = f"URGENT T3 hit (+{pnl_pct:.1f}% >= +{t3_pct}%)"
+            elif scaling_enabled and pnl_pct >= t2_pct and last_target_hit < 2:
+                action = "SCALE_OUT"
+                target_num = 2
+                size_pct = t2_size
+                reason = f"URGENT T2 hit (+{pnl_pct:.1f}% >= +{t2_pct}%)"
+            elif scaling_enabled and pnl_pct >= t1_pct and last_target_hit < 1:
+                action = "SCALE_OUT"
+                target_num = 1
+                size_pct = t1_size
+                reason = f"URGENT T1 hit (+{pnl_pct:.1f}% >= +{t1_pct}%)"
+            elif pnl_pct <= -urgent_drop_pct:
+                # Drop critico → NON EXIT automatico, ma logga per next full analysis
+                # Meglio non fare EXIT senza confluence check
+                print(f"  ⚠️ URGENT: {symbol} drop {pnl_pct:.1f}% — will be reviewed in next full APM run")
+                continue
+            
+            # ============================================
+            # ESEGUI TRIGGER (solo SCALE_OUT)
+            # ============================================
+            if action == "SCALE_OUT":
+                print(f"  🚨 URGENT TRIGGER {symbol}: {reason}")
+                
+                action_taken, action_details = await self._execute_scale_out(
+                    symbol, pos, buy_trade, target_num, size_pct, reason
+                )
+                
+                if action_taken:
+                    decision_log = {
+                        "ticker": symbol,
+                        "decision": "SCALE_OUT",
+                        "reason": reason,
+                        "current_pnl_pct": round(pnl_pct, 2),
+                        "current_price": current_price,
+                        "entry_price": entry_price,
+                        "action_taken": True,
+                        "action_details": action_details,
+                        "trigger_type": "urgent",
+                    }
+                    actions_taken.append(decision_log)
+                    
+                    # Log to decisions collection
+                    await self.log_decision(
+                        decision_type=f"apm_urgent_scale_out",
+                        data=decision_log,
+                        reasoning=reason,
+                        confidence=80,
+                    )
+                    
+                    # Telegram alert
+                    try:
+                        from app.services.telegram_bot import send_telegram
+                        msg = (
+                            f"🚨 <b>APM URGENT TRIGGER</b>\n\n"
+                            f"🟡 <b>{symbol}</b> SCALE_OUT T{target_num}\n"
+                            f"P&L: {pnl_pct:+.2f}% | Size: {size_pct}%\n"
+                            f"{reason}"
+                        )
+                        await send_telegram(msg)
+                    except Exception as e:
+                        print(f"  Telegram error: {e}")
+        
+        if actions_taken:
+            print(f"🚨 APM URGENT: {len(actions_taken)} actions triggered")
+        
+        return {
+            "status": "ok",
+            "actions_taken": actions_taken,
+            "checked_positions": len(positions),
+        }
+        
     async def analyze(self, context: dict) -> dict:
         """
         Analizza tutte le posizioni aperte e decide azione per ciascuna.
