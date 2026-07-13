@@ -204,11 +204,11 @@ class Executor(BaseAgent):
                     tolerance = entry_price * 0.001  # 0.1% tolerance
                     if stop_loss > entry_price + tolerance:
                         # SL sopra entry di più dello 0.1% = bug reale
-                        print(f"  ⚠️ INVALID SL for {ticker}: stop_loss ${stop_loss:.2f} > entry ${entry_price:.2f} (skipping SL check)")
+                        print(f"  ⚠️ INVALID SL for {symbol}: stop_loss ${stop_loss:.2f} > entry ${entry_price:.2f} (skipping SL check)")
                         stop_loss = 0
                     elif abs(stop_loss - entry_price) <= tolerance:
                         # SL ~= entry = break-even valido (post APM scale-out)
-                        print(f"  🛡️ BREAK-EVEN SL for {ticker}: ${stop_loss:.2f} (post scale-out)")
+                        print(f"  🛡️ BREAK-EVEN SL for {symbol}: ${stop_loss:.2f} (post scale-out)")
             
             # Se target <= entry_price → è un bug upstream (Alpha/Risk)
             # Non triggerare mai il TP, log warning e skip
