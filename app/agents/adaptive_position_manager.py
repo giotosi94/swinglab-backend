@@ -584,7 +584,8 @@ class AdaptivePositionManager(BaseAgent):
             # 4. Calcola P&L su porzione chiusa
             pnl_pct_partial = round(((current_price - entry_price) / entry_price) * 100, 2) if entry_price > 0 else 0
             pnl_dollar_partial = round((current_price - entry_price) * qty_to_close, 2)
-            days_held = await self._calc_days_held(db, symbol)
+            buy_date = buy_trade.get("date", datetime.utcnow())
+            days_held = max(1, (datetime.utcnow() - buy_date).days) if buy_date else 1
             
             sell_order_id = f"apm_scale_{target_hit}_{symbol}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
             
