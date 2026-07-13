@@ -373,3 +373,23 @@ async def apm_learn():
             "status": "error",
             "error": str(e),
         }
+
+
+
+@router.post("/apm/force-run")
+async def apm_force_run():
+    """
+    🔧 Forza APM a rieseguire immediatamente, ignorando il timer 3h.
+    Utile per debug/testing.
+    """
+    from app.db.mongodb import get_db
+    from datetime import datetime
+    
+    db = get_db()
+    await db.apm_state.delete_one({"_id": "last_run"})
+    
+    return {
+        "status": "reset",
+        "message": "APM timer reset. Next pipeline will run APM.",
+        "reset_at": datetime.utcnow().isoformat(),
+    }
