@@ -24,7 +24,6 @@ from datetime import datetime, timedelta
 from app.agents.base_agent import BaseAgent
 from app.db.mongodb import get_db
 from app.services.alpaca_trader import get_positions, close_position, update_stop_loss, close_position_partial
-`
 
 
 class AdaptivePositionManager(BaseAgent):
