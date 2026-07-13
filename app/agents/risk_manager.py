@@ -181,8 +181,6 @@ class RiskManager(BaseAgent):
             "conf_mult": round(conf_mult, 3),
             "breakdown": breakdown,
         }
-
-`
     
     # ============================================
     # 🆕 POSITION SIZING (notional mode)
