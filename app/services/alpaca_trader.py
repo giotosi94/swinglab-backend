@@ -378,6 +378,49 @@ async def close_position(symbol):
     return await alpaca_request("DELETE", "{}/v2/positions/{}".format(ALPACA_BASE, symbol))
 
 
+
+async def close_position_partial(symbol: str, qty: float):
+    """
+    🆕 v4.0 FASE 4 — Chiude parzialmente una posizione (X shares invece che tutta).
+    
+    Alpaca supporta partial close via query param `qty` sull'endpoint DELETE /positions/{symbol}.
+    Supporta anche fractional shares.
+    
+    Esempio: close_position_partial("NOW", 60.5) chiude 60.5 shares di NOW.
+    
+    Ritorna:
+    - dict con l'ordine sell creato (se successo)
+    - None se errore
+    """
+    if qty <= 0:
+        print(f"  ⚠️ close_position_partial: qty {qty} invalid for {symbol}")
+        return None
+    
+    qty_str = str(round(qty, 4))  # max 4 decimali per fractional
+    url = "{}/v2/positions/{}?qty={}".format(ALPACA_BASE, symbol, qty_str)
+    
+    result = await alpaca_request("DELETE", url)
+    
+    if result:
+        db = get_db()
+        await db.alpaca_orders.insert_one({
+            "order_id": result.get("id"),
+            "symbol": symbol,
+            "qty": float(qty),
+            "side": "sell",
+            "type": "partial_close",
+            "status": result.get("status"),
+            "created_at": datetime.utcnow(),
+            "raw": result,
+            "source": "apm_scale_out",
+        })
+        print(f"  🟡 PARTIAL CLOSE {symbol}: {qty_str} shares (id={result.get('id', '')[:8]})")
+    else:
+        print(f"  ❌ PARTIAL CLOSE FAILED {symbol}: qty={qty_str}")
+    
+    return result
+
+
 async def close_all_positions():
     return await alpaca_request("DELETE", "{}/v2/positions".format(ALPACA_BASE))
 
