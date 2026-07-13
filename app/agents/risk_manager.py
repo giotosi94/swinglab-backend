@@ -46,6 +46,15 @@ class RiskManager(BaseAgent):
             
             # ===== Cash reserve =====
             "min_cash_reserve_pct": 10.0,
+            
+            # ===== 🆕 v4.1 DYNAMIC POSITION SIZING (DPS) =====
+            "dps_enabled": True,                    # Toggle master DPS
+            "dps_rr_ideal": 2.5,                    # R/R ideale (base neutrale = 1.0x)
+            "dps_ml_ideal": 75.0,                   # ML score ideale (base 1.0x)
+            "dps_conf_ideal": 55.0,                 # Confluence ideale (base 1.0x)
+            "dps_max_multiplier": 1.6,              # Max boost (18% se base 12%)
+            "dps_min_multiplier": 0.5,              # Min malus (6% se base 12%)
+            "dps_aggressiveness": 1.0,              # Global scaler (0.5=safe, 1.5=aggressive)
         }
 
     async def _check_loss_limits(self, account: dict, params: dict) -> dict:
@@ -97,6 +106,84 @@ class RiskManager(BaseAgent):
             "weekly_pnl_pct": round(weekly_pnl_pct, 2),
         }
 
+    # ============================================
+    # 🆕 v4.1 — DYNAMIC POSITION SIZING (Smart Multiplier)
+    # ============================================
+    
+    def _calc_smart_multiplier(self, candidate: dict, params: dict) -> dict:
+        """
+        🆕 v4.1 — Calcola multiplier intelligente basato su R/R + ML + Confluence.
+        
+        Ritorna dict con:
+        - multiplier: float (0.5-1.6, applicato al position_size_pct base)
+        - rr_mult, ml_mult, conf_mult: componenti individuali
+        - breakdown: string per logging
+        """
+        if not params.get("dps_enabled", True):
+            return {"multiplier": 1.0, "breakdown": "DPS disabled"}
+        
+        # Ideali
+        rr_ideal = params.get("dps_rr_ideal", 2.5)
+        ml_ideal = params.get("dps_ml_ideal", 75.0)
+        conf_ideal = params.get("dps_conf_ideal", 55.0)
+        
+        # Boundaries
+        max_mult = params.get("dps_max_multiplier", 1.6)
+        min_mult = params.get("dps_min_multiplier", 0.5)
+        aggressiveness = params.get("dps_aggressiveness", 1.0)
+        
+        # Valori del candidato
+        rr = candidate.get("risk_reward", 1.0)
+        ml_score = candidate.get("ml_score", 50)
+        # ml_score può arrivare come 0-1 o 0-100 — normalizziamo a 0-100
+        if ml_score > 0 and ml_score <= 1.0:
+            ml_score = ml_score * 100
+        confluence = candidate.get("confluence", 40)
+        
+        # 1. R/R MULTIPLIER (0.5-1.4x)
+        # rr=0.5 → 0.5x | rr=1.5 → 0.7x | rr=2.5 → 1.0x | rr=3.5 → 1.3x
+        rr_ratio = rr / rr_ideal if rr_ideal > 0 else 1.0
+        rr_mult = max(0.5, min(1.4, 0.4 + rr_ratio * 0.6))
+        
+        # 2. ML MULTIPLIER (0.7-1.3x)
+        # ml=40 → 0.7x | ml=60 → 0.9x | ml=75 → 1.0x | ml=90 → 1.2x
+        if ml_score > 0:
+            ml_ratio = ml_score / ml_ideal if ml_ideal > 0 else 1.0
+            ml_mult = max(0.7, min(1.3, 0.5 + ml_ratio * 0.5))
+        else:
+            ml_mult = 1.0  # ML non disponibile → neutro
+        
+        # 3. CONFLUENCE MULTIPLIER (0.7-1.3x)
+        # conf=30 → 0.7x | conf=45 → 0.9x | conf=55 → 1.0x | conf=70 → 1.3x
+        conf_ratio = confluence / conf_ideal if conf_ideal > 0 else 1.0
+        conf_mult = max(0.7, min(1.3, 0.5 + conf_ratio * 0.5))
+        
+        # Combined multiplier
+        combined = rr_mult * ml_mult * conf_mult
+        
+        # Applica aggressiveness scaler
+        combined = 1.0 + (combined - 1.0) * aggressiveness
+        
+        # Cap finale
+        final_mult = max(min_mult, min(max_mult, combined))
+        
+        breakdown = (
+            f"R/R {rr:.2f} → {rr_mult:.2f}x | "
+            f"ML {ml_score:.0f}% → {ml_mult:.2f}x | "
+            f"Conf {confluence:.0f} → {conf_mult:.2f}x | "
+            f"Final: {final_mult:.2f}x"
+        )
+        
+        return {
+            "multiplier": round(final_mult, 3),
+            "rr_mult": round(rr_mult, 3),
+            "ml_mult": round(ml_mult, 3),
+            "conf_mult": round(conf_mult, 3),
+            "breakdown": breakdown,
+        }
+
+`
+    
     # ============================================
     # 🆕 POSITION SIZING (notional mode)
     # ============================================
@@ -380,13 +467,21 @@ class RiskManager(BaseAgent):
                 # 🆕 POSITION SIZING (notional or shares mode)
                 # ============================================
                 if sizing_mode == "notional":
+                    # 🆕 v4.1 — Calcola DPS multiplier per questo candidato
+                    dps_result = self._calc_smart_multiplier(c, params)
+                    dps_multiplier = dps_result["multiplier"]
+                    dynamic_size_pct = position_size_pct * dps_multiplier
+                    
+                    if dps_multiplier != 1.0:
+                        print(f"  🎯 DPS {ticker}: {dps_result['breakdown']} → size {position_size_pct:.1f}% × {dps_multiplier:.2f} = {dynamic_size_pct:.1f}%")
+                    
                     sizing = self._calc_position_size_notional(
                         price=price,
                         stop_loss=stop_loss,
                         equity=equity,
                         available_capital=available_buying_power,
                         risk_per_trade_usd=risk_per_trade_usd,
-                        position_size_pct=position_size_pct,
+                        position_size_pct=dynamic_size_pct,  # 🆕 usa il dinamico
                         min_notional=min_notional,
                     )
                     
@@ -412,6 +507,11 @@ class RiskManager(BaseAgent):
                         "stop_loss_pct": sizing.get("stop_loss_pct", 0),
                         "pct_of_equity": sizing.get("pct_of_equity", 0),
                         "approved": True,
+                        # 🆕 v4.1 DPS info
+                        "dps_multiplier": dps_multiplier,
+                        "dps_base_pct": position_size_pct,
+                        "dps_final_pct": dynamic_size_pct,
+                        "dps_breakdown": dps_result["breakdown"],
                     }
                     approved_trades.append(approved_trade)
                     available_buying_power -= notional_usd
