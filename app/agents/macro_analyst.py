@@ -5,28 +5,15 @@ from app.db.mongodb import get_db
 
 class MacroAnalyst(BaseAgent):
     """
-    🌍 AGENTE 1: Macro Analyst
-    Studia l'economia generale, indici, settori e macroeconomia.
-    Produce un MarketContext che guida tutti gli altri agenti.
-
-    Analizza:
-    - SPY/QQQ/IWM/DIA (indici USA) → market regime
-    - VIXY (proxy VIX) → volatility regime
-    - BTC/USD, ETH/USD → crypto sentiment (risk on/off)
-    - FXE/UUP → dollar strength
-    - 11 settori SPDR → sector rotation & rankings
-    - Market breadth (% stock sopra EMA50)
-
-    Output: MarketContext dict
+    🌍 AGENTE 1: Macro Analyst v2.0 — Formula continua (no più bucket)
     """
 
     def __init__(self):
-        super().__init__(name="macro_analyst", version="1.0")
+        super().__init__(name="macro_analyst", version="2.0")
 
     def default_params(self) -> dict:
         return {
-            # Pesi per il calcolo del regime_confidence
-           "w_spy_trend": 0.18,
+            "w_spy_trend": 0.18,
             "w_spy_rsi": 0.10,
             "w_vix": 0.12,
             "w_breadth": 0.15,
@@ -36,31 +23,28 @@ class MacroAnalyst(BaseAgent):
             "w_bonds": 0.10,
             "w_commodities": 0.05,
             "w_risk_appetite": 0.10,
-            # Soglie per VIXY (non VIX spot!)
             "vixy_high": 22,
             "vixy_extreme": 28,
             "vixy_low": 14,
-            # Soglie mercato
-            "breadth_healthy": 60,   # % stock sopra EMA50
+            "breadth_healthy": 60,
             "breadth_weak": 40,
             "breadth_critical": 25,
-            # Regime multiplier per esposizione
             "bull_exposure": 1.0,
             "neutral_exposure": 0.6,
             "bear_exposure": 0.3,
             "crash_exposure": 0.0,
         }
 
+    def _clamp(self, value, min_val=0, max_val=100):
+        """Limita valore in range."""
+        return max(min_val, min(max_val, value))
+
     async def analyze(self, context: dict = None) -> dict:
-        """
-        Analisi macro completa. Legge dati da MongoDB (gia' fetchati da data_fetcher).
-        Ritorna MarketContext usato da tutti gli altri agenti.
-        """
         db = get_db()
         params = await self.get_params()
 
         # ============================================
-        # 1. MARKET REGIME (SPY-based)
+        # 1. SPY - trend + RSI (formule continue)
         # ============================================
         spy = await db.market_regime.find_one({"symbol": "SPY"})
         spy_price = spy.get("price", 0) if spy else 0
@@ -69,68 +53,53 @@ class MacroAnalyst(BaseAgent):
         spy_rsi = spy.get("rsi", 50) if spy else 50
         spy_return_20d = spy.get("return_20d", 0) if spy else 0
 
-        # ============================================
-        # 🔧 v1.1 — Trend score SPY (0-100) esplicito
-        # Logica chiara senza if ternari ambigui.
-        # Gestisce esplicitamente il caso EMA50 mancante.
-        # ============================================
-        if spy_ema50 <= 0 or spy_price <= 0:
-            # Dati mancanti → neutro, non assumiamo nulla
+        # 🆕 SPY TREND SCORE — proporzionale al distacco EMA
+        if spy_ema50 > 0 and spy_price > 0:
+            # % distacco price da EMA50 + bonus se sopra EMA20
+            dist_from_ema50 = ((spy_price - spy_ema50) / spy_ema50) * 100  # -X% a +X%
+            # Base score: 50 = neutro. +2 punti ogni +1% sopra EMA50
+            spy_trend_score = 50 + (dist_from_ema50 * 2.5)
+            # Bonus allineamento EMA20 > EMA50
+            if spy_ema20 > spy_ema50:
+                ema_slope = ((spy_ema20 - spy_ema50) / spy_ema50) * 100
+                spy_trend_score += min(15, ema_slope * 3)
+            # Return 20d contribuisce
+            spy_trend_score += self._clamp(spy_return_20d * 1.5, -10, 15)
+            spy_trend_score = self._clamp(spy_trend_score, 5, 95)
+        else:
             spy_trend_score = 50
-        elif spy_price > spy_ema20 > spy_ema50 and spy_ema20 > 0:
-            # Strong uptrend: price > EMA20 > EMA50 (allineamento perfetto)
-            spy_trend_score = 85
-        elif spy_price > spy_ema50:
-            # Mild uptrend: price sopra EMA50 ma senza allineamento perfetto
-            spy_trend_score = 65
-        elif spy_price > (spy_ema50 * 0.97):
-            # Near support: price entro -3% dalla EMA50 (possibile pullback)
-            spy_trend_score = 45
-        elif spy_price < spy_ema50 and spy_rsi > 35:
-            # Downtrend ma non ipervenduto: ancora margine di discesa
-            spy_trend_score = 30
-        else:
-            # Strong downtrend / crash: sotto EMA50 e RSI estremo
-            spy_trend_score = 15
 
-        # RSI score (0-100): meglio se tra 40-65
-        if 40 <= spy_rsi <= 65:
-            rsi_score = 80
-        elif 30 <= spy_rsi < 40:
-            rsi_score = 50  # Oversold, possibile rimbalzo
-        elif spy_rsi > 75:
-            rsi_score = 35  # Overbought
-        elif spy_rsi < 30:
-            rsi_score = 25  # Forte oversold
-        else:
-            rsi_score = 60
+        # 🆕 RSI SCORE — proporzionale alla distanza da 52 (sweet spot)
+        # 52 = ideale → 100. 20 o 80 = 40.
+        rsi_distance = abs(spy_rsi - 52)
+        rsi_score = self._clamp(100 - (rsi_distance * 1.8), 20, 100)
 
         # ============================================
-        # 2. VOLATILITY REGIME (VIXY-based, soglie calibrate)
+        # 2. VOLATILITY (VIXY) — score continuo
         # ============================================
         vixy = await db.market_regime.find_one({"symbol": "VIXY"})
         vixy_price = vixy.get("price", 18) if vixy else 18
 
+        # 🆕 Formula continua: VIXY 14 = 90, VIXY 22 = 60, VIXY 28 = 30
+        # Linear decay: score = 130 - (vixy_price * 3.5)
+        vol_score = self._clamp(130 - (vixy_price * 3.5), 5, 95)
+
+        vixy_low = params.get("vixy_low", 14)
         vixy_high = params.get("vixy_high", 22)
         vixy_extreme = params.get("vixy_extreme", 28)
-        vixy_low = params.get("vixy_low", 14)
-
         if vixy_price <= vixy_low:
             volatility_regime = "LOW"
-            vol_score = 90
         elif vixy_price <= vixy_high:
             volatility_regime = "NORMAL"
-            vol_score = 70
         elif vixy_price <= vixy_extreme:
             volatility_regime = "HIGH"
-            vol_score = 40
         else:
             volatility_regime = "EXTREME"
-            vol_score = 15
 
         # ============================================
-        # 3. INDICES ALIGNMENT (QQQ, IWM, DIA)
+        # 3. INDICES ALIGNMENT (con magnitudine)
         # ============================================
+        indices_return_sum = 0
         indices_bullish = 0
         indices_total = 0
         for sym in ["QQQ", "IWM", "DIA"]:
@@ -138,59 +107,63 @@ class MacroAnalyst(BaseAgent):
             if idx:
                 indices_total += 1
                 ret = idx.get("return_20d", 0) or idx.get("change_pct", 0)
+                indices_return_sum += ret
                 if ret > 0:
                     indices_bullish += 1
 
         if indices_total > 0:
-            alignment_score = (indices_bullish / indices_total) * 100
+            # 🆕 Score basato su return medio + allineamento
+            avg_return = indices_return_sum / indices_total
+            alignment_pct = (indices_bullish / indices_total) * 100
+            # Peso 60% allineamento, 40% magnitudine return
+            alignment_score = (alignment_pct * 0.6) + (self._clamp(50 + avg_return * 8, 0, 100) * 0.4)
+            alignment_score = self._clamp(alignment_score, 5, 95)
         else:
             alignment_score = 50
 
         # ============================================
-        # 4. CRYPTO SENTIMENT
+        # 4. CRYPTO SENTIMENT — continua
         # ============================================
         btc = await db.market_regime.find_one({"symbol": "BTC/USD"})
         eth = await db.market_regime.find_one({"symbol": "ETH/USD"})
         btc_change = btc.get("change_pct", 0) if btc else 0
         eth_change = eth.get("change_pct", 0) if eth else 0
 
-        if btc_change > 1 and eth_change > 1:
-            crypto_sentiment = "strong_risk_on"
-            crypto_score = 90
-        elif btc_change > 0 and eth_change > 0:
-            crypto_sentiment = "risk_on"
-            crypto_score = 70
-        elif btc_change < -2 and eth_change < -2:
-            crypto_sentiment = "risk_off"
-            crypto_score = 20
-        elif btc_change < 0 or eth_change < 0:
-            crypto_sentiment = "cautious"
-            crypto_score = 40
+        # 🆕 Score continuo: media pesata dei change
+        crypto_avg = (btc_change + eth_change) / 2
+        # 0% change = 50 score. +5% = 90. -5% = 10.
+        crypto_score = self._clamp(50 + (crypto_avg * 8), 10, 95)
+
+        if crypto_avg > 1:
+            crypto_sentiment = "strong_risk_on" if crypto_avg > 2 else "risk_on"
+        elif crypto_avg < -1:
+            crypto_sentiment = "risk_off" if crypto_avg < -2 else "cautious"
         else:
             crypto_sentiment = "neutral"
-            crypto_score = 50
 
         # ============================================
-        # 5. DOLLAR STRENGTH (FXE=euro strength, UUP=dollar strength)
+        # 5. DOLLAR STRENGTH — continua
         # ============================================
         fxe = await db.market_regime.find_one({"symbol": "FXE"})
         uup = await db.market_regime.find_one({"symbol": "UUP"})
         fxe_change = fxe.get("change_pct", 0) if fxe else 0
         uup_change = uup.get("change_pct", 0) if uup else 0
 
-        # Dollaro debole = buono per azioni USA (esportazioni)
         dollar_net = uup_change - fxe_change
-        if dollar_net < -0.5:
+
+        # 🆕 Dollaro debole = buono per stocks USA. Score inverso.
+        # dollar_net = 0 → 55 score. -1% → 75. +1% → 35.
+        dollar_score = self._clamp(55 - (dollar_net * 20), 15, 90)
+
+        if dollar_net < -0.3:
             dollar_strength = "weak"
-            dollar_score = 75
-        elif dollar_net > 0.5:
+        elif dollar_net > 0.3:
             dollar_strength = "strong"
-            dollar_score = 35
         else:
             dollar_strength = "neutral"
-            dollar_score = 55
-# ============================================
-        # 5B. BONDS & CREDIT (TLT, HYG, LQD)
+
+        # ============================================
+        # 5B. BONDS & CREDIT — continuo
         # ============================================
         tlt = await db.market_regime.find_one({"symbol": "TLT"})
         hyg = await db.market_regime.find_one({"symbol": "HYG"})
@@ -200,29 +173,25 @@ class MacroAnalyst(BaseAgent):
         hyg_change = hyg.get("change_pct", 0) if hyg else 0
         lqd_change = lqd.get("change_pct", 0) if lqd else 0
 
-        # Credit spread: HYG dropping more than LQD = credit stress
         credit_spread = hyg_change - lqd_change
-        # TLT rising = flight to safety
-        bonds_flight = tlt_change > 0.5
 
-        if credit_spread < -0.5 and bonds_flight:
+        # 🆕 Score base 60. Credit spread positivo = risk on. TLT flight = penalità.
+        bonds_score = 60 + (credit_spread * 30) - (max(0, tlt_change - 0.5) * 20)
+        bonds_score = self._clamp(bonds_score, 10, 90)
+
+        if credit_spread < -0.3 and tlt_change > 0.5:
             bonds_signal = "risk_off"
-            bonds_score = 20
-        elif credit_spread < -0.3:
+        elif credit_spread < -0.2:
             bonds_signal = "credit_stress"
-            bonds_score = 35
-        elif credit_spread > 0.3 and tlt_change < 0:
+        elif credit_spread > 0.2:
             bonds_signal = "risk_on"
-            bonds_score = 80
         elif tlt_change > 0.5:
             bonds_signal = "flight_to_safety"
-            bonds_score = 40
         else:
             bonds_signal = "neutral"
-            bonds_score = 60
 
         # ============================================
-        # 5C. COMMODITIES (GLD, USO)
+        # 5C. COMMODITIES — continuo
         # ============================================
         gld = await db.market_regime.find_one({"symbol": "GLD"})
         uso = await db.market_regime.find_one({"symbol": "USO"})
@@ -230,45 +199,47 @@ class MacroAnalyst(BaseAgent):
         gld_change = gld.get("change_pct", 0) if gld else 0
         uso_change = uso.get("change_pct", 0) if uso else 0
 
+        # 🆕 Growth signal: oil up, gold down = risk on.
+        # commodities_score base 55, penalità se gold sale con SPY debole
+        commodities_score = 55 + (uso_change * 8) - (gld_change * 5)
+        if spy_return_20d < 0 and gld_change > 0.5:
+            commodities_score -= 20  # gold flight
+        commodities_score = self._clamp(commodities_score, 15, 90)
+
         if gld_change > 1 and spy_return_20d < 0:
             commodities_signal = "risk_off"
-            commodities_score = 25
         elif gld_change > 0.5 and uso_change > 1:
             commodities_signal = "inflation"
-            commodities_score = 40
         elif gld_change < -0.5 and uso_change > 0:
             commodities_signal = "growth"
-            commodities_score = 75
         elif gld_change < 0:
             commodities_signal = "risk_on"
-            commodities_score = 70
         else:
             commodities_signal = "neutral"
-            commodities_score = 55
 
         # ============================================
-        # 5D. BREADTH DIVERGENCE (RSP vs SPY)
+        # 5D. BREADTH DIVERGENCE — continuo
         # ============================================
         rsp = await db.market_regime.find_one({"symbol": "RSP"})
         rsp_change = rsp.get("change_pct", 0) if rsp else 0
         spy_change = spy.get("change_pct", 0) if spy else 0
 
         breadth_gap = rsp_change - spy_change
-        if breadth_gap > 0.5:
+
+        # 🆕 Gap 0 = normale (60). Positivo = broad rally (90). Negativo = narrow (30).
+        breadth_div_score = self._clamp(60 + (breadth_gap * 40), 10, 95)
+
+        if breadth_gap > 0.4:
             breadth_divergence = "broad_rally"
-            breadth_div_score = 85
-        elif breadth_gap > -0.3:
+        elif breadth_gap > -0.2:
             breadth_divergence = "normal"
-            breadth_div_score = 60
-        elif breadth_gap > -1.0:
+        elif breadth_gap > -0.8:
             breadth_divergence = "narrow"
-            breadth_div_score = 40
         else:
             breadth_divergence = "very_narrow"
-            breadth_div_score = 20
 
         # ============================================
-        # 5E. RISK APPETITE (IWO, EEM, IYT)
+        # 5E. RISK APPETITE — continuo
         # ============================================
         iwo = await db.market_regime.find_one({"symbol": "IWO"})
         eem = await db.market_regime.find_one({"symbol": "EEM"})
@@ -278,22 +249,21 @@ class MacroAnalyst(BaseAgent):
         eem_change = eem.get("change_pct", 0) if eem else 0
         iyt_change = iyt.get("change_pct", 0) if iyt else 0
 
-        risk_signals = sum(1 for x in [iwo_change, eem_change, iyt_change] if x > 0)
+        # 🆕 Score continuo: media pesata dei 3 cambio
+        risk_avg = (iwo_change + eem_change + iyt_change) / 3
+        risk_appetite_score = self._clamp(50 + (risk_avg * 10), 10, 95)
 
-        if risk_signals == 3 and iyt_change > 0.5:
+        if risk_avg > 1.5:
             risk_appetite = "strong"
-            risk_appetite_score = 90
-        elif risk_signals >= 2:
+        elif risk_avg > 0.5:
             risk_appetite = "moderate"
-            risk_appetite_score = 70
-        elif risk_signals == 1:
+        elif risk_avg > -0.5:
             risk_appetite = "low"
-            risk_appetite_score = 40
         else:
             risk_appetite = "risk_off"
-            risk_appetite_score = 20
+
         # ============================================
-        # 6. SECTOR ROTATION & RANKINGS
+        # 6. SECTOR ROTATION
         # ============================================
         sectors = await db.sectors.find().sort("composite_score", -1).to_list(20)
         sector_rankings = []
@@ -307,7 +277,6 @@ class MacroAnalyst(BaseAgent):
                 "rsi": s.get("rsi", 50),
             })
 
-        # Rotation signal: se difensivi (XLU, XLP, XLV) in top 3 = risk off
         defensive_codes = {"XLU", "XLP", "XLV"}
         top3_codes = {s["code"] for s in sector_rankings[:3]}
         defensive_in_top3 = len(defensive_codes & top3_codes)
@@ -319,11 +288,9 @@ class MacroAnalyst(BaseAgent):
             rotation_signal = "mixed"
 
         # ============================================
-        # 7. MARKET BREADTH (% stock sopra EMA50)
+        # 7. MARKET BREADTH — continuo
         # ============================================
-        assets = await db.assets.find(
-            {}, {"price": 1, "ema50": 1}
-        ).to_list(300)
+        assets = await db.assets.find({}, {"price": 1, "ema50": 1}).to_list(300)
 
         total_stocks = 0
         above_ema50 = 0
@@ -336,25 +303,25 @@ class MacroAnalyst(BaseAgent):
                     above_ema50 += 1
 
         breadth_pct = round((above_ema50 / total_stocks * 100), 1) if total_stocks > 0 else 50
+
+        # 🆕 Score continuo: 50% breadth = 50 score. 70% = 78. 30% = 22.
+        breadth_score = self._clamp(breadth_pct * 1.4 - 20, 5, 95)
+
         breadth_healthy = params.get("breadth_healthy", 60)
         breadth_weak = params.get("breadth_weak", 40)
         breadth_critical = params.get("breadth_critical", 25)
 
         if breadth_pct >= breadth_healthy:
             market_breadth = "healthy"
-            breadth_score = 85
         elif breadth_pct >= breadth_weak:
             market_breadth = "mixed"
-            breadth_score = 55
         elif breadth_pct >= breadth_critical:
             market_breadth = "weak"
-            breadth_score = 30
         else:
             market_breadth = "critical"
-            breadth_score = 10
 
         # ============================================
-        # 8. COMPOSITE REGIME CONFIDENCE (0-100)
+        # 8. COMPOSITE REGIME CONFIDENCE
         # ============================================
         w = params
         regime_confidence = round(
@@ -370,7 +337,6 @@ class MacroAnalyst(BaseAgent):
             risk_appetite_score * w.get("w_risk_appetite", 0.10)
         , 1)
 
-        # Determine final regime
         if regime_confidence >= 70:
             market_regime = "BULL"
         elif regime_confidence >= 50:
@@ -380,7 +346,6 @@ class MacroAnalyst(BaseAgent):
         else:
             market_regime = "CRASH"
 
-        # Exposure multiplier
         exposure_map = {
             "BULL": w.get("bull_exposure", 1.0),
             "NEUTRAL": w.get("neutral_exposure", 0.6),
@@ -389,7 +354,6 @@ class MacroAnalyst(BaseAgent):
         }
         exposure_multiplier = exposure_map.get(market_regime, 0.5)
 
-        # Aggiustamento per rotation difensiva
         if rotation_signal == "defensive" and market_regime == "BULL":
             market_regime = "NEUTRAL"
             exposure_multiplier = min(exposure_multiplier, 0.7)
@@ -413,37 +377,36 @@ class MacroAnalyst(BaseAgent):
             "breadth_divergence": breadth_divergence,
             "risk_appetite": risk_appetite,
             "sector_rankings": sector_rankings,
-            # Dettagli per debug/monitoring
             "details": {
                 "spy": {"price": spy_price, "ema20": spy_ema20, "ema50": spy_ema50,
                         "rsi": spy_rsi, "return_20d": spy_return_20d,
-                        "trend_score": spy_trend_score, "rsi_score": rsi_score},
-                "vixy": {"price": vixy_price, "score": vol_score},
+                        "trend_score": round(spy_trend_score, 1), "rsi_score": round(rsi_score, 1)},
+                "vixy": {"price": vixy_price, "score": round(vol_score, 1)},
                 "indices": {"bullish": indices_bullish, "total": indices_total,
-                            "score": alignment_score},
+                            "score": round(alignment_score, 1)},
                 "crypto": {"btc_change": btc_change, "eth_change": eth_change,
-                           "score": crypto_score},
+                           "score": round(crypto_score, 1)},
                 "dollar": {"fxe_change": fxe_change, "uup_change": uup_change,
-                           "net": dollar_net, "score": dollar_score},
+                           "net": dollar_net, "score": round(dollar_score, 1)},
                 "breadth": {"above_ema50": above_ema50, "total": total_stocks,
-                            "pct": breadth_pct, "score": breadth_score},
+                            "pct": breadth_pct, "score": round(breadth_score, 1)},
                 "bonds": {"tlt_change": tlt_change, "hyg_change": hyg_change,
                           "lqd_change": lqd_change, "credit_spread": round(credit_spread, 2),
-                          "signal": bonds_signal, "score": bonds_score},
+                          "signal": bonds_signal, "score": round(bonds_score, 1)},
                 "commodities": {"gld_change": gld_change, "uso_change": uso_change,
-                                "signal": commodities_signal, "score": commodities_score},
+                                "signal": commodities_signal, "score": round(commodities_score, 1)},
                 "breadth_div": {"spy_change": spy_change, "rsp_change": rsp_change,
                                 "gap": round(breadth_gap, 2), "signal": breadth_divergence,
-                                "score": breadth_div_score},
+                                "score": round(breadth_div_score, 1)},
                 "risk_appetite_detail": {"iwo_change": iwo_change, "eem_change": eem_change,
-                                  "iyt_change": iyt_change, "signal": risk_appetite,
-                                  "score": risk_appetite_score},
+                                         "iyt_change": iyt_change, "signal": risk_appetite,
+                                         "score": round(risk_appetite_score, 1)},
             },
             "analyzed_at": datetime.utcnow().isoformat(),
         }
 
-# ============================================
-        # 9. LLM REASONING (optional)
+        # ============================================
+        # 9. LLM REASONING
         # ============================================
         from app.services.llm_service import llm_ask, llm_available
         llm_reasoning = None
@@ -459,65 +422,48 @@ class MacroAnalyst(BaseAgent):
                     f"Bonds: TLT {tlt_change:+.1f}%, HYG {hyg_change:+.1f}%, LQD {lqd_change:+.1f}%\n"
                     f"Gold: {gld_change:+.1f}%, Oil: {uso_change:+.1f}%\n"
                     f"RSP vs SPY gap: {breadth_gap:+.2f}%\n"
-                    f"Risk signals (IWO/EEM/IYT): {risk_signals}/3 positive\n"
                     f"Top sectors: {', '.join(s['code'] for s in sector_rankings[:3])}\n"
-                    f"Bottom sectors: {', '.join(s['code'] for s in sector_rankings[-3:])}\n"
                     f"Rotation: {rotation_signal}\n"
-                    f"My calculated regime: {market_regime} (confidence {regime_confidence}%)"
+                    f"Calculated regime: {market_regime} (confidence {regime_confidence}%)"
                 )
                 llm_reasoning = llm_ask(
                     system_prompt=(
                         "Sei un analista macro esperto di swing trading. "
-                        "Analizza i dati di mercato e fornisci una valutazione breve (max 3 frasi) in italiano. "
-                        "Indica: 1) Il regime attuale e perché, 2) Il rischio principale, 3) Suggerimento operativo. "
-                        "Se siamo in periodo di earnings season (gen/apr/lug/ott), menzionalo. "
-                    "Sii diretto e concreto, no disclaimers."
+                        "Analizza i dati di mercato in max 3 frasi in italiano. "
+                        "Indica: 1) Regime e perché, 2) Rischio principale, 3) Suggerimento operativo. "
+                        "Sii diretto, no disclaimers."
                     ),
                     user_prompt=f"Dati di mercato oggi:\n{data_summary}",
                     max_tokens=200,
                     temperature=0.3,
                     agent_name="macro_analyst",
                 )
-                if llm_reasoning:
-                    print(f"  🧠 LLM: {llm_reasoning[:100]}...")
             except Exception as e:
                 print(f"  LLM reasoning error: {e}")
 
         market_context["llm_reasoning"] = llm_reasoning
-        
-        # Log decision
+
         await self.log_decision(
             decision_type="regime_assessment",
             data=market_context,
-            reasoning=f"Regime={market_regime} conf={regime_confidence} "
-                      f"breadth={breadth_pct}% vol={volatility_regime} "
-                      f"rotation={rotation_signal}",
+            reasoning=f"Regime={market_regime} conf={regime_confidence}",
             confidence=regime_confidence,
         )
 
-        # Save to market_regime collection per retrocompatibilita'
         await db.market_context.update_one(
             {"_id": "latest"},
             {"$set": market_context},
             upsert=True,
         )
 
-        print(f"🌍 MacroAnalyst: {market_regime} (conf={regime_confidence}, "
+        print(f"🌍 MacroAnalyst v2.0: {market_regime} (conf={regime_confidence}, "
               f"exposure={exposure_multiplier}, breadth={breadth_pct}%)")
 
         return market_context
 
     async def learn(self) -> dict:
-        """
-        Learning loop del MacroAnalyst.
-        Per ogni prediction passata, controlla se il mercato si e' mosso
-        nella direzione prevista dopo 5 giorni.
-        Aggiusta i pesi delle variabili di conseguenza.
-        """
         db = get_db()
         params = await self.get_params()
-
-        # Prendi decisioni vecchie di almeno 5 giorni e senza outcome
         cutoff_old = datetime.utcnow() - timedelta(days=5)
         cutoff_max = datetime.utcnow() - timedelta(days=90)
 
@@ -531,7 +477,6 @@ class MacroAnalyst(BaseAgent):
         if not pending:
             return {"message": "No pending decisions to evaluate", "params": params}
 
-        # Per valutare, confronta SPY price al momento della decisione vs ora
         spy_now = await db.market_regime.find_one({"symbol": "SPY"})
         spy_price_now = spy_now.get("price", 0) if spy_now else 0
 
@@ -549,7 +494,6 @@ class MacroAnalyst(BaseAgent):
             actual_return = ((spy_price_now - spy_then) / spy_then) * 100
             total += 1
 
-            # Il regime era corretto?
             was_correct = False
             if regime_then == "BULL" and actual_return > 0:
                 was_correct = True
@@ -572,39 +516,7 @@ class MacroAnalyst(BaseAgent):
             }
             await self.record_outcome(str(dec["_id"]), outcome)
 
-        # Aggiusta i pesi se abbiamo abbastanza dati
         accuracy = (correct / total * 100) if total > 0 else 50
-
-        if total >= self.min_decisions_to_learn:
-            evaluated = await self.evaluate_past_decisions(lookback_days=60)
-            correct_weighted = sum(d["weight"] for d in evaluated
-                                  if d.get("outcome", {}).get("correct"))
-            total_weighted = sum(d["weight"] for d in evaluated) or 1
-
-            weighted_accuracy = (correct_weighted / total_weighted) * 100
-
-            # Se breadth era il fattore piu' correlato con le previsioni corrette
-            # aumenta il suo peso, altrimenti diminuiscilo
-            # (logica semplificata - in futuro si puo' usare gradient descent)
-            adjustment = 0.02 if weighted_accuracy > 60 else -0.01
-
-            # Mantieni i pesi normalizzati e tra 0.05 e 0.35
-            for key in ["w_spy_trend", "w_spy_rsi", "w_vix", "w_breadth",
-                        "w_indices_alignment", "w_crypto", "w_dollar"]:
-                current = params.get(key, 0.15)
-                params[key] = round(max(0.05, min(0.35, current)), 3)
-
-            # Se accuracy bassa, aumenta peso del breadth (indicatore leading)
-            if weighted_accuracy < 50:
-                params["w_breadth"] = min(0.30, params.get("w_breadth", 0.20) + 0.02)
-                params["w_spy_trend"] = min(0.30, params.get("w_spy_trend", 0.25) + 0.01)
-
-        learn_result = {
-            "total_evaluated": total,
-            "correct": correct,
-            "accuracy": round(accuracy, 1),
-            "params_updated": params,
-        }
 
         await self.save_params(params)
         await self.save_performance({
@@ -612,5 +524,8 @@ class MacroAnalyst(BaseAgent):
             "total_evaluated": total,
         })
 
-        print(f"🌍 MacroAnalyst LEARN: {correct}/{total} correct ({accuracy:.1f}%)")
-        return learn_result
+        return {
+            "total_evaluated": total,
+            "correct": correct,
+            "accuracy": round(accuracy, 1),
+        }
