@@ -23,7 +23,8 @@ LEARNING:
 from datetime import datetime, timedelta
 from app.agents.base_agent import BaseAgent
 from app.db.mongodb import get_db
-from app.services.alpaca_trader import get_positions, close_position, update_stop_loss
+from app.services.alpaca_trader import get_positions, close_position, update_stop_loss, close_position_partial
+`
 
 
 class AdaptivePositionManager(BaseAgent):
@@ -538,18 +539,126 @@ class AdaptivePositionManager(BaseAgent):
             return False, {"error": str(e)}
 
     async def _execute_scale_out(self, symbol, pos, buy_trade, target_hit, size_pct, reason):
-        """Esegue chiusura parziale."""
-        # NOTA: Alpaca supporta chiusura parziale via close_position con qty specifica
-        # Per ora, semplice log — implementeremo chiusura parziale nella FASE 4 (weekend prox)
-        print(f"  🟡 APM SCALE_OUT {symbol}: Target {target_hit}, size {size_pct}%")
-        print(f"     ⚠️ Scale-out implementation planned for FASE 4 (weekend 19-20 luglio)")
+        """
+        🆕 v4.0 FASE 4 — Chiusura parziale REALE su Alpaca.
         
-        return True, {
-            "action": "SCALE_OUT_LOGGED",
-            "target_hit": target_hit,
-            "size_pct": size_pct,
-            "note": "Full implementation in FASE 4",
-        }
+        Chiude size_pct% della posizione + sposta SL a break-even sul restante.
+        
+        Args:
+            symbol: ticker
+            pos: dict posizione Alpaca
+            buy_trade: dict buy da trade_history
+            target_hit: 1, 2, o 3 (quale target scattato)
+            size_pct: % posizione da chiudere (es. 50)
+            reason: motivo APM
+        """
+        db = get_db()
+        
+        try:
+            # 1. Calcola quantità da chiudere
+            current_qty = float(pos.get("qty", 0))
+            qty_to_close = round(current_qty * (size_pct / 100), 4)
+            qty_remaining = round(current_qty - qty_to_close, 4)
+            
+            if qty_to_close <= 0.0001:
+                return False, {"error": "qty_to_close too small"}
+            
+            current_price = float(pos.get("current_price", 0))
+            entry_price = float(buy_trade.get("entry_price", 0))
+            
+            # 2. Cancella eventuali ordini SL/TP aperti (li rimpiazzeremo dopo)
+            from app.services.alpaca_trader import get_orders, cancel_order
+            open_orders = await get_orders(status="open", limit=50)
+            cancelled_orders = 0
+            if open_orders:
+                for o in open_orders:
+                    if o.get("symbol") == symbol and o.get("side") == "sell":
+                        await cancel_order(o.get("id"))
+                        cancelled_orders += 1
+            
+            # 3. Chiudi parziale su Alpaca
+            close_result = await close_position_partial(symbol, qty_to_close)
+            
+            if close_result is None:
+                return False, {"error": "partial close failed", "cancelled_orders": cancelled_orders}
+            
+            # 4. Calcola P&L su porzione chiusa
+            pnl_pct_partial = round(((current_price - entry_price) / entry_price) * 100, 2) if entry_price > 0 else 0
+            pnl_dollar_partial = round((current_price - entry_price) * qty_to_close, 2)
+            days_held = await self._calc_days_held(db, symbol)
+            
+            sell_order_id = f"apm_scale_{target_hit}_{symbol}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+            
+            # 5. Log sell parziale in trade_history
+            await db.trade_history.insert_one({
+                "ticker": symbol,
+                "side": "sell",
+                "entry_price": entry_price,
+                "exit_price": current_price,
+                "shares": float(qty_to_close),
+                "pnl_pct": pnl_pct_partial,
+                "pnl_dollar": pnl_dollar_partial,
+                "days_held": days_held,
+                "reason": f"APM_SCALE_OUT_T{target_hit}",
+                "apm_reason": reason,
+                "setup_type": buy_trade.get("setup_type", "unknown"),
+                "sector": buy_trade.get("sector", "unknown"),
+                "market_regime": buy_trade.get("market_regime", "UNKNOWN"),
+                "order_id": sell_order_id,
+                "buy_order_id": buy_trade.get("order_id", ""),
+                "agent": "adaptive_position_manager",
+                "date": datetime.utcnow(),
+                "source": "apm_v1_scale_out",
+                "target_hit": target_hit,
+                "partial": True,
+                "qty_closed": float(qty_to_close),
+                "qty_remaining": float(qty_remaining),
+            })
+            
+            # 6. Aggiorna buy_trade con qty ridotta (per software SL/TP tracking)
+            await db.trade_history.update_one(
+                {"_id": buy_trade["_id"]},
+                {"$set": {
+                    "shares": float(qty_remaining),
+                    "partial_scaled_out": True,
+                    "last_scale_out_at": datetime.utcnow(),
+                    "last_target_hit": target_hit,
+                }}
+            )
+            
+            # 7. Sposta SL a break-even sul restante (solo se T1 hit)
+            new_stop = entry_price if target_hit == 1 else max(entry_price, entry_price * 1.03)  # T2: entry+3%
+            
+            await db.trailing_stops.update_one(
+                {"ticker": symbol},
+                {"$set": {
+                    "ticker": symbol,
+                    "stop_price": round(new_stop, 2),
+                    "reason": f"APM scale-out T{target_hit}: SL moved to {'break-even' if target_hit == 1 else 'entry+3%'}",
+                    "updated_at": datetime.utcnow(),
+                    "source": "apm_v1_scale_out",
+                }},
+                upsert=True
+            )
+            
+            print(f"  🟡 APM SCALE_OUT T{target_hit} {symbol}: closed {qty_to_close:.4f} shares "
+                  f"(P&L {pnl_pct_partial:+.2f}%, ${pnl_dollar_partial:+.0f}), "
+                  f"SL → ${new_stop:.2f}, remaining {qty_remaining:.4f}")
+            
+            return True, {
+                "action": "SCALE_OUT_REAL",
+                "target_hit": target_hit,
+                "size_pct": size_pct,
+                "qty_closed": float(qty_to_close),
+                "qty_remaining": float(qty_remaining),
+                "pnl_pct": pnl_pct_partial,
+                "pnl_dollar": pnl_dollar_partial,
+                "new_stop": round(new_stop, 2),
+                "cancelled_orders": cancelled_orders,
+            }
+        except Exception as e:
+            print(f"  ⚠️ APM SCALE_OUT error {symbol}: {e}")
+            return False, {"error": str(e)}
 
     async def _execute_tighten_stop(self, symbol, pos, buy_trade, new_stop, reason):
         """Esegue tightening dello stop loss."""
