@@ -652,3 +652,129 @@ async def get_portfolio_periods():
             except:
                 pass
     return periods
+
+
+
+# ============================================
+# 🆕 v4.2 — MACRO BARS (per aggiornare market_regime)
+# ============================================
+
+async def get_bars_daily(symbol: str, limit: int = 60):
+    """
+    🆕 v4.2 — Fetcha bars daily da Alpaca IEX (gratis, live).
+    Usato per aggiornare macro ETF (SPY, QQQ, VXX, TLT, ecc.)
+    
+    Ritorna lista di dict: [{"t": timestamp, "o": open, "h": high, "l": low, "c": close, "v": volume}]
+    """
+    from datetime import datetime, timedelta
+    end_date = datetime.utcnow()
+    start_date = end_date - timedelta(days=limit + 30)  # Buffer per weekend/holidays
+    
+    url = (
+        f"{ALPACA_DATA}/v2/stocks/bars"
+        f"?symbols={symbol}"
+        f"&timeframe=1Day"
+        f"&start={start_date.strftime('%Y-%m-%d')}"
+        f"&end={end_date.strftime('%Y-%m-%d')}"
+        f"&limit={limit}"
+        f"&feed=iex"
+    )
+    
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(url, headers=HEADERS)
+            if r.status_code == 200:
+                data = r.json()
+                bars = data.get("bars", {}).get(symbol, [])
+                return bars
+    except Exception as e:
+        print(f"  ⚠️ get_bars_daily error for {symbol}: {e}")
+    return []
+
+
+def _calc_rsi(prices, period=14):
+    """Calcola RSI da lista di prezzi close."""
+    if len(prices) < period + 1:
+        return 50.0
+    gains = []
+    losses = []
+    for i in range(1, len(prices)):
+        diff = prices[i] - prices[i-1]
+        if diff >= 0:
+            gains.append(diff)
+            losses.append(0)
+        else:
+            gains.append(0)
+            losses.append(abs(diff))
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    return round(rsi, 2)
+
+
+def _calc_ema(prices, period):
+    """Calcola EMA da lista prezzi."""
+    if len(prices) < period:
+        return prices[-1] if prices else 0
+    k = 2 / (period + 1)
+    ema = sum(prices[:period]) / period
+    for price in prices[period:]:
+        ema = price * k + ema * (1 - k)
+    return round(ema, 2)
+
+
+async def fetch_macro_data_alpaca(symbols: list):
+    """
+    🆕 v4.2 — Fetcha e calcola indicatori per lista macro symbols da Alpaca.
+    Ritorna dict {symbol: {price, rsi, ema20, ema50, change_pct, return_20d}}
+    """
+    from datetime import datetime
+    results = {}
+    
+    for symbol in symbols:
+        try:
+            bars = await get_bars_daily(symbol, limit=60)
+            
+            if not bars or len(bars) < 5:
+                print(f"  ⚠️ Not enough bars for {symbol}: {len(bars)}")
+                continue
+            
+            closes = [b.get("c", 0) for b in bars if b.get("c")]
+            if not closes:
+                continue
+            
+            latest_price = closes[-1]
+            prev_close = closes[-2] if len(closes) > 1 else latest_price
+            change_pct = ((latest_price - prev_close) / prev_close * 100) if prev_close > 0 else 0
+            
+            # 20-day return
+            if len(closes) >= 21:
+                price_20d_ago = closes[-21]
+                return_20d = ((latest_price - price_20d_ago) / price_20d_ago * 100) if price_20d_ago > 0 else 0
+            else:
+                return_20d = 0
+            
+            rsi = _calc_rsi(closes)
+            ema20 = _calc_ema(closes, 20)
+            ema50 = _calc_ema(closes, 50) if len(closes) >= 50 else ema20
+            
+            results[symbol] = {
+                "symbol": symbol,
+                "price": round(latest_price, 2),
+                "change_pct": round(change_pct, 2),
+                "return_20d": round(return_20d, 2),
+                "rsi": rsi,
+                "ema20": ema20,
+                "ema50": ema50,
+                "updated_at": datetime.utcnow(),
+                "source": "alpaca_iex",
+            }
+            print(f"  ✅ {symbol}: ${latest_price} ({change_pct:+.2f}%) RSI {rsi} EMA20 {ema20}")
+        except Exception as e:
+            print(f"  ⚠️ fetch_macro error {symbol}: {e}")
+            continue
+    
+    return results
