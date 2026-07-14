@@ -728,38 +728,65 @@ def _calc_ema(prices, period):
 
 async def fetch_macro_data_alpaca(symbols: list):
     """
-    🆕 v4.2 — Fetcha e calcola indicatori per lista macro symbols da Alpaca.
-    Ritorna dict {symbol: {price, rsi, ema20, ema50, change_pct, return_20d}}
+    v4.3 — Fetch prezzi live via latest quotes + bars daily per RSI/EMA.
+    Combina: quote latest (prezzo intraday reale) + bars daily (indicatori tecnici).
     """
     from datetime import datetime
     results = {}
     
+    # STEP 1: Fetch latest quotes (prezzi REALI intraday)
+    symbols_str = ",".join(symbols)
+    quotes_url = f"{ALPACA_DATA}/v2/stocks/quotes/latest?symbols={symbols_str}&feed=iex"
+    latest_prices = {}
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(quotes_url, headers=HEADERS)
+            if r.status_code == 200:
+                data = r.json()
+                quotes = data.get("quotes", {})
+                for sym, q in quotes.items():
+                    # Mid price = (bid + ask) / 2
+                    bid = q.get("bp", 0)
+                    ask = q.get("ap", 0)
+                    if bid > 0 and ask > 0:
+                        latest_prices[sym] = (bid + ask) / 2
+                    elif ask > 0:
+                        latest_prices[sym] = ask
+                    elif bid > 0:
+                        latest_prices[sym] = bid
+    except Exception as e:
+        print(f"  latest quotes error: {e}")
+    
+    # STEP 2: Fetch bars daily per RSI/EMA/change_pct
     for symbol in symbols:
         try:
             bars = await get_bars_daily(symbol, limit=60)
             
             if not bars or len(bars) < 5:
-                print(f"  ⚠️ Not enough bars for {symbol}: {len(bars)}")
+                print(f"  Not enough bars for {symbol}: {len(bars)}")
                 continue
             
             closes = [b.get("c", 0) for b in bars if b.get("c")]
             if not closes:
                 continue
             
-            latest_price = closes[-1]
-            prev_close = closes[-2] if len(closes) > 1 else latest_price
+            # Prezzo LIVE (quote intraday) fallback a ultimo close
+            latest_price = latest_prices.get(symbol, closes[-1])
+            
+            prev_close = closes[-1]  # ultimo bar daily close (di ieri)
             change_pct = ((latest_price - prev_close) / prev_close * 100) if prev_close > 0 else 0
             
-            # 20-day return
             if len(closes) >= 21:
                 price_20d_ago = closes[-21]
                 return_20d = ((latest_price - price_20d_ago) / price_20d_ago * 100) if price_20d_ago > 0 else 0
             else:
                 return_20d = 0
             
-            rsi = _calc_rsi(closes)
-            ema20 = _calc_ema(closes, 20)
-            ema50 = _calc_ema(closes, 50) if len(closes) >= 50 else ema20
+            # RSI/EMA su bars daily (usa il latest_price come ultimo punto)
+            closes_with_live = closes[:-1] + [latest_price]  # sostituisce ultimo close con live
+            rsi = _calc_rsi(closes_with_live)
+            ema20 = _calc_ema(closes_with_live, 20)
+            ema50 = _calc_ema(closes_with_live, 50) if len(closes_with_live) >= 50 else ema20
             
             results[symbol] = {
                 "symbol": symbol,
@@ -770,11 +797,12 @@ async def fetch_macro_data_alpaca(symbols: list):
                 "ema20": ema20,
                 "ema50": ema50,
                 "updated_at": datetime.utcnow(),
-                "source": "alpaca_iex",
+                "source": "alpaca_iex_live",
             }
-            print(f"  ✅ {symbol}: ${latest_price} ({change_pct:+.2f}%) RSI {rsi} EMA20 {ema20}")
+            source_note = "LIVE" if symbol in latest_prices else "close"
+            print(f"  {symbol}: ${latest_price:.2f} ({change_pct:+.2f}%) RSI {rsi} [{source_note}]")
         except Exception as e:
-            print(f"  ⚠️ fetch_macro error {symbol}: {e}")
+            print(f"  fetch_macro error {symbol}: {e}")
             continue
     
     return results
