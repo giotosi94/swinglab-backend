@@ -1018,22 +1018,34 @@ class Executor(BaseAgent):
                 print(f"  Executor LLM error: {e}")
 
         # Log decision
+        sw_sl_tp_count = len(sl_tp_result.get("triggered", []))
+        total_sells = len(executed_sells) + sw_sl_tp_count
+        
         await self.log_decision(
             decision_type="execution_complete",
             data={
-                "buys": len(executed_buys), "sells": len(executed_sells),
-                "failed": len(failed_orders), "cancelled_stale": cancelled,
+                "buys": len(executed_buys),
+                "sells": total_sells,
+                "direct_sells": len(executed_sells),
+                "software_sl_tp": sw_sl_tp_count,
+                "failed": len(failed_orders),
+                "cancelled_stale": cancelled,
                 "trailing_adjustments": len(trailing_adjustments),
                 "synced_trades": synced,
                 "sizing_mode": sizing_mode,
-                "market_open": market_status["is_open"], "regime": regime,
+                "market_open": market_status["is_open"],
+                "regime": regime,
             },
-            reasoning=f"Executed {len(executed_buys)} buys, {len(executed_sells)} sells, "
-                      f"{len(trailing_adjustments)} trailing stops, synced {synced}",
+            reasoning=(
+                f"Executed {len(executed_buys)} buys, {total_sells} sells "
+                f"({sw_sl_tp_count} software SL/TP), "
+                f"{len(trailing_adjustments)} trailing stops, synced {synced}"
+            ),
             confidence=80,
         )
 
-        print(f"\n⚡ Executor: {len(executed_buys)} buys, {len(executed_sells)} sells, "
+        print(f"\n⚡ Executor: {len(executed_buys)} buys, {total_sells} sells "
+              f"({sw_sl_tp_count} software SL/TP), "
               f"{len(trailing_adjustments)} trailing stops, {cancelled} stale cancelled, {synced} synced "
               f"[mode={sizing_mode}]")
 
