@@ -71,6 +71,50 @@ async def refresh_all():
     trader_result = await run_auto_trader()
     return {"message": "Full refresh completed", "sectors": len(sectors), "stocks": len(stocks), "auto_trader": trader_result}
 
+@router.get("/tickers/list")
+async def list_all_tickers():
+    """
+    🆕 v4.2 — Ritorna lista di tutti i ticker disponibili con nome azienda.
+    Usato dal frontend per autocomplete search.
+    """
+    from app.services.stock_names import STOCK_NAMES, get_stock_name
+    db = get_db()
+    
+    # Prendi tutti gli asset dal DB
+    assets = await db.assets.find({}, {"ticker": 1, "sector_code": 1}).to_list(300)
+    
+    tickers = []
+    for a in assets:
+        ticker = a.get("ticker", "")
+        if not ticker:
+            continue
+        tickers.append({
+            "ticker": ticker,
+            "name": get_stock_name(ticker),
+            "sector": a.get("sector_code", ""),
+        })
+    
+    # Aggiungi ETF e indici che sono in STOCK_NAMES ma potrebbero non essere in assets
+    existing_tickers = {t["ticker"] for t in tickers}
+    extra_symbols = ["SPY", "QQQ", "IWM", "DIA", "XLK", "XLF", "XLV", "XLI", 
+                     "XLY", "XLP", "XLE", "XLU", "XLB", "XLRE", "XLC", 
+                     "VIXY", "FXE", "UUP", "TLT", "HYG", "LQD", "GLD", "USO",
+                     "RSP", "IWO", "EEM", "IYT", "VXX"]
+    for sym in extra_symbols:
+        if sym not in existing_tickers and sym in STOCK_NAMES:
+            tickers.append({
+                "ticker": sym,
+                "name": STOCK_NAMES[sym],
+                "sector": "ETF",
+            })
+    
+    # Sort by ticker
+    tickers.sort(key=lambda x: x["ticker"])
+    
+    return {
+        "total": len(tickers),
+        "tickers": tickers,
+    }
 
 @router.get("/search/{ticker}")
 async def search_stock(ticker: str):
