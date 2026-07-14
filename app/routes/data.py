@@ -71,6 +71,56 @@ async def refresh_all():
     trader_result = await run_auto_trader()
     return {"message": "Full refresh completed", "sectors": len(sectors), "stocks": len(stocks), "auto_trader": trader_result}
 
+@router.post("/refresh/market")
+async def refresh_market_data():
+    """
+    🆕 v4.2 — Aggiorna macro data (SPY, QQQ, VXX, TLT, GLD, ecc.) da Alpaca IEX.
+    Bypass Twelve Data che ha ETF stale.
+    Popola market_regime collection con prezzi live + RSI/EMA calcolati.
+    """
+    from app.services.alpaca_trader import fetch_macro_data_alpaca
+    from datetime import datetime
+    
+    db = get_db()
+    
+    # Lista macro ETF + indici
+    macro_symbols = [
+        "SPY", "QQQ", "IWM", "DIA",
+        "VXX", "VIXY",
+        "TLT", "HYG", "LQD",
+        "GLD", "USO",
+        "RSP", "IWO",
+        "FXE", "UUP",
+        "EEM", "IYT",
+    ]
+    
+    print(f"🔄 Refreshing {len(macro_symbols)} macro symbols from Alpaca IEX...")
+    
+    results = await fetch_macro_data_alpaca(macro_symbols)
+    
+    updated_count = 0
+    failed = []
+    for symbol, data in results.items():
+        try:
+            await db.market_regime.update_one(
+                {"symbol": symbol},
+                {"$set": data},
+                upsert=True,
+            )
+            updated_count += 1
+        except Exception as e:
+            failed.append({"symbol": symbol, "error": str(e)})
+            print(f"  ⚠️ DB update error {symbol}: {e}")
+    
+    return {
+        "message": "Market data refreshed",
+        "updated": updated_count,
+        "total_requested": len(macro_symbols),
+        "failed": failed,
+        "source": "alpaca_iex",
+        "refreshed_at": datetime.utcnow().isoformat(),
+    }
+
 @router.get("/tickers/list")
 async def list_all_tickers():
     """
