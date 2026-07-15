@@ -281,34 +281,57 @@ def get_pattern_score_bonus(patterns):
 # ============================================
 
 async def fetch_bars_from_api(client, symbol, limit=252):
-    """Fetch bars: Twelve Data for recent, Alpaca IEX for historical."""
-    # For small requests (incremental refresh), use Twelve Data (more accurate)
-    if limit <= 65:
-        try:
-            url = "https://api.twelvedata.com/time_series"
-            params = {
-                "symbol": symbol,
-                "interval": "1day",
-                "outputsize": str(limit),
-                "apikey": settings.TWELVEDATA_API_KEY,
-            }
-            r = await client.get(url, params=params, timeout=10)
-            if r.status_code == 200:
-                data = r.json()
-                if "values" in data:
-                    bars = []
-                    for v in reversed(data["values"]):
-                        bars.append({
-                            "t": v["datetime"] + "T00:00:00Z",
-                            "o": float(v["open"]),
-                            "h": float(v["high"]),
-                            "l": float(v["low"]),
-                            "c": float(v["close"]),
-                            "v": int(v["volume"]),
-                        })
-                    return bars
-        except Exception:
-            pass
+    """Fetch bars: Alpaca IEX first (fresh), Twelve Data fallback."""
+    # 🔧 v4.3 — Alpaca IEX priority (freschi) invece di Twelve Data (stale)
+    end = datetime.utcnow() - timedelta(minutes=20)
+    start = end - timedelta(days=400)
+    url = f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/bars"
+    params = {
+        "timeframe": "1Day",
+        "start": start.strftime("%Y-%m-%dT00:00:00Z"),
+        "end": end.strftime("%Y-%m-%dT23:59:59Z"),
+        "limit": limit,
+        "feed": "iex",
+        "adjustment": "split",
+    }
+    try:
+        r = await client.get(url, headers=ALPACA_HEADERS, params=params)
+        if r.status_code == 200:
+            data = r.json()
+            bars = data.get("bars", [])
+            if bars:
+                return bars
+    except Exception as e:
+        print(f"  Alpaca error {symbol}: {e}")
+
+    # Fallback: Twelve Data (solo se Alpaca fallisce)
+    try:
+        url = "https://api.twelvedata.com/time_series"
+        params = {
+            "symbol": symbol,
+            "interval": "1day",
+            "outputsize": str(limit),
+            "apikey": settings.TWELVEDATA_API_KEY,
+        }
+        r = await client.get(url, params=params, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            if "values" in data:
+                bars = []
+                for v in reversed(data["values"]):
+                    bars.append({
+                        "t": v["datetime"] + "T00:00:00Z",
+                        "o": float(v["open"]),
+                        "h": float(v["high"]),
+                        "l": float(v["low"]),
+                        "c": float(v["close"]),
+                        "v": int(v["volume"]),
+                    })
+                return bars
+    except Exception:
+        pass
+
+    return []
 
     # Fallback / bulk: use Alpaca IEX
     end = datetime.utcnow() - timedelta(minutes=20)
@@ -363,7 +386,16 @@ async def get_or_fetch_bars(client, db, symbol):
         except:
             days_old = 999
 
-        if days_old <= 1:
+        # 🔧 v4.3 — Force refresh se cache vecchia di più di 4 ore (era 1 giorno)
+        # Verifica solo timestamp updated_at invece di last_bar date
+        last_update = doc.get("updated_at")
+        if last_update:
+            hours_since_update = (datetime.utcnow() - last_update).total_seconds() / 3600
+            if hours_since_update < 4:  # Cache valida solo per 4 ore
+                return _bars_to_df(doc["bars"])
+        
+        # Altrimenti fetch fresh (era: if days_old <= 1)
+        # (rimossa la logica days_old che era buggy)
             return _bars_to_df(doc["bars"])
 
         fetch_limit = min(days_old + 5, 65)
