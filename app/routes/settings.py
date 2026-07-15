@@ -178,3 +178,216 @@ async def save_settings(s: SettingsModel):
         "capital_source": "alpaca",
         "apm_enabled": s.apm_enabled,
     }
+
+
+
+# ============================================
+# v4.3 — RISK PROFILE PRESETS
+# ============================================
+
+RISK_PRESETS = {
+    "conservative": {
+        "name": "Conservativo",
+        "emoji": "🛡️",
+        "description": "Bassa esposizione, alta protezione. Ideale per iniziare.",
+        "expected_return": "+8-12% annuo",
+        "max_drawdown": "< 5%",
+        "settings": {
+            "max_positions": 5,
+            "max_position_pct": 15.0,
+            "position_size_pct": 8.0,
+            "risk_pct_per_trade": 1.0,
+            "min_risk_reward": 2.0,
+            "max_per_sector": 1,
+            "daily_loss_limit_pct": -2.0,
+            "weekly_loss_limit_pct": -3.0,
+            "min_cash_reserve_pct": 20.0,
+            "dps_enabled": True,
+            "dps_max_multiplier": 1.2,
+            "dps_min_multiplier": 0.6,
+            "dps_aggressiveness": 0.7,
+            "kelly_enabled": False,
+            "apm_exit_confluence_threshold": 40,
+            "apm_exit_ml_threshold": 45,
+            "apm_target_1_pct": 4.0,
+            "apm_target_2_pct": 7.0,
+            "apm_target_3_pct": 12.0,
+            "apm_check_interval_hours": 2,
+        }
+    },
+    "moderate": {
+        "name": "Moderato",
+        "emoji": "🎯",
+        "description": "Bilanciato tra rischio e rendimento.",
+        "expected_return": "+15-25% annuo",
+        "max_drawdown": "5-10%",
+        "settings": {
+            "max_positions": 8,
+            "max_position_pct": 20.0,
+            "position_size_pct": 12.0,
+            "risk_pct_per_trade": 2.0,
+            "min_risk_reward": 1.5,
+            "max_per_sector": 2,
+            "daily_loss_limit_pct": -3.0,
+            "weekly_loss_limit_pct": -5.0,
+            "min_cash_reserve_pct": 10.0,
+            "dps_enabled": True,
+            "dps_max_multiplier": 1.4,
+            "dps_min_multiplier": 0.6,
+            "dps_aggressiveness": 1.0,
+            "kelly_enabled": True,
+            "kelly_fractional_factor": 0.20,
+            "apm_exit_confluence_threshold": 30,
+            "apm_exit_ml_threshold": 40,
+            "apm_target_1_pct": 5.0,
+            "apm_target_2_pct": 10.0,
+            "apm_target_3_pct": 20.0,
+            "apm_check_interval_hours": 1,
+        }
+    },
+    "aggressive": {
+        "name": "Aggressivo",
+        "emoji": "⚡",
+        "description": "Alta esposizione. Per investitori esperti.",
+        "expected_return": "+25-40% annuo",
+        "max_drawdown": "10-15%",
+        "settings": {
+            "max_positions": 12,
+            "max_position_pct": 25.0,
+            "position_size_pct": 18.0,
+            "risk_pct_per_trade": 3.0,
+            "min_risk_reward": 1.3,
+            "max_per_sector": 3,
+            "daily_loss_limit_pct": -5.0,
+            "weekly_loss_limit_pct": -8.0,
+            "min_cash_reserve_pct": 5.0,
+            "dps_enabled": True,
+            "dps_max_multiplier": 1.6,
+            "dps_min_multiplier": 0.5,
+            "dps_aggressiveness": 1.3,
+            "kelly_enabled": True,
+            "kelly_fractional_factor": 0.25,
+            "apm_exit_confluence_threshold": 25,
+            "apm_exit_ml_threshold": 35,
+            "apm_target_1_pct": 6.0,
+            "apm_target_2_pct": 12.0,
+            "apm_target_3_pct": 25.0,
+            "apm_check_interval_hours": 1,
+        }
+    },
+    "super_aggressive": {
+        "name": "Super Aggressivo",
+        "emoji": "🚀",
+        "description": "Massima esposizione. Alta volatilita. Solo pro.",
+        "expected_return": "+35-60% annuo",
+        "max_drawdown": "> 15%",
+        "settings": {
+            "max_positions": 15,
+            "max_position_pct": 30.0,
+            "position_size_pct": 22.0,
+            "risk_pct_per_trade": 4.0,
+            "min_risk_reward": 1.2,
+            "max_per_sector": 4,
+            "daily_loss_limit_pct": -7.0,
+            "weekly_loss_limit_pct": -12.0,
+            "min_cash_reserve_pct": 3.0,
+            "dps_enabled": True,
+            "dps_max_multiplier": 1.8,
+            "dps_min_multiplier": 0.4,
+            "dps_aggressiveness": 1.6,
+            "kelly_enabled": True,
+            "kelly_fractional_factor": 0.35,
+            "apm_exit_confluence_threshold": 20,
+            "apm_exit_ml_threshold": 30,
+            "apm_target_1_pct": 7.0,
+            "apm_target_2_pct": 15.0,
+            "apm_target_3_pct": 30.0,
+            "apm_check_interval_hours": 1,
+        }
+    },
+}
+
+
+@router.get("/presets")
+async def get_risk_presets():
+    """v4.3 Ritorna tutti i 4 preset di rischio disponibili."""
+    return {
+        "presets": RISK_PRESETS,
+        "current": await get_current_preset_name(),
+    }
+
+
+async def get_current_preset_name():
+    """Determina quale preset e attualmente attivo (best match)."""
+    db = get_db()
+    current = await db.app_settings.find_one({"_id": "risk_params"})
+    if not current:
+        return None
+    
+    max_pos = current.get("max_positions", 8)
+    if max_pos <= 5:
+        return "conservative"
+    elif max_pos <= 8:
+        return "moderate"
+    elif max_pos <= 12:
+        return "aggressive"
+    else:
+        return "super_aggressive"
+
+
+@router.post("/preset/{preset_name}")
+async def apply_risk_preset(preset_name: str):
+    """v4.3 Applica un preset di rischio (aggiorna tutte le settings)."""
+    if preset_name not in RISK_PRESETS:
+        return {"error": f"Preset '{preset_name}' non trovato", "available": list(RISK_PRESETS.keys())}
+    
+    preset = RISK_PRESETS[preset_name]
+    settings_data = preset["settings"]
+    
+    db = get_db()
+    
+    # 1. Aggiorna DB app_settings
+    await db.app_settings.update_one(
+        {"_id": "risk_params"},
+        {"$set": settings_data},
+        upsert=True,
+    )
+    
+    # 2. Propaga a tutti gli agenti
+    await db.agent_memory_risk_manager.update_one(
+        {"_id": "params"},
+        {"$set": {k: v for k, v in settings_data.items() if k.startswith(("max_", "risk_", "min_risk", "position_", "daily_", "weekly_", "kelly_", "dps_"))}},
+        upsert=True,
+    )
+    
+    await db.agent_memory_alpha_strategist.update_one(
+        {"_id": "params"},
+        {"$set": {
+            "max_candidates": settings_data.get("max_positions", 8) * 2,
+            "max_positions": settings_data.get("max_positions", 8),
+        }},
+        upsert=True,
+    )
+    
+    await db.agent_memory_executor.update_one(
+        {"_id": "params"},
+        {"$set": {
+            "max_positions": settings_data.get("max_positions", 8),
+        }},
+        upsert=True,
+    )
+    
+    await db.agent_memory_adaptive_position_manager.update_one(
+        {"_id": "params"},
+        {"$set": {k: v for k, v in settings_data.items() if k.startswith("apm_")}},
+        upsert=True,
+    )
+    
+    print(f"Applied risk preset: {preset_name}")
+    
+    return {
+        "message": f"Preset {preset['name']} applicato con successo",
+        "preset": preset_name,
+        "settings_applied": len(settings_data),
+        "description": preset["description"],
+    }
