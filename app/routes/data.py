@@ -71,6 +71,21 @@ async def refresh_all():
     trader_result = await run_auto_trader()
     return {"message": "Full refresh completed", "sectors": len(sectors), "stocks": len(stocks), "auto_trader": trader_result}
 
+@router.post("/wipe/sector-bars")
+async def wipe_sector_bars():
+    """v4.3 — Wipe cache bars di sectors ETF per force refresh fresh."""
+    db = get_db()
+    sector_etfs = ["XLK", "XLF", "XLV", "XLI", "XLY", "XLP", 
+                   "XLE", "XLU", "XLB", "XLRE", "XLC"]
+    
+    result = await db.stock_bars.delete_many({"ticker": {"$in": sector_etfs}})
+    
+    return {
+        "message": "Sector ETF bars cache wiped",
+        "deleted": result.deleted_count,
+        "sectors": sector_etfs,
+    }
+
 @router.post("/refresh/market")
 async def refresh_market_data():
     """
