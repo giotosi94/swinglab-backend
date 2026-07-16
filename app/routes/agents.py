@@ -393,3 +393,118 @@ async def apm_force_run():
         "message": "APM timer reset. Next pipeline will run APM.",
         "reset_at": datetime.utcnow().isoformat(),
     }
+
+
+# ============================================
+# v4.5 — DPS + KELLY ANALYTICS ENDPOINT
+# ============================================
+
+@router.get("/dps/status")
+async def dps_kelly_status():
+    """Ritorna stato completo DPS + Kelly: params, trade stats, sizing history."""
+    from app.db.mongodb import get_db
+    from datetime import datetime, timedelta
+    
+    db = get_db()
+    
+    # 1. Params correnti DPS + Kelly
+    risk_params = await db.agent_memory_risk_manager.find_one({"_id": "params"})
+    params = risk_params or {}
+    
+    # 2. Kelly calcolo su trade history
+    trades = await db.trade_history.find({
+        "side": "sell",
+        "pnl_pct": {"$exists": True}
+    }).sort("date", -1).limit(100).to_list(100)
+    
+    n_trades = len(trades)
+    kelly_min = params.get("kelly_min_trades", 20)
+    kelly_active = n_trades >= kelly_min
+    
+    wins = [t for t in trades if t.get("pnl_pct", 0) > 0]
+    losses = [t for t in trades if t.get("pnl_pct", 0) <= 0]
+    
+    win_rate = (len(wins) / n_trades * 100) if n_trades > 0 else 0
+    avg_win = (sum(t.get("pnl_pct", 0) for t in wins) / len(wins)) if wins else 0
+    avg_loss = abs(sum(t.get("pnl_pct", 0) for t in losses) / len(losses)) if losses else 0
+    
+    kelly_pct = 0
+    if avg_win > 0 and avg_loss > 0 and wins and losses:
+        wr = win_rate / 100
+        lr = 1 - wr
+        kelly_pct = (wr * avg_win - lr * avg_loss) / avg_win * 100
+    
+    fractional_factor = params.get("kelly_fractional_factor", 0.25)
+    fractional_kelly = max(0, kelly_pct * fractional_factor)
+    
+    # 3. Ultimo risk report (per multipliers correnti)
+    alpaca_state = await db.auto_trader.find_one({"_id": "alpaca_state"})
+    latest_risk = alpaca_state.get("risk_report", {}) if alpaca_state else {}
+    
+    # 4. Ultime 30 decisions trade_approved con DPS info
+    decisions = await db.agent_decisions_risk_manager.find({
+        "type": "trade_approved",
+        "created_at": {"$gte": datetime.utcnow() - timedelta(days=30)}
+    }).sort("created_at", -1).limit(30).to_list(30)
+    
+    sizing_history = []
+    for d in decisions:
+        data = d.get("data", {})
+        sizing_history.append({
+            "ticker": data.get("ticker"),
+            "notional_usd": data.get("notional_usd", 0),
+            "dps_multiplier": data.get("dps_multiplier", 1.0),
+            "kelly_multiplier": data.get("kelly_multiplier", 1.0),
+            "confluence": data.get("confluence", 0),
+            "risk_reward": data.get("risk_reward", 0),
+            "date": d.get("created_at").isoformat() if d.get("created_at") else "",
+        })
+    
+    # 5. Distribution multipliers
+    multipliers_dist = {}
+    for s in sizing_history:
+        mult = s["dps_multiplier"]
+        bucket = round(mult * 10) / 10  # 0.1 precision
+        multipliers_dist[str(bucket)] = multipliers_dist.get(str(bucket), 0) + 1
+    
+    avg_dps_mult = sum(s["dps_multiplier"] for s in sizing_history) / len(sizing_history) if sizing_history else 1.0
+    avg_kelly_mult = sum(s["kelly_multiplier"] for s in sizing_history) / len(sizing_history) if sizing_history else 1.0
+    
+    return {
+        "params": {
+            "dps_enabled": params.get("dps_enabled", True),
+            "dps_rr_ideal": params.get("dps_rr_ideal", 2.5),
+            "dps_ml_ideal": params.get("dps_ml_ideal", 75.0),
+            "dps_conf_ideal": params.get("dps_conf_ideal", 55.0),
+            "dps_max_multiplier": params.get("dps_max_multiplier", 1.6),
+            "dps_aggressiveness": params.get("dps_aggressiveness", 1.0),
+            "kelly_enabled": params.get("kelly_enabled", True),
+            "kelly_min_trades": kelly_min,
+            "kelly_fractional_factor": fractional_factor,
+        },
+        "kelly_status": {
+            "active": kelly_active,
+            "n_trades": n_trades,
+            "trades_needed": max(0, kelly_min - n_trades),
+            "win_rate": round(win_rate, 1),
+            "avg_win": round(avg_win, 2),
+            "avg_loss": round(avg_loss, 2),
+            "kelly_pct": round(kelly_pct, 2),
+            "fractional_kelly": round(fractional_kelly, 2),
+            "current_multiplier": latest_risk.get("kelly_multiplier", 1.0),
+        },
+        "current_risk_report": {
+            "kelly_multiplier": latest_risk.get("kelly_multiplier", 1.0),
+            "position_size_pct": latest_risk.get("position_size_pct", 12.0),
+            "risk_per_trade_usd": latest_risk.get("risk_per_trade_usd", 0),
+            "final_multiplier": latest_risk.get("final_multiplier", 0.6),
+        },
+        "sizing_history": sizing_history,
+        "multipliers_distribution": multipliers_dist,
+        "stats": {
+            "avg_dps_multiplier": round(avg_dps_mult, 3),
+            "avg_kelly_multiplier": round(avg_kelly_mult, 3),
+            "total_approved_30d": len(sizing_history),
+        },
+        "generated_at": datetime.utcnow().isoformat(),
+    }
