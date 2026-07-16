@@ -31,7 +31,7 @@ class Executor(BaseAgent):
     def default_params(self) -> dict:
         return {
             "limit_price_buffer_pct": 0.5,
-            "stale_order_hours": 24,
+            "stale_order_hours": 2,
             "send_telegram": True,
             "allow_premarket": False,
             "trailing_level_1_pct": 5.0,
@@ -75,7 +75,7 @@ class Executor(BaseAgent):
         - side=sell + type=stop/limit → SL o TP di posizione aperta → MAI cancellare
         - Tutto il resto → log e skip
         """
-        stale_hours = params.get("stale_order_hours", 24)
+        stale_hours = params.get("stale_order_hours", 2)
         cutoff = datetime.utcnow() - timedelta(hours=stale_hours)
         cancelled = 0
         skipped_sl_tp = 0
