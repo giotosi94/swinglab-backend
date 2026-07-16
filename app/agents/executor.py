@@ -854,13 +854,33 @@ class Executor(BaseAgent):
                             "executed_at": datetime.utcnow().isoformat(),
                         })
                         
+                        # 🆕 v4.6 — Calcola target adattivi basati su Alpha analysis
+                        entry_ref = avg_price
+                        sl_distance_pct = ((entry_ref - stop) / entry_ref * 100) if entry_ref > 0 else 4.0
+                        target_distance_pct = ((target - entry_ref) / entry_ref * 100) if entry_ref > 0 else 8.0
+                        
+                        # Cap safety: min 2% max 40%
+                        target_distance_pct = max(2.0, min(40.0, target_distance_pct))
+                        sl_distance_pct = max(1.0, min(15.0, sl_distance_pct))
+                        
+                        # Adaptive scale-out targets (frazione del target completo)
+                        adaptive_t1_pct = round(target_distance_pct * 0.40, 2)  # 40% del percorso
+                        adaptive_t2_pct = round(target_distance_pct * 0.70, 2)  # 70% del percorso
+                        adaptive_t3_pct = round(target_distance_pct * 1.00, 2)  # 100% target Alpha
+                        
                         await db.trade_history.insert_one({
                             "ticker": ticker, "side": "buy",
                             "sizing_mode": "notional",
                             "notional_usd": notional_usd,
                             "entry_price": avg_price,
-                            "shares": filled_qty,  # float
+                            "shares": filled_qty,
                             "target": target, "stop_loss": stop,
+                            "target_distance_pct": round(target_distance_pct, 2),
+                            "sl_distance_pct": round(sl_distance_pct, 2),
+                            # 🆕 v4.6 Adaptive targets APM
+                            "adaptive_t1_pct": adaptive_t1_pct,
+                            "adaptive_t2_pct": adaptive_t2_pct,
+                            "adaptive_t3_pct": adaptive_t3_pct,
                             "confluence": t.get("confluence", 0),
                             "setup_type": t.get("setup_type", ""),
                             "sector": t.get("sector", ""),
@@ -873,6 +893,8 @@ class Executor(BaseAgent):
                             "date": datetime.utcnow(),
                             "sell_linked": False,
                         })
+                        
+                        print(f"  🎯 {ticker} adaptive: T1=+{adaptive_t1_pct}% T2=+{adaptive_t2_pct}% T3=+{adaptive_t3_pct}% (target=+{target_distance_pct:.1f}%)")
                         
                         from app.services.stock_names import get_stock_name
                         stock_name = get_stock_name(ticker)
