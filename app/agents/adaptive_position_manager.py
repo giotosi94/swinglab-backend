@@ -118,6 +118,20 @@ class AdaptivePositionManager(BaseAgent):
             
             # Check se già scaled out (per non ripetere stesso target)
             # Check se già scaled out (per non ripetere stesso target)
+            # 🆕 v4.6 — Adaptive targets: usa quelli calcolati al buy, fallback su params
+            adaptive_t1 = buy_trade.get("adaptive_t1_pct")
+            adaptive_t2 = buy_trade.get("adaptive_t2_pct")
+            adaptive_t3 = buy_trade.get("adaptive_t3_pct")
+            
+            # Override params solo se disponibili nel buy (fallback per trade vecchi)
+            if adaptive_t1 and adaptive_t1 > 0:
+                t1_pct_local = adaptive_t1
+                t2_pct_local = adaptive_t2 if adaptive_t2 else t2_pct
+                t3_pct_local = adaptive_t3 if adaptive_t3 else t3_pct
+            else:
+                t1_pct_local = t1_pct
+                t2_pct_local = t2_pct
+                t3_pct_local = t3_pct
             last_target_hit = buy_trade.get("last_target_hit", 0)
             partial_scaled_out = buy_trade.get("partial_scaled_out", False)
             
@@ -134,21 +148,21 @@ class AdaptivePositionManager(BaseAgent):
             # ============================================
             # TRIGGER CHECK (in ordine: T3 → T2 → T1 → drop)
             # ============================================
-            if scaling_enabled and pnl_pct >= t3_pct and last_target_hit < 3:
+            if scaling_enabled and pnl_pct >= t3_pct_local and last_target_hit < 3:
                 action = "SCALE_OUT"
                 target_num = 3
                 size_pct = t3_size
-                reason = f"URGENT T3 hit (+{pnl_pct:.1f}% >= +{t3_pct}%)"
-            elif scaling_enabled and pnl_pct >= t2_pct and last_target_hit < 2:
+                reason = f"URGENT T3 hit (+{pnl_pct:.1f}% >= +{t3_pct_local}% adaptive)"
+            elif scaling_enabled and pnl_pct >= t2_pct_local and last_target_hit < 2:
                 action = "SCALE_OUT"
                 target_num = 2
                 size_pct = t2_size
-                reason = f"URGENT T2 hit (+{pnl_pct:.1f}% >= +{t2_pct}%)"
-            elif scaling_enabled and pnl_pct >= t1_pct and last_target_hit < 1:
+                reason = f"URGENT T2 hit (+{pnl_pct:.1f}% >= +{t2_pct_local}% adaptive)"
+            elif scaling_enabled and pnl_pct >= t1_pct_local and last_target_hit < 1:
                 action = "SCALE_OUT"
                 target_num = 1
                 size_pct = t1_size
-                reason = f"URGENT T1 hit (+{pnl_pct:.1f}% >= +{t1_pct}%)"
+                reason = f"URGENT T1 hit (+{pnl_pct:.1f}% >= +{t1_pct_local}% adaptive)"
             elif pnl_pct <= -urgent_drop_pct:
                 # Drop critico → NON EXIT automatico, ma logga per next full analysis
                 # Meglio non fare EXIT senza confluence check
@@ -334,6 +348,8 @@ class AdaptivePositionManager(BaseAgent):
             # ============================================
             # DECISION LOGIC
             # ============================================
+            # 🆕 v4.6 — Salva buy_trade per accesso adaptive targets in _decide_action
+            self._current_buy_trade = buy_trade
             decision_result = self._decide_action(
                 pos=pos,
                 pnl_pct=pnl_pct,
@@ -502,6 +518,15 @@ class AdaptivePositionManager(BaseAgent):
         Logica decisionale APM.
         Ritorna: {"decision": "...", "reason": "...", "details": {...}}
         """
+        # 🆕 v4.6 — Adaptive targets (letti da self._current_buy_trade se disponibile)
+        buy_trade_ref = getattr(self, "_current_buy_trade", None)
+        if buy_trade_ref:
+            adaptive_t1 = buy_trade_ref.get("adaptive_t1_pct")
+            adaptive_t2 = buy_trade_ref.get("adaptive_t2_pct")
+            adaptive_t3 = buy_trade_ref.get("adaptive_t3_pct")
+        else:
+            adaptive_t1 = adaptive_t2 = adaptive_t3 = None
+        
         # Soglie base
         exit_conf_th_base = params.get("apm_exit_confluence_threshold", 30)
         exit_ml_th_base = params.get("apm_exit_ml_threshold", 40)
@@ -529,7 +554,6 @@ class AdaptivePositionManager(BaseAgent):
         exit_conf_th = max(15, min(50, exit_conf_th_base + adj["conf"]))
         exit_ml_th = max(20, min(60, exit_ml_th_base + adj["ml"]))
         
-        min_negative = params.get("apm_exit_min_negative_factors", 2)
         min_negative = params.get("apm_exit_min_negative_factors", 2)
         
         # 🆕 v1.1 — Detect "ML flat" (bug fix)
@@ -580,9 +604,9 @@ class AdaptivePositionManager(BaseAgent):
         # 🟡 SCALE_OUT (multi-target)
         # ============================================
         if params.get("apm_scaling_enabled", True):
-            t1_pct = params.get("apm_target_1_pct", 5.0)
-            t2_pct = params.get("apm_target_2_pct", 10.0)
-            t3_pct = params.get("apm_target_3_pct", 20.0)
+            t1_pct = adaptive_t1 if adaptive_t1 else params.get("apm_target_1_pct", 5.0)
+            t2_pct = adaptive_t2 if adaptive_t2 else params.get("apm_target_2_pct", 10.0)
+            t3_pct = adaptive_t3 if adaptive_t3 else params.get("apm_target_3_pct", 20.0)
             t1_size = params.get("apm_target_1_size", 50)
             t2_size = params.get("apm_target_2_size", 30)
             t3_size = params.get("apm_target_3_size", 20)
