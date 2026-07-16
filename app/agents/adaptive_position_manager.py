@@ -117,7 +117,14 @@ class AdaptivePositionManager(BaseAgent):
                 continue
             
             # Check se già scaled out (per non ripetere stesso target)
+            # Check se già scaled out (per non ripetere stesso target)
             last_target_hit = buy_trade.get("last_target_hit", 0)
+            partial_scaled_out = buy_trade.get("partial_scaled_out", False)
+            
+            # 🔧 v4.4 — Safety net: se già partial_scaled_out ma last_target_hit=0
+            # (bug legacy), forza last_target_hit >= 1 per bloccare re-trigger T1
+            if partial_scaled_out and last_target_hit < 1:
+                last_target_hit = 1
             
             action = None
             reason = None
