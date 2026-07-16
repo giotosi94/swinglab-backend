@@ -225,6 +225,9 @@ class AdaptivePositionManager(BaseAgent):
         
         # Ricava contesto
         market_ctx = context.get("market_context", {})
+        # 🆕 v4.5 — Salva regime per uso in _decide_action
+        self._current_market_regime = market_ctx.get("market_regime", "NEUTRAL")
+        self._current_market_confidence = market_ctx.get("regime_confidence", 50)
         positions = context.get("positions", [])
         ml_map = context.get("ml_map", {})
         
@@ -499,9 +502,34 @@ class AdaptivePositionManager(BaseAgent):
         Logica decisionale APM.
         Ritorna: {"decision": "...", "reason": "...", "details": {...}}
         """
-        # Soglie
-        exit_conf_th = params.get("apm_exit_confluence_threshold", 30)
-        exit_ml_th = params.get("apm_exit_ml_threshold", 40)
+        # Soglie base
+        exit_conf_th_base = params.get("apm_exit_confluence_threshold", 30)
+        exit_ml_th_base = params.get("apm_exit_ml_threshold", 40)
+        
+        # 🆕 v4.5 — APM Regime-Aware: adatta soglie a market regime
+        # Legge da market_context passato dal Orchestrator
+        # Non altera params in DB, solo runtime
+        market_regime = "NEUTRAL"
+        regime_confidence = 50
+        try:
+            # Se disponibile nel context (aggiunto in analyze() sopra)
+            market_regime = getattr(self, "_current_market_regime", "NEUTRAL")
+            regime_confidence = getattr(self, "_current_market_confidence", 50)
+        except:
+            pass
+        
+        # Adatta soglie in base al regime
+        regime_multipliers = {
+            "BULL": {"conf": -10, "ml": -10},      # meno aggressivo (esce solo se davvero rotto)
+            "NEUTRAL": {"conf": 0, "ml": 0},       # comportamento standard
+            "BEAR": {"conf": +10, "ml": +10},      # più aggressivo (esce prima)
+            "CRASH": {"conf": +15, "ml": +15},     # molto aggressivo (protegge capitale)
+        }
+        adj = regime_multipliers.get(market_regime, {"conf": 0, "ml": 0})
+        exit_conf_th = max(15, min(50, exit_conf_th_base + adj["conf"]))
+        exit_ml_th = max(20, min(60, exit_ml_th_base + adj["ml"]))
+        
+        min_negative = params.get("apm_exit_min_negative_factors", 2)
         min_negative = params.get("apm_exit_min_negative_factors", 2)
         
         # 🆕 v1.1 — Detect "ML flat" (bug fix)
