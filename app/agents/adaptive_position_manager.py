@@ -611,11 +611,18 @@ class AdaptivePositionManager(BaseAgent):
             t2_size = params.get("apm_target_2_size", 30)
             t3_size = params.get("apm_target_3_size", 20)
             
+            # 🔧 v4.7 — Fix critico: leggi last_target_hit per evitare ripetizioni
+            last_target_hit = buy_trade_ref.get("last_target_hit", 0) if buy_trade_ref else 0
+            partial_scaled_out = buy_trade_ref.get("partial_scaled_out", False) if buy_trade_ref else False
+            # Safety net: se partial ma last_target_hit=0 (legacy), forza a 1
+            if partial_scaled_out and last_target_hit < 1:
+                last_target_hit = 1
+            
             # Ha già raggiunto qualche target?
             # (Per ora semplice check: se pnl_pct >= t3, target 3; se >= t2, target 2; ecc.)
             # In produzione futura terremo track di quali target sono già stati raggiunti
             
-            if pnl_pct >= t3_pct:
+            if pnl_pct >= t3_pct and last_target_hit < 3:
                 return {
                     "decision": "SCALE_OUT",
                     "reason": (
@@ -624,7 +631,7 @@ class AdaptivePositionManager(BaseAgent):
                     ),
                     "details": {"target_hit": 3, "size_pct": t3_size},
                 }
-            elif pnl_pct >= t2_pct:
+            elif pnl_pct >= t2_pct and last_target_hit < 2:
                 return {
                     "decision": "SCALE_OUT",
                     "reason": (
@@ -633,7 +640,7 @@ class AdaptivePositionManager(BaseAgent):
                     ),
                     "details": {"target_hit": 2, "size_pct": t2_size},
                 }
-            elif pnl_pct >= t1_pct:
+            elif pnl_pct >= t1_pct and last_target_hit < 1:
                 return {
                     "decision": "SCALE_OUT",
                     "reason": (
