@@ -461,3 +461,64 @@ async def get_starting_capital():
         "source": "alpaca_portfolio_history",
         "calculated_at": datetime.utcnow().isoformat(),
     }
+
+
+
+# ============================================
+# v4.6 — BACKFILL ADAPTIVE TARGETS
+# ============================================
+
+@router.post("/backfill/adaptive-targets")
+async def backfill_adaptive_targets():
+    """v4.6 One-shot: calcola adaptive targets per buy_trade esistenti."""
+    from datetime import datetime as dt
+    db = get_db()
+    
+    # Trova tutti i buy attivi senza adaptive_t1_pct
+    buys = await db.trade_history.find({
+        "side": "buy",
+        "sell_linked": {"$ne": True},
+        "adaptive_t1_pct": {"$exists": False}
+    }).to_list(100)
+    
+    updated = 0
+    skipped = []
+    for buy in buys:
+        entry_price = buy.get("entry_price", 0)
+        target = buy.get("target", 0)
+        stop = buy.get("stop_loss", 0)
+        ticker = buy.get("ticker", "?")
+        
+        if entry_price <= 0 or target <= 0:
+            skipped.append({"ticker": ticker, "reason": "invalid entry/target"})
+            continue
+        
+        target_distance_pct = ((target - entry_price) / entry_price * 100)
+        target_distance_pct = max(2.0, min(40.0, target_distance_pct))
+        
+        sl_distance_pct = ((entry_price - stop) / entry_price * 100) if stop > 0 else 4.0
+        sl_distance_pct = max(1.0, min(15.0, sl_distance_pct))
+        
+        adaptive_t1_pct = round(target_distance_pct * 0.40, 2)
+        adaptive_t2_pct = round(target_distance_pct * 0.70, 2)
+        adaptive_t3_pct = round(target_distance_pct * 1.00, 2)
+        
+        await db.trade_history.update_one(
+            {"_id": buy["_id"]},
+            {"$set": {
+                "adaptive_t1_pct": adaptive_t1_pct,
+                "adaptive_t2_pct": adaptive_t2_pct,
+                "adaptive_t3_pct": adaptive_t3_pct,
+                "target_distance_pct": round(target_distance_pct, 2),
+                "sl_distance_pct": round(sl_distance_pct, 2),
+                "backfilled_at": dt.utcnow(),
+            }}
+        )
+        updated += 1
+    
+    return {
+        "message": "Backfill completed",
+        "updated": updated,
+        "total_buys": len(buys),
+        "skipped": skipped,
+    }
