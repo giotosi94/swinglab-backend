@@ -273,6 +273,146 @@ class SwingLabModel:
             labels.append(label)
         return features_list, labels
 
+    async def train_hybrid(self, real_weight=3):
+        """
+        v2.0 Hybrid training:
+        - Real trades DEDUPLICATED by buy_order_id (peso real_weight)
+        - Backtest trades from ml_training_data collection (peso 1)
+        Evita il bias dei scale-out T1 duplicati.
+        """
+        if not HAS_SKLEARN:
+            return {"error": "scikit-learn not installed"}
+
+        print("\nML HYBRID TRAINING v2.0")
+        print("=" * 50)
+        db = get_db()
+
+        # ===== 1. REAL TRADES — deduplicated by buy_order_id =====
+        real_trades = await db.trade_history.find(
+            {"side": "sell", "pnl_pct": {"$exists": True}}
+        ).to_list(length=5000)
+
+        # Aggrega per buy_order_id: 1 posizione = 1 sample
+        positions = {}
+        for t in real_trades:
+            boid = t.get("buy_order_id", "")
+            if not boid:
+                continue
+            if boid not in positions:
+                positions[boid] = {
+                    "total_pnl_dollar": 0,
+                    "sample_trade": t,
+                    "rsi": t.get("rsi_at_entry"),
+                }
+            positions[boid]["total_pnl_dollar"] += t.get("pnl_dollar", 0)
+            # preferisci trade con rsi_at_entry per features migliori
+            if t.get("rsi_at_entry") and not positions[boid]["rsi"]:
+                positions[boid]["rsi"] = t.get("rsi_at_entry")
+                positions[boid]["sample_trade"] = t
+
+        real_features = []
+        real_labels = []
+        for boid, pos in positions.items():
+            try:
+                feats = extract_features_from_trade(pos["sample_trade"])
+                arr = features_to_array(feats)
+                label = 1 if pos["total_pnl_dollar"] > 0 else 0
+                real_features.append(arr)
+                real_labels.append(label)
+            except Exception as e:
+                print(f"  Skip position {boid}: {e}")
+                continue
+
+        print(f"  Real: {len(real_trades)} trades -> {len(real_features)} unique positions")
+        print(f"  Real wins: {sum(real_labels)}, losses: {len(real_labels) - sum(real_labels)}")
+
+        # ===== 2. BACKTEST TRADES from ml_training_data =====
+        bt_docs = await db.ml_training_data.find({}).to_list(length=5000)
+        bt_features = []
+        bt_labels = []
+        for doc in bt_docs:
+            try:
+                arr = doc.get("features_array")
+                label = doc.get("label")
+                if arr and label is not None:
+                    bt_features.append(arr)
+                    bt_labels.append(label)
+            except Exception:
+                continue
+
+        print(f"  Backtest: {len(bt_features)} samples")
+
+        # ===== 3. COMBINE with weighting =====
+        # Real trades ripetuti real_weight volte per dare più peso
+        X_list = []
+        y_list = []
+        for _ in range(real_weight):
+            X_list.extend(real_features)
+            y_list.extend(real_labels)
+        X_list.extend(bt_features)
+        y_list.extend(bt_labels)
+
+        if len(X_list) < 20:
+            return {
+                "error": f"Not enough data: {len(X_list)} samples (need 20+). "
+                         f"Run backtest data collector first: POST /api/ml/collect-backtest-data"
+            }
+
+        X = np.array(X_list)
+        y = np.array(y_list)
+        print(f"  Combined dataset: {len(X)} samples (real x{real_weight} + backtest)")
+        print(f"  Win rate: {sum(y) / len(y) * 100:.1f}%")
+
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42,
+            stratify=y if len(set(y)) > 1 else None
+        )
+
+        if HAS_XGB:
+            self.model = xgb.XGBClassifier(
+                n_estimators=150, max_depth=4, learning_rate=0.08,
+                use_label_encoder=False, eval_metric="logloss", random_state=42,
+            )
+        else:
+            self.model = GradientBoostingClassifier(
+                n_estimators=150, max_depth=4, learning_rate=0.08, random_state=42,
+            )
+
+        print("  Training hybrid model...")
+        self.model.fit(X_train, y_train)
+        y_pred = self.model.predict(X_test)
+        accuracy = round(accuracy_score(y_test, y_pred) * 100, 1)
+        precision = round(precision_score(y_test, y_pred, zero_division=0) * 100, 1)
+        recall = round(recall_score(y_test, y_pred, zero_division=0) * 100, 1)
+
+        importances = self.model.feature_importances_
+        feature_names = get_feature_names()
+        importance_dict = {
+            name: round(float(imp), 4)
+            for name, imp in sorted(
+                zip(feature_names, importances), key=lambda x: x[1], reverse=True,
+            )
+        }
+
+        self.is_trained = True
+        self.metadata = {
+            "accuracy": accuracy, "precision": precision, "recall": recall,
+            "n_samples": len(X),
+            "n_real_positions": len(real_features),
+            "n_backtest_samples": len(bt_features),
+            "real_weight": real_weight,
+            "n_wins": int(sum(y)), "n_losses": int(len(y) - sum(y)),
+            "train_date": datetime.utcnow().isoformat(),
+            "feature_importance": importance_dict,
+            "model_type": ("xgboost" if HAS_XGB else "sklearn_gb") + "_hybrid",
+        }
+        await self.save_to_db()
+
+        print(f"  Hybrid model trained! Accuracy: {accuracy}%")
+        print(f"  Top features: {list(importance_dict.keys())[:5]}")
+        print("=" * 50)
+        return {"status": "trained_hybrid", **self.metadata,
+                "top_features": dict(list(importance_dict.items())[:5])}
 
 # ---- Singleton ----
 ml_model = SwingLabModel()
