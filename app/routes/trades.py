@@ -406,11 +406,62 @@ async def get_analytics():
     setup_breakdown.sort(key=lambda x: x["pnl_dollar"], reverse=True)
 
     # ============================================
+    # POSITION-LEVEL WIN RATE (dedup scale-out T1/T2/T3)
+    # ============================================
+    positions = {}
+    for t in trades:
+        key = t.get("buy_order_id") or f"{t.get('ticker','?')}_{str(t.get('entry_date') or t.get('date',''))[:10]}"
+        if key not in positions:
+            positions[key] = {"pnl_dollar": 0, "tranches": 0}
+        positions[key]["pnl_dollar"] += t.get("pnl_dollar", 0)
+        positions[key]["tranches"] += 1
+
+    n_positions = len(positions)
+    winning_positions = sum(1 for p in positions.values() if p["pnl_dollar"] > 0)
+    position_win_rate = round(winning_positions / n_positions * 100, 1) if n_positions > 0 else 0
+
+    # ============================================
+    # DOLLAR-WEIGHTED WIN RATE (peso dei target/capitale)
+    # ============================================
+    gross_win_usd = sum(t.get("pnl_dollar", 0) for t in trades if t.get("pnl_dollar", 0) > 0)
+    gross_all_abs_usd = sum(abs(t.get("pnl_dollar", 0)) for t in trades)
+    dollar_weighted_win_rate = round(gross_win_usd / gross_all_abs_usd * 100, 1) if gross_all_abs_usd > 0 else 0
+
+    # ============================================
+    # EXIT REASON BREAKDOWN (contributo per target/stop)
+    # ============================================
+    reason_stats = {}
+    for t in trades:
+        reason = t.get("reason", "UNKNOWN") or "UNKNOWN"
+        if reason not in reason_stats:
+            reason_stats[reason] = {"count": 0, "pnl_dollar": 0, "wins": 0}
+        reason_stats[reason]["count"] += 1
+        reason_stats[reason]["pnl_dollar"] += t.get("pnl_dollar", 0)
+        if (t.get("pnl_pct") or 0) > 0:
+            reason_stats[reason]["wins"] += 1
+
+    exit_reason_breakdown = []
+    for reason, s in reason_stats.items():
+        exit_reason_breakdown.append({
+            "reason": reason,
+            "count": s["count"],
+            "pct_of_exits": round(s["count"] / total * 100, 1) if total > 0 else 0,
+            "pnl_dollar": round(s["pnl_dollar"], 2),
+            "pnl_contribution_pct": round((s["pnl_dollar"] / starting_capital * 100), 2) if starting_capital > 0 else 0,
+            "win_rate": round(s["wins"] / s["count"] * 100, 1) if s["count"] > 0 else 0,
+        })
+    exit_reason_breakdown.sort(key=lambda x: x["pnl_dollar"], reverse=True)
+
+    # ============================================
     # RETURN
     # ============================================
     return {
         "total_trades": total,
         "win_rate": round(win_rate, 1),
+        "position_win_rate": position_win_rate,
+        "n_positions": n_positions,
+        "dollar_weighted_win_rate": dollar_weighted_win_rate,
+        "exit_reason_breakdown": exit_reason_breakdown,
         "avg_win": round(avg_win, 2),
         "avg_loss": round(avg_loss, 2),
         "expectancy": expectancy,
