@@ -380,6 +380,7 @@ class Executor(BaseAgent):
                     print(f"  📈 {reason} -> ${new_stop}")
         return adjustments
 
+
     # ==========================================
     # Trade Sync v5 — Anti-mismatch fractional/integer
     # ==========================================
