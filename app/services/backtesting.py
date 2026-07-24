@@ -277,6 +277,7 @@ async def run_backtest(
                     "tp": entry_price * (1 + take_profit_pct / 100),
                     "entry_date": date,
                     "confluence": conf,
+                    "last_price": entry_price,
                 }
 
         # 3. Calcola equity totale (cash + posizioni aperte a close)
@@ -286,6 +287,11 @@ async def run_backtest(
             bar = next((b for b in bars if b["date"] == date), None)
             if bar:
                 positions_value += bar["c"] * pos["shares"]
+                pos["last_price"] = bar["c"]  # aggiorna ultimo prezzo noto
+            else:
+                # Bar mancante (gap dati) → usa ultimo prezzo noto, NON zero
+                last_price = pos.get("last_price", pos["entry_price"])
+                positions_value += last_price * pos["shares"]
         total_equity = cash + positions_value
         equity_curve.append({"date": date, "equity": round(total_equity, 2)})
 
