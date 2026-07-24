@@ -403,7 +403,7 @@ async def get_analytics():
             "win_rate": round(s["wins"] / s["total"] * 100, 1) if s["total"] > 0 else 0,
             "pnl": round((s["pnl_dollar"] / starting_capital * 100), 2) if starting_capital > 0 else 0,
         })
-    setup_breakdown.sort(key=lambda x: x["pnl_dollar"], reverse=True)
+    setup_breakdown.sort(key=lambda x: x["pnl"], reverse=True)
 
     # ============================================
     # POSITION-LEVEL WIN RATE (dedup scale-out T1/T2/T3)
