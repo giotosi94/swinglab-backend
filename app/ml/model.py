@@ -111,7 +111,7 @@ class SwingLabModel:
         self.is_trained = True
         self.metadata = {
             "accuracy": accuracy, "precision": precision, "recall": recall,
-            "n_samples": len(X), "n_real_trades": len(trades),
+            "n_samples": len(X), "n_real_positions": len(trades),
             "n_wins": int(sum(y)), "n_losses": int(len(y) - sum(y)),
             "train_date": datetime.utcnow().isoformat(),
             "feature_importance": importance_dict,
@@ -228,7 +228,7 @@ class SwingLabModel:
             "precision": self.metadata.get("precision", 0),
             "recall": self.metadata.get("recall", 0),
             "n_samples": self.metadata.get("n_samples", 0),
-            "n_real_trades": self.metadata.get("n_real_trades", 0),
+            "n_real_positions": self.metadata.get("n_real_positions", self.metadata.get("n_real_trades", 0)),
             "train_date": self.metadata.get("train_date", ""),
             "model_type": self.metadata.get("model_type", "unknown"),
             "top_features": top5,
