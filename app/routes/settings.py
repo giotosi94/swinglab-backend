@@ -25,6 +25,15 @@ class SettingsModel(BaseModel):
     position_size_pct: float = 12.0
     fractionable_only: bool = True
     min_notional_per_trade: float = 100.0
+    min_cash_reserve_pct: float = 10.0
+    dps_enabled: bool = True
+    dps_max_multiplier: float = 1.4
+    dps_min_multiplier: float = 0.6
+    dps_aggressiveness: float = 1.0
+    kelly_enabled: bool = True
+    kelly_fractional_factor: float = 0.20
+    kelly_min_trades: int = 20
+    active_preset: Optional[str] = None
     
     # ===== 🆕 v4.0 — APM (Adaptive Position Manager) =====
     apm_enabled: bool = True
@@ -104,6 +113,14 @@ async def save_settings(s: SettingsModel):
             "position_size_pct": s.position_size_pct,
             "fractionable_only": s.fractionable_only,
             "min_notional_per_trade": s.min_notional_per_trade,
+            "min_cash_reserve_pct": s.min_cash_reserve_pct,
+            "dps_enabled": s.dps_enabled,
+            "dps_max_multiplier": s.dps_max_multiplier,
+            "dps_min_multiplier": s.dps_min_multiplier,
+            "dps_aggressiveness": s.dps_aggressiveness,
+            "kelly_enabled": s.kelly_enabled,
+            "kelly_fractional_factor": s.kelly_fractional_factor,
+            "kelly_min_trades": s.kelly_min_trades,
         }},
         upsert=True,
     )
@@ -324,6 +341,9 @@ async def get_current_preset_name():
     if not current:
         return None
     
+    explicit = current.get("active_preset")
+    if explicit in RISK_PRESETS:
+        return explicit
     max_pos = current.get("max_positions", 8)
     if max_pos <= 5:
         return "conservative"
@@ -342,7 +362,8 @@ async def apply_risk_preset(preset_name: str):
         return {"error": f"Preset '{preset_name}' non trovato", "available": list(RISK_PRESETS.keys())}
     
     preset = RISK_PRESETS[preset_name]
-    settings_data = preset["settings"]
+    settings_data = dict(preset["settings"])
+    settings_data["active_preset"] = preset_name
     
     db = get_db()
     
