@@ -6,6 +6,22 @@ import math
 router = APIRouter()
 
 
+async def _get_starting_capital():
+    """Recupera il capitale iniziale reale da Alpaca (fallback 100000)."""
+    starting_capital = 100000.0
+    try:
+        from app.services.alpaca_trader import get_portfolio_history
+        history = await get_portfolio_history(period="1A", timeframe="1D")
+        if history and history.get("equity"):
+            for eq in history.get("equity", []):
+                if eq and eq > 0:
+                    starting_capital = round(eq, 2)
+                    break
+    except Exception as e:
+        print(f"  starting_capital fetch error: {e}")
+    return starting_capital
+
+
 @router.get("/history")
 async def get_trade_history(limit: int = Query(default=50)):
     """Trade history con P&L in % e $."""
@@ -38,7 +54,7 @@ async def get_trade_history(limit: int = Query(default=50)):
 
 @router.get("/daily")
 async def get_daily_summary():
-    """P&L di oggi."""
+    """P&L di oggi (return reale in $ e % sul capitale)."""
     db = get_db()
     today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
     trades_today = await db.trade_history.find(
@@ -48,7 +64,9 @@ async def get_daily_summary():
     buys = [t for t in trades_today if t.get("side") == "buy"]
     sells = [t for t in trades_today if t.get("side") == "sell"]
 
-    total_pnl_pct = sum(t.get("pnl_pct", 0) for t in sells)
+    starting_capital = await _get_starting_capital()
+    total_pnl_dollar = sum(t.get("pnl_dollar", 0) for t in sells)
+    total_pnl_pct = round((total_pnl_dollar / starting_capital * 100), 2) if starting_capital > 0 else 0
     wins = sum(1 for t in sells if t.get("pnl_pct", 0) > 0)
 
     return {
@@ -57,7 +75,8 @@ async def get_daily_summary():
         "sells": len(sells),
         "wins": wins,
         "losses": len(sells) - wins,
-        "total_pnl_pct": round(total_pnl_pct, 2),
+        "total_pnl_pct": total_pnl_pct,
+        "total_pnl_dollar": round(total_pnl_dollar, 2),
         "trades": [{
             "ticker": t.get("ticker"),
             "side": t.get("side"),
@@ -100,6 +119,7 @@ async def clear_all_trades():
 
 from pydantic import BaseModel
 
+
 class TradeInsert(BaseModel):
     ticker: str
     side: str
@@ -111,6 +131,7 @@ class TradeInsert(BaseModel):
     market_regime: str = "NEUTRAL"
     agent: str = "manual"
 
+
 @router.post("/insert")
 async def insert_trade(trade: TradeInsert):
     db = get_db()
@@ -121,11 +142,15 @@ async def insert_trade(trade: TradeInsert):
 
 
 # ============================================
-# FASE 23: Advanced Analytics
+# FASE 23: Advanced Analytics (v2.0 — equity-based)
 # ============================================
 @router.get("/analytics")
 async def get_analytics():
-    """Sharpe, Sortino, Drawdown, Monthly P&L, Regime/Day/Sector/Setup breakdown."""
+    """
+    Sharpe, Sortino, Drawdown, Monthly P&L, Regime/Day/Sector/Setup breakdown.
+    v2.0 — Tutte le metriche cumulative sono calcolate su equity reale in $,
+    NON sommando percentuali (che era matematicamente errato).
+    """
     db = get_db()
     trades = await db.trade_history.find(
         {"side": "sell"}
@@ -133,6 +158,8 @@ async def get_analytics():
 
     if not trades or len(trades) < 2:
         return {"error": "Not enough trades", "count": len(trades)}
+
+    starting_capital = await _get_starting_capital()
 
     # ============================================
     # BASIC STATS
@@ -148,25 +175,27 @@ async def get_analytics():
 
     avg_win = sum(win_pcts) / len(win_pcts) if win_pcts else 0
     avg_loss = sum(loss_pcts) / len(loss_pcts) if loss_pcts else 0
-    total_pnl_pct = sum(all_pcts)
+
+    # Total P&L: return REALE in $ diviso capitale iniziale (NO somma %)
     total_pnl_dollar = sum(t.get("pnl_dollar", 0) for t in trades)
+    total_pnl_pct = round((total_pnl_dollar / starting_capital * 100), 2) if starting_capital > 0 else 0
 
     # ============================================
-    # EXPECTANCY
+    # EXPECTANCY (edge medio per trade — si legge per trade)
     # ============================================
     wr = win_rate / 100
     lr = 1 - wr
     expectancy = round((wr * avg_win) - (lr * avg_loss), 3)
 
     # ============================================
-    # PROFIT FACTOR
+    # PROFIT FACTOR ($ vinti / $ persi — dollar-based)
     # ============================================
-    gross_profit = sum(win_pcts)
-    gross_loss = sum(loss_pcts)
-    profit_factor = round(gross_profit / gross_loss, 2) if gross_loss > 0 else 999
+    gross_profit_usd = sum(t.get("pnl_dollar", 0) for t in wins)
+    gross_loss_usd = abs(sum(t.get("pnl_dollar", 0) for t in losses))
+    profit_factor = round(gross_profit_usd / gross_loss_usd, 2) if gross_loss_usd > 0 else 999
 
     # ============================================
-    # SHARPE RATIO
+    # SHARPE RATIO (su distribuzione return per-trade)
     # ============================================
     if len(all_pcts) >= 5:
         mean_return = sum(all_pcts) / len(all_pcts)
@@ -181,7 +210,7 @@ async def get_analytics():
         std_return = 0
 
     # ============================================
-    # SORTINO RATIO
+    # SORTINO RATIO (penalizza solo le discese)
     # ============================================
     if len(all_pcts) >= 5:
         negative_returns = [r for r in all_pcts if r < 0]
@@ -197,28 +226,30 @@ async def get_analytics():
         sortino = 0
 
     # ============================================
-    # DRAWDOWN CURVE
+    # EQUITY CURVE + DRAWDOWN (su capitale reale in $)
     # ============================================
-    cum_pnl = 0
-    peak = 0
+    equity = starting_capital
+    peak = starting_capital
     drawdown_series = []
     max_drawdown = 0
     max_drawdown_date = ""
 
     for t in trades:
-        cum_pnl += t.get("pnl_pct", 0)
-        if cum_pnl > peak:
-            peak = cum_pnl
-        dd = cum_pnl - peak
-        if dd < max_drawdown:
-            max_drawdown = dd
+        equity += t.get("pnl_dollar", 0)
+        if equity > peak:
+            peak = equity
+        dd_pct = ((equity - peak) / peak * 100) if peak > 0 else 0
+        cum_return_pct = ((equity - starting_capital) / starting_capital * 100) if starting_capital > 0 else 0
+        if dd_pct < max_drawdown:
+            max_drawdown = dd_pct
             max_drawdown_date = str(t.get("date", ""))[:10]
         drawdown_series.append({
             "date": str(t.get("date", ""))[:10],
             "ticker": t.get("ticker", ""),
-            "cum_pnl": round(cum_pnl, 2),
-            "drawdown": round(dd, 2),
+            "cum_pnl": round(cum_return_pct, 2),
+            "drawdown": round(dd_pct, 2),
             "peak": round(peak, 2),
+            "equity": round(equity, 2),
         })
 
     # ============================================
@@ -240,15 +271,15 @@ async def get_analytics():
             max_consec_losses = max(max_consec_losses, current_losses)
 
     # ============================================
-    # WIN RATE PER REGIME
+    # WIN RATE PER REGIME (pnl % = contributo $ sul capitale)
     # ============================================
     regime_stats = {}
     for t in trades:
         regime = t.get("market_regime", "UNKNOWN")
         if regime not in regime_stats:
-            regime_stats[regime] = {"total": 0, "wins": 0, "pnl": 0}
+            regime_stats[regime] = {"total": 0, "wins": 0, "pnl_dollar": 0}
         regime_stats[regime]["total"] += 1
-        regime_stats[regime]["pnl"] += t.get("pnl_pct", 0)
+        regime_stats[regime]["pnl_dollar"] += t.get("pnl_dollar", 0)
         if (t.get("pnl_pct") or 0) > 0:
             regime_stats[regime]["wins"] += 1
 
@@ -259,7 +290,8 @@ async def get_analytics():
             "total": s["total"],
             "wins": s["wins"],
             "win_rate": round(s["wins"] / s["total"] * 100, 1) if s["total"] > 0 else 0,
-            "pnl": round(s["pnl"], 2),
+            "pnl": round((s["pnl_dollar"] / starting_capital * 100), 2) if starting_capital > 0 else 0,
+            "pnl_dollar": round(s["pnl_dollar"], 2),
         })
     regime_breakdown.sort(key=lambda x: x["total"], reverse=True)
 
@@ -267,14 +299,14 @@ async def get_analytics():
     # WIN RATE PER DAY OF WEEK
     # ============================================
     day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-    day_stats = {i: {"total": 0, "wins": 0, "pnl": 0} for i in range(7)}
+    day_stats = {i: {"total": 0, "wins": 0, "pnl_dollar": 0} for i in range(7)}
 
     for t in trades:
         d = t.get("date")
         if d:
             dow = d.weekday() if hasattr(d, 'weekday') else 0
             day_stats[dow]["total"] += 1
-            day_stats[dow]["pnl"] += t.get("pnl_pct", 0)
+            day_stats[dow]["pnl_dollar"] += t.get("pnl_dollar", 0)
             if (t.get("pnl_pct") or 0) > 0:
                 day_stats[dow]["wins"] += 1
 
@@ -286,7 +318,7 @@ async def get_analytics():
             "total": s["total"],
             "wins": s["wins"],
             "win_rate": round(s["wins"] / s["total"] * 100, 1) if s["total"] > 0 else 0,
-            "pnl": round(s["pnl"], 2),
+            "pnl": round((s["pnl_dollar"] / starting_capital * 100), 2) if starting_capital > 0 else 0,
         })
 
     # ============================================
@@ -305,9 +337,8 @@ async def get_analytics():
     for t in trades:
         sec = t.get("sector", t.get("setup_type", "unknown"))
         if sec not in sector_stats:
-            sector_stats[sec] = {"total": 0, "wins": 0, "pnl": 0, "pnl_dollar": 0}
+            sector_stats[sec] = {"total": 0, "wins": 0, "pnl_dollar": 0}
         sector_stats[sec]["total"] += 1
-        sector_stats[sec]["pnl"] += t.get("pnl_pct", 0)
         sector_stats[sec]["pnl_dollar"] += t.get("pnl_dollar", 0)
         if (t.get("pnl_pct") or 0) > 0:
             sector_stats[sec]["wins"] += 1
@@ -319,10 +350,10 @@ async def get_analytics():
             "total": s["total"],
             "wins": s["wins"],
             "win_rate": round(s["wins"] / s["total"] * 100, 1) if s["total"] > 0 else 0,
-            "pnl": round(s["pnl"], 2),
+            "pnl": round((s["pnl_dollar"] / starting_capital * 100), 2) if starting_capital > 0 else 0,
             "pnl_dollar": round(s["pnl_dollar"], 2),
         })
-    sector_breakdown.sort(key=lambda x: x["pnl"], reverse=True)
+    sector_breakdown.sort(key=lambda x: x["pnl_dollar"], reverse=True)
 
     # ============================================
     # MONTHLY P&L TABLE
@@ -333,8 +364,7 @@ async def get_analytics():
         if d:
             key = d.strftime("%Y-%m") if hasattr(d, 'strftime') else str(d)[:7]
             if key not in monthly:
-                monthly[key] = {"pnl": 0, "pnl_dollar": 0, "trades": 0, "wins": 0}
-            monthly[key]["pnl"] += t.get("pnl_pct", 0)
+                monthly[key] = {"pnl_dollar": 0, "trades": 0, "wins": 0}
             monthly[key]["pnl_dollar"] += t.get("pnl_dollar", 0)
             monthly[key]["trades"] += 1
             if (t.get("pnl_pct") or 0) > 0:
@@ -344,7 +374,7 @@ async def get_analytics():
     for month, s in sorted(monthly.items()):
         monthly_table.append({
             "month": month,
-            "pnl": round(s["pnl"], 2),
+            "pnl": round((s["pnl_dollar"] / starting_capital * 100), 2) if starting_capital > 0 else 0,
             "pnl_dollar": round(s["pnl_dollar"], 2),
             "trades": s["trades"],
             "wins": s["wins"],
@@ -358,9 +388,9 @@ async def get_analytics():
     for t in trades:
         st = t.get("setup_type", "unknown")
         if st not in setup_stats:
-            setup_stats[st] = {"total": 0, "wins": 0, "pnl": 0}
+            setup_stats[st] = {"total": 0, "wins": 0, "pnl_dollar": 0}
         setup_stats[st]["total"] += 1
-        setup_stats[st]["pnl"] += t.get("pnl_pct", 0)
+        setup_stats[st]["pnl_dollar"] += t.get("pnl_dollar", 0)
         if (t.get("pnl_pct") or 0) > 0:
             setup_stats[st]["wins"] += 1
 
@@ -371,9 +401,9 @@ async def get_analytics():
             "total": s["total"],
             "wins": s["wins"],
             "win_rate": round(s["wins"] / s["total"] * 100, 1) if s["total"] > 0 else 0,
-            "pnl": round(s["pnl"], 2),
+            "pnl": round((s["pnl_dollar"] / starting_capital * 100), 2) if starting_capital > 0 else 0,
         })
-    setup_breakdown.sort(key=lambda x: x["pnl"], reverse=True)
+    setup_breakdown.sort(key=lambda x: x["pnl_dollar"], reverse=True)
 
     # ============================================
     # RETURN
@@ -387,8 +417,10 @@ async def get_analytics():
         "profit_factor": profit_factor,
         "sharpe": sharpe,
         "sortino": sortino,
-        "total_pnl_pct": round(total_pnl_pct, 2),
+        "total_pnl_pct": total_pnl_pct,
         "total_pnl_dollar": round(total_pnl_dollar, 2),
+        "starting_capital": starting_capital,
+        "current_equity": round(equity, 2),
         "max_drawdown": round(max_drawdown, 2),
         "max_drawdown_date": max_drawdown_date,
         "max_consec_wins": max_consec_wins,
