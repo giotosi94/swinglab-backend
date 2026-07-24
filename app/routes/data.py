@@ -522,3 +522,26 @@ async def backfill_adaptive_targets():
         "total_buys": len(buys),
         "skipped": skipped,
     }
+
+
+
+@router.post("/backtest/run")
+async def backtest_run(
+    days: int = 180,
+    min_confluence: float = 55,
+    stop_loss_pct: float = 6.0,
+    take_profit_pct: float = 12.0,
+    max_positions: int = 8,
+    position_size_pct: float = 12.0,
+):
+    """v5.0 Backtesting Engine — simula strategia su dati storici."""
+    from app.services.backtesting import run_backtest
+    result = await run_backtest(
+        days=days,
+        min_confluence=min_confluence,
+        stop_loss_pct=stop_loss_pct,
+        take_profit_pct=take_profit_pct,
+        max_positions=max_positions,
+        position_size_pct=position_size_pct,
+    )
+    return result
