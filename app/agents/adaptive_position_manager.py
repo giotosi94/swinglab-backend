@@ -526,7 +526,13 @@ class AdaptivePositionManager(BaseAgent):
             adaptive_t3 = buy_trade_ref.get("adaptive_t3_pct")
         else:
             adaptive_t1 = adaptive_t2 = adaptive_t3 = None
-        
+
+        # 🆕 v1.3 — Target già raggiunti (per proteggere i runner post-T1)
+        last_target_hit_now = buy_trade_ref.get("last_target_hit", 0) if buy_trade_ref else 0
+        partial_now = buy_trade_ref.get("partial_scaled_out", False) if buy_trade_ref else False
+        if partial_now and last_target_hit_now < 1:
+            last_target_hit_now = 1
+
         # Soglie base
         exit_conf_th_base = params.get("apm_exit_confluence_threshold", 30)
         exit_ml_th_base = params.get("apm_exit_ml_threshold", 40)
@@ -584,7 +590,10 @@ class AdaptivePositionManager(BaseAgent):
         # ============================================
         # 🔴 EXIT
         # ============================================
-        if len(negative_factors) >= min_negative:
+        # 🆕 v1.3 — Runner protection: se ha già preso T1+ ed è in profitto,
+        # NON uscire per tesi debole. Lascia correre verso T2/T3 col trailing.
+        runner_in_profit = last_target_hit_now >= 1 and pnl_pct > 0
+        if len(negative_factors) >= min_negative and not runner_in_profit:
             return {
                 "decision": "EXIT",
                 "reason": (
@@ -832,15 +841,28 @@ class AdaptivePositionManager(BaseAgent):
                 }}
             )
             
-            # 7. Sposta SL a break-even sul restante (solo se T1 hit)
-            new_stop = entry_price if target_hit == 1 else max(entry_price, entry_price * 1.03)  # T2: entry+3%
-            
+            # 7. 🆕 v1.3 — Trailing stop dal picco (invece del break-even fisso)
+            # Lascia correre il residuo verso T2/T3 dando spazio al ritracciamento normale.
+            # Floor progressivo: T1 = break-even, T2 = entry+3%, T3 = entry+8%.
+            trail_pct = 0.05  # trail 5% sotto il picco (tunable)
+            if target_hit == 1:
+                floor_price = entry_price
+            elif target_hit == 2:
+                floor_price = entry_price * 1.03
+            else:
+                floor_price = entry_price * 1.08
+            new_stop = round(max(floor_price, current_price * (1 - trail_pct)), 2)
+
             await db.trailing_stops.update_one(
                 {"ticker": symbol},
                 {"$set": {
                     "ticker": symbol,
-                    "stop_price": round(new_stop, 2),
-                    "reason": f"APM scale-out T{target_hit}: SL moved to {'break-even' if target_hit == 1 else 'entry+3%'}",
+                    "stop_price": new_stop,
+                    "peak_price": round(current_price, 2),
+                    "trail_pct": trail_pct,
+                    "trailing_active": True,
+                    "floor_price": round(floor_price, 2),
+                    "reason": f"APM scale-out T{target_hit}: trailing {trail_pct*100:.0f}% dal picco (floor ${round(floor_price, 2)})",
                     "updated_at": datetime.utcnow(),
                     "source": "apm_v1_scale_out",
                 }},
