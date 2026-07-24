@@ -396,3 +396,28 @@ async def ml_health_check():
     health_report["suggestions"] = suggestions if suggestions else ["✅ System is healthy"]
     
     return health_report
+
+@router.post("/collect-backtest-data")
+async def collect_backtest_data(
+    days: int = 250,
+    min_confluence: float = 55,
+    stop_loss_pct: float = 6.0,
+    take_profit_pct: float = 12.0,
+):
+    """v2.0 Genera training data da backtest storico."""
+    from app.ml.backtest_collector import collect_backtest_training_data
+    result = await collect_backtest_training_data(
+        days=days,
+        min_confluence=min_confluence,
+        stop_loss_pct=stop_loss_pct,
+        take_profit_pct=take_profit_pct,
+    )
+    return result
+
+
+@router.post("/train-hybrid")
+async def train_hybrid(real_weight: int = 3):
+    """v2.0 Training ibrido: real (dedup) + backtest data."""
+    from app.ml.model import ml_model
+    result = await ml_model.train_hybrid(real_weight=real_weight)
+    return result
