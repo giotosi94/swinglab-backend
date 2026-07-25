@@ -471,25 +471,36 @@ async def run_backtest(
                 spy_by_date[b["date"]] = b["c"]
 
             # Beta + correlazione sui rendimenti giornalieri
-            eq_map = {e["date"]: e["equity"] for e in equity_curve}
-            common_dates = sorted(set(eq_map.keys()) & set(spy_by_date.keys()))
-            if len(common_dates) >= 5:
-                eq_rets = []
-                spy_rets = []
-                for i in range(1, len(common_dates)):
-                    d0, d1 = common_dates[i - 1], common_dates[i]
-                    eq_r = (eq_map[d1] - eq_map[d0]) / eq_map[d0] if eq_map[d0] else 0
-                    spy_r = (spy_by_date[d1] - spy_by_date[d0]) / spy_by_date[d0] if spy_by_date[d0] else 0
-                    eq_rets.append(eq_r)
-                    spy_rets.append(spy_r)
-                eq_arr = np.array(eq_rets)
-                spy_arr = np.array(spy_rets)
-                spy_var = np.var(spy_arr)
-                if spy_var > 0:
-                    beta = round(float(np.cov(eq_arr, spy_arr)[0][1] / spy_var), 2)
-                std_prod = np.std(eq_arr) * np.std(spy_arr)
-                if std_prod > 0:
-                    correlation = round(float(np.corrcoef(eq_arr, spy_arr)[0][1]), 2)
+            # Beta +  (difensivo)
+            try:
+                eq_map = {e["date"]: e["equity"] for e in equity_curve}
+                common_dates = sorted(set(eq_map.keys()) & set(spy_by_date.keys()))
+                if len(common_dates) >= 5:
+                    eq_rets = []
+                    spy_rets = []
+                    for i in range(1, len(common_dates)):
+                        d0, d1 = common_dates[i - 1], common_dates[i]
+                        e0 = eq_map[d0]
+                        s0 = spy_by_date[d0]
+                        eq_r = (eq_map[d1] - e0) / e0 if e0 else 0
+                        spy_r = (spy_by_date[d1] - s0) / s0 if s0 else 0
+                        eq_rets.append(eq_r)
+                        spy_rets.append(spy_r)
+                    if len(eq_rets) >= 2 and len(eq_rets) == len(spy_rets):
+                        eq_arr = np.array(eq_rets, dtype=float)
+                        spy_arr = np.array(spy_rets, dtype=float)
+                        spy_var = float(np.var(spy_arr))
+                        if spy_var > 1e-12:
+                            cov = float(np.cov(eq_arr, spy_arr)[0][1])
+                            beta = round(cov / spy_var, 2)
+                        std_prod = float(np.std(eq_arr) * np.std(spy_arr))
+                        if std_prod > 1e-12:
+                            corr = float(np.corrcoef(eq_arr, spy_arr)[0][1])
+                            correlation = round(corr, 2)
+            except Exception as e:
+                print(f"  Beta/correlation calc error: {e}")
+                beta = 0
+                correlation = 0
 
     return {
         "config": {
