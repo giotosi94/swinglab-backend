@@ -449,9 +449,8 @@ async def run_backtest(
 
     metrics = _calc_metrics(equity_curve, trades)
 
-    # SPY benchmark + curva allineata + correlazione
+    # SPY benchmark + curva allineata all'equity + correlazione
     spy_return = 0
-    spy_curve = []
     beta = 0
     correlation = 0
     spy_doc = await db.stock_bars.find_one({"ticker": "SPY"})
@@ -463,17 +462,22 @@ async def run_backtest(
         if len(spy_slice) >= 2:
             spy_start = spy_slice[0]["c"]
             spy_return = (spy_slice[-1]["c"] - spy_start) / spy_start * 100
-            # Curva SPY normalizzata (% dal punto di partenza)
-            spy_by_date = {}
-            for b in spy_slice:
-                pct = round((b["c"] - spy_start) / spy_start * 100, 2)
-                spy_curve.append({"date": b["date"], "spy_pct": pct})
-                spy_by_date[b["date"]] = b["c"]
+            spy_by_date = {b["date"]: b["c"] for b in spy_slice}
+
+            # 🆕 v2.1 — Attacca il valore SPY (in $ dallo stesso start capitale)
+            # a OGNI punto dell'equity_curve, così il downsample è allineato.
+            for pt in equity_curve:
+                sc = spy_by_date.get(pt["date"])
+                if sc is not None:
+                    pt["spy_equity"] = round(starting_capital * (sc / spy_start), 2)
+                else:
+                    pt["spy_equity"] = None
 
             # Beta + correlazione sui rendimenti giornalieri (difensivo)
             try:
                 eq_map = {e["date"]: e["equity"] for e in equity_curve}
                 common_dates = sorted(set(eq_map.keys()) & set(spy_by_date.keys()))
+                _ = common_dates  # (nomi invariati sotto)
                 if len(common_dates) >= 5:
                     eq_rets = []
                     spy_rets = []
@@ -519,7 +523,6 @@ async def run_backtest(
             "alpha": round(metrics.get("total_return_pct", 0) - spy_return, 2),
             "beta": beta,
             "correlation": correlation,
-            "spy_curve": spy_curve[::max(1, len(spy_curve) // 100)],
         },
         "apm_stats": {
             "scale_out_events": scale_out_events,
