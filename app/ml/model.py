@@ -87,12 +87,15 @@ class SwingLabModel:
         )
         if HAS_XGB:
             self.model = xgb.XGBClassifier(
-                n_estimators=100, max_depth=4, learning_rate=0.1,
+                n_estimators=120, max_depth=3, learning_rate=0.05,
+                subsample=0.8, colsample_bytree=0.8, min_child_weight=3,
+                reg_alpha=0.5, reg_lambda=1.0,
                 use_label_encoder=False, eval_metric="logloss", random_state=42,
             )
         else:
             self.model = GradientBoostingClassifier(
-                n_estimators=100, max_depth=4, learning_rate=0.1, random_state=42,
+                n_estimators=120, max_depth=3, learning_rate=0.05,
+                subsample=0.8, min_samples_leaf=3, random_state=42,
             )
         print("  Training model...")
         self.model.fit(X_train, y_train)
@@ -370,13 +373,17 @@ class SwingLabModel:
 
         if HAS_XGB:
             self.model = xgb.XGBClassifier(
-                n_estimators=150, max_depth=4, learning_rate=0.08,
+                n_estimators=180, max_depth=3, learning_rate=0.05,
+                subsample=0.8, colsample_bytree=0.8, min_child_weight=3,
+                reg_alpha=0.5, reg_lambda=1.0,
                 use_label_encoder=False, eval_metric="logloss", random_state=42,
             )
         else:
             self.model = GradientBoostingClassifier(
-                n_estimators=150, max_depth=4, learning_rate=0.08, random_state=42,
+                n_estimators=180, max_depth=3, learning_rate=0.05,
+                subsample=0.8, min_samples_leaf=3, random_state=42,
             )
+
 
         print("  Training hybrid model...")
         self.model.fit(X_train, y_train)
