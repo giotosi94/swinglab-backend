@@ -11,6 +11,7 @@ from app.routes import trades  # NEW
 from app.routes import ml
 from app.routes import debug  # 🚨 EMERGENCY DEBUG ENDPOINTS
 from app.routes import telegram  # 🆕 v3.7 Telegram notifications
+from app.routes import system  # 🩺 v5.0 System Health Dashboard
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -42,7 +43,6 @@ app.include_router(agents.router, prefix="/api/agents", tags=["Agents"])
 app.include_router(settings.router, prefix="/api/settings", tags=["Settings"])
 app.include_router(trades.router, prefix="/api/trades", tags=["Trades"])  # NEW
 app.include_router(ml.router)
-from app.routes import system
 app.include_router(system.router)
 app.include_router(debug.router, prefix="/api/debug", tags=["Debug"])  # 🚨 EMERGENCY
 app.include_router(telegram.router, prefix="/api/telegram", tags=["Telegram"])  # 🆕 v3.7
