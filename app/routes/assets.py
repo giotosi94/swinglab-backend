@@ -4,6 +4,12 @@ from app.db.mongodb import get_db
 
 router = APIRouter()
 
+# Ticker esclusi dall'universo trade (indici/ETF macro + residui ricerche)
+EXCLUDED_TICKERS = [
+    "SPY", "QQQ", "IWM", "DIA", "VXX", "VIXY", "TLT", "HYG",
+    "LQD", "GLD", "USO", "RSP", "IWO", "FXE", "UUP", "EEM", "IYT",
+]
+
 
 @router.get("/")
 async def get_assets(
@@ -13,7 +19,10 @@ async def get_assets(
     limit: int = 50
 ):
     db = get_db()
-    query = {}
+    query = {
+        "sector_code": {"$ne": "SEARCH"},
+        "ticker": {"$nin": EXCLUDED_TICKERS},
+    }
     if sector:
         query["sector_code"] = sector.upper()
     if min_score > 0:
