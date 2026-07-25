@@ -24,7 +24,8 @@ class AlphaStrategist(BaseAgent):
         # + Factor 14 (ML WIN/LOSS): 2.5 max
         # + Factor 15 (Trend Predictor): 2.0 max
         # = 19.5 total
-        self.MAX_RAW_CONFLUENCE = 19.5
+        # v2.1 — +Factor 16 MTF Weekly Alignment (2.5 max) = 22.0
+        self.MAX_RAW_CONFLUENCE = 22.0
 
     def default_params(self) -> dict:
         return {
@@ -46,6 +47,7 @@ class AlphaStrategist(BaseAgent):
                 # 🆕 v2.0 — ML factors (pesi bassi perché modelli poco affidabili)
                 "ml_winloss": 0.8,       # WIN/LOSS accuracy 46.7% → peso ridotto
                 "trend_predictor": 0.7,   # Trend accuracy 50.7% → peso ridotto
+                "mtf_alignment": 1.0,     # 🆕 v2.1 MTF Weekly trend filter
             },
             # Filtri
             "min_confluence": 35,
@@ -393,6 +395,28 @@ class AlphaStrategist(BaseAgent):
             factors.append({"name": "Trend", "pts": 0, "max": 2.0, "detail": "N/A", "pass": False})
         raw_score += pts
 
+        # --- 16. 🆕 v2.1 MTF Weekly Alignment ---
+        w = fw.get("mtf_alignment", 1.0)
+        mtf = asset.get("mtf", {})
+        wtrend = mtf.get("weekly_trend", "UNKNOWN")
+        wslope = mtf.get("weekly_ema20_slope", "flat")
+        if wtrend == "BULL" and wslope == "rising":
+            pts = 2.5 * w
+            factors.append({"name": "MTF", "pts": pts, "max": 2.5, "detail": "Weekly BULL rising", "pass": True})
+        elif wtrend == "BULL":
+            pts = 1.5 * w
+            factors.append({"name": "MTF", "pts": pts, "max": 2.5, "detail": "Weekly BULL", "pass": True})
+        elif wtrend == "NEUTRAL":
+            pts = 0.5 * w
+            factors.append({"name": "MTF", "pts": pts, "max": 2.5, "detail": "Weekly NEUTRAL", "pass": True})
+        elif wtrend == "BEAR":
+            pts = -2.0 * w
+            factors.append({"name": "MTF", "pts": pts, "max": 2.5, "detail": "Weekly BEAR", "pass": False})
+        else:
+            pts = 0
+            factors.append({"name": "MTF", "pts": 0, "max": 2.5, "detail": "N/A", "pass": False})
+        raw_score += pts
+
         # Normalize to 0-100
         normalized = round(max(0, min(100, (raw_score / self.MAX_RAW_CONFLUENCE) * 100)), 1)
 
@@ -657,6 +681,7 @@ class AlphaStrategist(BaseAgent):
                 "ml_score": ml_data.get("ml_score", 0) if ml_data else 0,
                 "trend_prediction": ml_data.get("trend_prediction", "N/A") if ml_data else "N/A",
                 "trend_up_prob": ml_data.get("trend_up_prob", 0) if ml_data else 0,
+                "weekly_trend": a.get("mtf", {}).get("weekly_trend", "UNKNOWN"),
             })
 
         candidates.sort(key=lambda x: x["confluence"], reverse=True)
