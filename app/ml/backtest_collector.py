@@ -210,22 +210,39 @@ def _build_features(bars_slice, sector_code, sector_rank=6, regime_enc=1):
     poc_proxy = np.mean(closes[-20:])
     poc_dist = round(abs(price - poc_proxy) / price * 100, 2) if price > 0 else 50
 
+    macd_hist = _macd_hist(closes)
+
+    # 🔧 v2.2 — Feature reali (non più hardcoded) usando gli helper del collector
+    wyckoff_enc = _detect_wyckoff(closes, volumes, highs, lows)
+    accum_score = _accumulation_score(closes, volumes, highs, lows)
+    bullish = _bullish_pattern(closes, opens, highs, lows)
+
+    # 🆕 v2.2 — Interaction features (identiche a features.py)
+    rsi_sweet = max(0.0, 1.0 - abs(rsi - 50) / 50)
+    rsi_volume_interaction = round(rsi_sweet * rel_vol, 3)
+    macd_dir = 1 if macd_hist > 0 else (-1 if macd_hist < 0 else 0)
+    trend_strength = round(ema_align * macd_dir, 2)
+    poc_closeness = max(0.0, (5.0 - poc_dist) / 5.0)
+    value_proximity = round(poc_closeness * (accum_score / 100.0), 3)
+
     features = {
         "rsi": rsi,
-        "macd_histogram": _macd_hist(closes),
+        "macd_histogram": macd_hist,
         "ema_alignment": ema_align,
         "relative_volume": rel_vol,
         "poc_distance_pct": poc_dist,
         "setup_type_encoded": SETUP_ENCODE.get(setup, 5),
-        "sector_rank": 6,
-        "wyckoff_encoded": 5,
-        "accumulation_score": 0,
+        "wyckoff_encoded": wyckoff_enc,
+        "accumulation_score": round(accum_score, 1),
         "range_position": round(range_pos, 1),
         "change_pct": round(change_pct, 2),
-        "regime_encoded": 1,
+        "regime_encoded": regime_enc,
         "confluence_score": round(conf, 1),
-        "has_bullish_patterns": 0,
+        "has_bullish_patterns": bullish,
         "pct_from_high": round(pct_from_high, 2),
+        "rsi_volume_interaction": rsi_volume_interaction,
+        "trend_strength": trend_strength,
+        "value_proximity": value_proximity,
     }
     return features, conf, price
 
@@ -372,8 +389,7 @@ async def collect_backtest_training_data(
     wins = sum(1 for s in samples if s["label"] == 1)
     losses = len(samples) - wins
 
-    return {
-        "message": "Backtest training data collected (v2.1 - 15 features)",
+     training data collected (v2.2 - 17 features)",
         "total_samples": len(samples),
         "wins": wins,
         "losses": losses,
