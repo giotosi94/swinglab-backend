@@ -339,6 +339,13 @@ async def reset_all_bars():
     result = await db.stock_bars.delete_many({})
     return {"deleted": result.deleted_count, "message": "All bars deleted. Next refresh will re-download."}
 
+@router.delete("/reset-bars/{ticker}")
+async def reset_ticker_bars(ticker: str):
+    """Cancella le bars di UN singolo ticker per forzare re-download pulito."""
+    db = get_db()
+    result = await db.stock_bars.delete_one({"ticker": ticker.upper()})
+    return {"deleted": result.deleted_count, "ticker": ticker.upper(),
+            "message": "Bars deleted. Next refresh will bulk re-download."}
 
 @router.delete("/assets/cleanup-search")
 async def cleanup_search_assets():
