@@ -841,28 +841,28 @@ class AdaptivePositionManager(BaseAgent):
                 }}
             )
             
-            # 7. 🆕 v1.3 — Trailing stop dal picco (invece del break-even fisso)
-            # Lascia correre il residuo verso T2/T3 dando spazio al ritracciamento normale.
-            # Floor progressivo: T1 = break-even, T2 = entry+3%, T3 = entry+8%.
-            trail_pct = 0.05  # trail 5% sotto il picco (tunable)
+            # 7. 🆕 v4.8 — Floor FISSO (no trailing dal picco). "Lascia correre".
+            # Dopo lo scale-out il residuo corre libero verso il target pieno,
+            # protetto solo da un floor fisso. Il software SL/TP dell'Executor
+            # (sicurezza indispensabile con fractional) chiude a floor (giù) o
+            # al target Alpha (su). apm_managed blocca _manage_trailing_stops.
             if target_hit == 1:
-                floor_price = entry_price
+                floor_price = entry_price          # break-even
             elif target_hit == 2:
-                floor_price = entry_price * 1.03
+                floor_price = entry_price * 1.03   # +3% garantito
             else:
                 floor_price = entry_price * 1.08
-            new_stop = round(max(floor_price, current_price * (1 - trail_pct)), 2)
+            new_stop = round(floor_price, 2)
 
             await db.trailing_stops.update_one(
                 {"ticker": symbol},
                 {"$set": {
                     "ticker": symbol,
                     "stop_price": new_stop,
-                    "peak_price": round(current_price, 2),
-                    "trail_pct": trail_pct,
-                    "trailing_active": True,
-                    "floor_price": round(floor_price, 2),
-                    "reason": f"APM scale-out T{target_hit}: trailing {trail_pct*100:.0f}% dal picco (floor ${round(floor_price, 2)})",
+                    "floor_price": new_stop,
+                    "trailing_active": False,
+                    "apm_managed": True,
+                    "reason": f"APM scale-out T{target_hit}: floor fisso ${new_stop} (lascia correre verso target)",
                     "updated_at": datetime.utcnow(),
                     "source": "apm_v1_scale_out",
                 }},
