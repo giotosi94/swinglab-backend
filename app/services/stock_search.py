@@ -90,8 +90,10 @@ async def search_and_analyze_stock(ticker):
             setup_type = detect_setup_type(ind_data)
 
             db = get_db()
+            existing_asset = await db.assets.find_one({"ticker": ticker})
             asset_doc = {
-                "ticker": ticker, "name": ticker, "sector_code": "SEARCH",
+                "ticker": ticker, "name": ticker,
+                "sector_code": existing_asset.get("sector_code", "SEARCH") if existing_asset else "SEARCH",
                 "price": round(price, 2), "change_pct": change_pct,
                 "avg_volume": round(avg_vol, 0), "relative_volume": rel_vol,
                 "rsi": rsi, "macd": macd,
@@ -115,9 +117,13 @@ async def search_and_analyze_stock(ticker):
                 asset_doc["llm_analysis"] = existing["llm_analysis"]
                 asset_doc["llm_analysis_at"] = existing.get("llm_analysis_at", "")
 
-            await db.assets.update_one(
-                {"ticker": ticker}, {"$set": asset_doc}, upsert=True
-            )
+            # Opzione A: salva SOLO se il ticker è già nell'universo reale.
+            # I ticker cercati "usa e getta" NON inquinano più db.assets.
+            if existing_asset:
+                asset_doc.pop("sector_code", None)  # non sovrascrivere il settore reale
+                await db.assets.update_one(
+                    {"ticker": ticker}, {"$set": asset_doc}, upsert=False
+                )
             return asset_doc
 
         except Exception as e:
