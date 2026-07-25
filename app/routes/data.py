@@ -340,6 +340,21 @@ async def reset_all_bars():
     return {"deleted": result.deleted_count, "message": "All bars deleted. Next refresh will re-download."}
 
 
+@router.delete("/assets/cleanup-search")
+async def cleanup_search_assets():
+    """Rimuove ticker da ricerche (SEARCH) + ETF macro dall'universo trade."""
+    db = get_db()
+    macro_etfs = ["SPY", "QQQ", "IWM", "DIA", "VXX", "VIXY", "TLT", "HYG",
+                  "LQD", "GLD", "USO", "RSP", "IWO", "FXE", "UUP", "EEM", "IYT"]
+    result = await db.assets.delete_many({
+        "$or": [
+            {"sector_code": "SEARCH"},
+            {"ticker": {"$in": macro_etfs}},
+        ]
+    })
+    return {"deleted": result.deleted_count, "message": "Universe cleaned (SEARCH + macro ETF removed)"}
+
+
 @router.get("/test-bars/{symbol}")
 async def test_bars(symbol: str):
     from app.services.data_fetcher import fetch_bars_from_api
