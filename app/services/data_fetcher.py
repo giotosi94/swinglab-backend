@@ -276,6 +276,66 @@ def get_pattern_score_bonus(patterns):
     return max(-10, min(15, bonus))
 
 
+def calc_weekly_trend(df):
+    """MTF Light: resample daily bars -> weekly per il trend di fondo. Zero API extra."""
+    default = {"weekly_trend": "UNKNOWN", "aligned": True, "score": 50,
+               "weekly_rsi": 50, "weekly_ema20_slope": "flat", "bars": 0}
+    if df is None or len(df) < 60 or "datetime" not in df.columns:
+        return default
+    try:
+        w = df.set_index("datetime").resample("W-FRI").agg({
+            "Open": "first", "High": "max", "Low": "min",
+            "Close": "last", "Volume": "sum",
+        }).dropna()
+    except Exception:
+        return default
+    if len(w) < 12:
+        return {**default, "bars": len(w)}
+
+    wclose = w["Close"]
+    wprice = float(wclose.iloc[-1])
+    wema10 = float(wclose.ewm(span=10).mean().iloc[-1])
+    wema20_series = wclose.ewm(span=20).mean()
+    wema20 = float(wema20_series.iloc[-1])
+    wema50 = float(wclose.ewm(span=min(50, len(w))).mean().iloc[-1])
+    wrsi = round(float(calc_rsi(wclose)), 1) if len(w) >= 15 else 50
+
+    # Slope EMA20 sulle ultime 4 settimane
+    slope = "flat"
+    if len(wema20_series) >= 4:
+        prev = float(wema20_series.iloc[-4])
+        if wema20 > prev * 1.005:
+            slope = "rising"
+        elif wema20 < prev * 0.995:
+            slope = "falling"
+
+    # Trend di fondo weekly
+    if wprice > wema10 > wema20 > wema50 and wema50 > 0:
+        trend, score = "BULL", 90
+    elif wprice > wema20 > wema50 and wema50 > 0:
+        trend, score = "BULL", 75
+    elif wprice > wema50 and wema50 > 0:
+        trend, score = "NEUTRAL", 55
+    elif wprice > wema20:
+        trend, score = "NEUTRAL", 45
+    else:
+        trend, score = "BEAR", 25
+
+    aligned = trend in ("BULL", "NEUTRAL") and slope != "falling"
+
+    return {
+        "weekly_trend": trend,
+        "weekly_rsi": wrsi,
+        "weekly_ema20_slope": slope,
+        "weekly_price": round(wprice, 2),
+        "weekly_ema20": round(wema20, 2),
+        "weekly_ema50": round(wema50, 2),
+        "aligned": aligned,
+        "score": score,
+        "bars": len(w),
+    }
+
+
 # ============================================
 # INCREMENTAL BAR STORAGE
 # ============================================
@@ -511,6 +571,7 @@ def analyze_stock(ticker, df, sector_code, sector_scores):
     patterns = detect_candlestick_patterns(df)
     fvgs = detect_fvg(df); wyckoff = detect_wyckoff_phase(df)
     accumulation = calc_accumulation_score(df, poc, va_low, va_high)
+    mtf = calc_weekly_trend(df)
     ds = close.diff(); gs = ds.where(ds > 0, 0).rolling(14).mean()
     ls = (-ds.where(ds < 0, 0)).rolling(14).mean(); rs_s = 100 - (100 / (1 + gs / ls))
     e10s = close.ewm(span=10).mean(); e20s = close.ewm(span=20).mean(); e50s = close.ewm(span=50).mean()
@@ -541,7 +602,7 @@ def analyze_stock(ticker, df, sector_code, sector_scores):
         "poc_price": poc, "value_area_high": va_high, "value_area_low": va_low,
         "setup_score": setup_score, "setup_type": setup_type, "vp_distribution": vp_distribution,
         "candlestick_patterns": patterns_list, "fvg": fvgs, "wyckoff": wyckoff,
-        "accumulation": accumulation, "price_history": price_history, "pattern_bonus": pattern_bonus,
+        "accumulation": accumulation, "mtf": mtf, "price_history": price_history, "pattern_bonus": pattern_bonus,
         "high_52w": high_52w, "low_52w": low_52w, "pct_from_high": pct_from_high,
         "pct_from_low": pct_from_low, "range_position": range_position,
         "updated_at": datetime.utcnow(),
