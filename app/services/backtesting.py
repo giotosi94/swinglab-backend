@@ -449,14 +449,47 @@ async def run_backtest(
 
     metrics = _calc_metrics(equity_curve, trades)
 
-    # SPY benchmark
+    # SPY benchmark + curva allineata + correlazione
     spy_return = 0
+    spy_curve = []
+    beta = 0
+    correlation = 0
     spy_doc = await db.stock_bars.find_one({"ticker": "SPY"})
     if spy_doc:
         spy_bars = spy_doc.get("bars", [])
-        spy_slice = [b for b in spy_bars if b["date"] in set(backtest_dates)]
+        bt_date_set = set(backtest_dates)
+        spy_slice = [b for b in spy_bars if b["date"] in bt_date_set]
+        spy_slice.sort(key=lambda x: x["date"])
         if len(spy_slice) >= 2:
-            spy_return = (spy_slice[-1]["c"] - spy_slice[0]["c"]) / spy_slice[0]["c"] * 100
+            spy_start = spy_slice[0]["c"]
+            spy_return = (spy_slice[-1]["c"] - spy_start) / spy_start * 100
+            # Curva SPY normalizzata (% dal punto di partenza)
+            spy_by_date = {}
+            for b in spy_slice:
+                pct = round((b["c"] - spy_start) / spy_start * 100, 2)
+                spy_curve.append({"date": b["date"], "spy_pct": pct})
+                spy_by_date[b["date"]] = b["c"]
+
+            # Beta + correlazione sui rendimenti giornalieri
+            eq_map = {e["date"]: e["equity"] for e in equity_curve}
+            common_dates = sorted(set(eq_map.keys()) & set(spy_by_date.keys()))
+            if len(common_dates) >= 5:
+                eq_rets = []
+                spy_rets = []
+                for i in range(1, len(common_dates)):
+                    d0, d1 = common_dates[i - 1], common_dates[i]
+                    eq_r = (eq_map[d1] - eq_map[d0]) / eq_map[d0] if eq_map[d0] else 0
+                    spy_r = (spy_by_date[d1] - spy_by_date[d0]) / spy_by_date[d0] if spy_by_date[d0] else 0
+                    eq_rets.append(eq_r)
+                    spy_rets.append(spy_r)
+                eq_arr = np.array(eq_rets)
+                spy_arr = np.array(spy_rets)
+                spy_var = np.var(spy_arr)
+                if spy_var > 0:
+                    beta = round(float(np.cov(eq_arr, spy_arr)[0][1] / spy_var), 2)
+                std_prod = np.std(eq_arr) * np.std(spy_arr)
+                if std_prod > 0:
+                    correlation = round(float(np.corrcoef(eq_arr, spy_arr)[0][1]), 2)
 
     return {
         "config": {
@@ -472,8 +505,12 @@ async def run_backtest(
         },
         "metrics": metrics,
         "benchmark": {
+        "benchmark": {
             "spy_return_pct": round(spy_return, 2),
             "alpha": round(metrics.get("total_return_pct", 0) - spy_return, 2),
+            "beta": beta,
+            "correlation": correlation,
+            "spy_curve": spy_curve[::max(1, len(spy_curve) // 100)],
         },
         "apm_stats": {
             "scale_out_events": scale_out_events,
