@@ -8,6 +8,8 @@ import numpy as np
 from datetime import datetime
 from app.db.mongodb import get_db
 
+_USE_MTF_BT = True
+
 
 def _calc_rsi(prices, period=14):
     if len(prices) < period + 1:
@@ -31,6 +33,40 @@ def _calc_ema(prices, period):
     for p in prices[period:]:
         ema = p * k + ema * (1 - k)
     return ema
+
+
+def _weekly_trend_bt(bars_slice):
+    """MTF Light per backtest: raggruppa le daily in settimane (blocchi di 5)."""
+    if len(bars_slice) < 60:
+        return "UNKNOWN", "flat"
+    closes = [b["c"] for b in bars_slice]
+    # Weekly = ogni 5 barre daily, prendo l'ultima chiusura
+    weekly = closes[4::5]
+    if len(weekly) < 12:
+        return "UNKNOWN", "flat"
+    wprice = weekly[-1]
+    wema10 = _calc_ema(weekly, 10)
+    wema20 = _calc_ema(weekly, 20)
+    wema50 = _calc_ema(weekly, min(50, len(weekly)))
+    # Slope EMA20 sulle ultime 4 settimane
+    wema20_prev = _calc_ema(weekly[:-4], 20) if len(weekly) > 24 else wema20
+    if wema20 > wema20_prev * 1.005:
+        slope = "rising"
+    elif wema20 < wema20_prev * 0.995:
+        slope = "falling"
+    else:
+        slope = "flat"
+    if wprice > wema10 > wema20 > wema50 and wema50 > 0:
+        trend = "BULL"
+    elif wprice > wema20 > wema50 and wema50 > 0:
+        trend = "BULL"
+    elif wprice > wema50 and wema50 > 0:
+        trend = "NEUTRAL"
+    elif wprice > wema20:
+        trend = "NEUTRAL"
+    else:
+        trend = "BEAR"
+    return trend, slope
 
 
 def _confluence_and_target(bars_slice):
@@ -93,7 +129,19 @@ def _confluence_and_target(bars_slice):
         score += 8
     if closes[-1] > closes[-5]:
         score += 10
-    score = min(score, 100)
+
+    # 🆕 MTF Weekly Alignment (proporzionale al peso live: ~11% del totale)
+    wtrend, wslope = _weekly_trend_bt(bars_slice) if _USE_MTF_BT else ("UNKNOWN", "flat")
+    if wtrend == "BULL" and wslope == "rising":
+        score += 12
+    elif wtrend == "BULL":
+        score += 7
+    elif wtrend == "NEUTRAL":
+        score += 2
+    elif wtrend == "BEAR":
+        score -= 10
+
+    score = max(0, min(score, 100))
 
     # Setup type
     if price > ema10 > ema20 > ema50:
@@ -185,6 +233,7 @@ async def run_backtest(
     t1_ratio: float = 0.40,
     t2_ratio: float = 0.70,
     t3_ratio: float = 1.00,
+    use_mtf: bool = True,
 ):
     """
     Backtest v2.0 con APM COMPLETO:
@@ -193,6 +242,8 @@ async def run_backtest(
     - Break-even SL dopo T1
     - Trailing stop dopo T2
     """
+    global _USE_MTF_BT
+    _USE_MTF_BT = use_mtf
     db = get_db()
     all_bars = await db.stock_bars.find({}).to_list(300)
     if not all_bars:
