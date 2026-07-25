@@ -548,16 +548,39 @@ async def backfill_adaptive_targets():
 @router.post("/backtest/run")
 async def backtest_run(
     days: int = 180,
-    min_confluence: float = 55,
-    max_positions: int = 8,
-    position_size_pct: float = 12.0,
+    min_confluence: float = None,
+    max_positions: int = None,
+    position_size_pct: float = None,
     use_apm: bool = True,
     t1_ratio: float = 0.40,
     t2_ratio: float = 0.70,
     t3_ratio: float = 1.00,
+    use_preset: bool = True,
 ):
-    """v2.0 Backtest con APM completo — adaptive targets + scale-out."""
+    """v2.1 Backtest con APM + parametri dal preset di rischio attivo."""
     from app.services.backtesting import run_backtest
+    db = get_db()
+
+    # 🆕 v2.1 — Usa i parametri del preset attivo (se non forzati via query)
+    preset_name = None
+    if use_preset:
+        settings = await db.app_settings.find_one({"_id": "risk_params"})
+        if settings:
+            preset_name = settings.get("active_preset")
+            if max_positions is None:
+                max_positions = settings.get("max_positions", 8)
+            if position_size_pct is None:
+                position_size_pct = settings.get("position_size_pct", 12.0)
+            if min_confluence is None:
+                # deriva soglia dal min_risk_reward: profili aggressivi = soglia più bassa
+                mrr = settings.get("min_risk_reward", 1.5)
+                min_confluence = 45 if mrr <= 1.3 else (50 if mrr <= 1.5 else 55)
+
+    # Fallback finali
+    max_positions = max_positions if max_positions is not None else 8
+    position_size_pct = position_size_pct if position_size_pct is not None else 12.0
+    min_confluence = min_confluence if min_confluence is not None else 55
+
     result = await run_backtest(
         days=days,
         min_confluence=min_confluence,
@@ -568,4 +591,5 @@ async def backtest_run(
         t2_ratio=t2_ratio,
         t3_ratio=t3_ratio,
     )
+    result["active_preset"] = preset_name
     return result
