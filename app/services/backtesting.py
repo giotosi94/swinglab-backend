@@ -268,6 +268,7 @@ async def run_backtest(
     trades = []
     equity_curve = []
     scale_out_events = 0
+    mtf_debug = {}
 
     for date in backtest_dates:
         # ===== 1. GESTIONE POSIZIONI APERTE (APM logic) =====
@@ -383,6 +384,8 @@ async def run_backtest(
                 if idx is None or idx < 50:
                     continue
                 bars_slice = bars[:idx + 1]
+                _wt, _ws = _weekly_trend_bt(bars_slice)
+                mtf_debug[_wt] = mtf_debug.get(_wt, 0) + 1
                 conf, target_price, stop_price, setup = _confluence_and_target(bars_slice, use_mtf=use_mtf)
                 if conf >= min_confluence:
                     entry_price = bars_slice[-1]["c"]
@@ -476,6 +479,8 @@ async def run_backtest(
             "scale_out_events": scale_out_events,
             "apm_enabled": use_apm,
         },
+        "mtf_debug": mtf_debug,
+        "config_use_mtf": use_mtf,
         "equity_curve": equity_curve[::max(1, len(equity_curve) // 100)],
         "trades": sorted(trades, key=lambda x: x["exit_date"], reverse=True)[:60],
         "total_trades": len(trades),
