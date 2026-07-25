@@ -352,6 +352,13 @@ class Executor(BaseAgent):
             if entry_price <= 0:
                 continue
 
+            # 🔧 v4.8 — Se l'APM ha già fatto scale-out (floor fisso), NON stringere.
+            # Il break-even a +5% di questo metodo uccideva i runner prima di T2/T3.
+            # Dopo T1 comanda l'APM: lascia correre verso il target.
+            apm_trailing = await db.trailing_stops.find_one({"ticker": symbol})
+            if apm_trailing and apm_trailing.get("apm_managed"):
+                continue
+
             new_stop = None
             reason = None
             if pnl_pct >= level3:
