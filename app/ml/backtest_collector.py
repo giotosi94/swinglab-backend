@@ -1,6 +1,6 @@
 """
-Backtest Data Collector v2.1 — genera training data ML da dati storici.
-Calcola TUTTE le 15 features (incluse regime, wyckoff, accumulation, bullish patterns).
+Backtest Data Collector v2.2 — genera training data ML da dati storici.
+Calcola TUTTE le 17 features (14 base reali + 3 interazioni).
 Ogni posizione = 1 training sample (no scale-out duplication).
 """
 
@@ -147,7 +147,7 @@ def _regime_from_spy(spy_closes, date_idx):
 # ============================================
 
 def _build_features(bars_slice, sector_code, sector_rank=6, regime_enc=1):
-    """Estrae le 15 features nel formato features.py da bars storici."""
+    """Estrae le 17 features nel formato features.py da bars storici."""
     closes = [b["c"] for b in bars_slice]
     opens = [b.get("o", b["c"]) for b in bars_slice]
     highs = [b["h"] for b in bars_slice]
@@ -260,7 +260,7 @@ async def collect_backtest_training_data(
 ):
     """
     Simula trade su dati storici e salva features + outcome in ml_training_data.
-    v2.1: tutte le 15 features calcolate realmente.
+    v2.2: tutte le 17 features calcolate realmente.
     """
     db = get_db()
 
@@ -389,7 +389,8 @@ async def collect_backtest_training_data(
     wins = sum(1 for s in samples if s["label"] == 1)
     losses = len(samples) - wins
 
-     training data collected (v2.2 - 17 features)",
+    return {
+        "message": "Backtest training data collected (v2.2 - 17 features)",
         "total_samples": len(samples),
         "wins": wins,
         "losses": losses,
