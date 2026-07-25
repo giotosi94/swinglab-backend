@@ -69,7 +69,7 @@ def _weekly_trend_bt(bars_slice):
     return trend, slope
 
 
-def _confluence_and_target(bars_slice):
+def _confluence_and_target(bars_slice, use_mtf=True):
     """
     Calcola confluence + target dinamico (come Alpha reale).
     Ritorna: (confluence, target_price, stop_price, setup_type)
@@ -131,7 +131,7 @@ def _confluence_and_target(bars_slice):
         score += 10
 
     # 🆕 MTF Weekly Alignment (proporzionale al peso live: ~11% del totale)
-    wtrend, wslope = _weekly_trend_bt(bars_slice) if _USE_MTF_BT else ("UNKNOWN", "flat")
+    wtrend, wslope = _weekly_trend_bt(bars_slice) if use_mtf else ("UNKNOWN", "flat")
     if wtrend == "BULL" and wslope == "rising":
         score += 12
     elif wtrend == "BULL":
@@ -242,8 +242,6 @@ async def run_backtest(
     - Break-even SL dopo T1
     - Trailing stop dopo T2
     """
-    global _USE_MTF_BT
-    _USE_MTF_BT = use_mtf
     db = get_db()
     all_bars = await db.stock_bars.find({}).to_list(300)
     if not all_bars:
@@ -385,7 +383,7 @@ async def run_backtest(
                 if idx is None or idx < 50:
                     continue
                 bars_slice = bars[:idx + 1]
-                conf, target_price, stop_price, setup = _confluence_and_target(bars_slice)
+                conf, target_price, stop_price, setup = _confluence_and_target(bars_slice, use_mtf=use_mtf)
                 if conf >= min_confluence:
                     entry_price = bars_slice[-1]["c"]
                     candidates.append((ticker, conf, entry_price, target_price, stop_price, setup))
