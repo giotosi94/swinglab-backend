@@ -427,3 +427,72 @@ async def train_hybrid(real_weight: int = 3):
     from app.ml.model import ml_model
     result = await ml_model.train_hybrid(real_weight=real_weight)
     return result
+
+
+@router.post("/weekly-retrain")
+async def weekly_retrain(
+    days: int = 250,
+    min_confluence: float = 55,
+    real_weight: int = 3,
+):
+    """
+    🆕 Cron settimanale: collect backtest data (17 feature) + train-hybrid.
+    Un solo endpoint atomico per il cron della domenica.
+    Il modello impara dai nuovi trade reali accumulati durante la settimana.
+    """
+    from datetime import datetime
+    from app.ml.backtest_collector import collect_backtest_training_data
+    from app.ml.model import ml_model
+
+    report = {"started_at": datetime.utcnow().isoformat()}
+
+    # ===== Step 1: Collect =====
+    try:
+        collect_result = await collect_backtest_training_data(
+            days=days, min_confluence=min_confluence
+        )
+        report["collect"] = {
+            "status": "ok",
+            "total_samples": collect_result.get("total_samples", 0),
+            "message": collect_result.get("message", ""),
+        }
+    except Exception as e:
+        report["collect"] = {"status": "error", "error": str(e)}
+        report["status"] = "failed_at_collect"
+        return report
+
+    # ===== Step 2: Train hybrid =====
+    try:
+        train_result = await ml_model.train_hybrid(real_weight=real_weight)
+        report["train"] = {
+            "status": "ok",
+            "accuracy": train_result.get("accuracy", 0),
+            "n_samples": train_result.get("n_samples", 0),
+            "n_real_positions": train_result.get("n_real_positions", 0),
+            "top_features": train_result.get("top_features", {}),
+        }
+        report["status"] = "success"
+    except Exception as e:
+        report["train"] = {"status": "error", "error": str(e)}
+        report["status"] = "failed_at_train"
+        return report
+
+    # ===== Step 3: Telegram report =====
+    try:
+        from app.services.telegram_bot import send_telegram
+        acc = report["train"]["accuracy"]
+        n_real = report["train"]["n_real_positions"]
+        msg = (
+            f"🧠 <b>ML Weekly Retrain</b>\n\n"
+            f"✅ Accuracy: {acc}%\n"
+            f"📊 Samples: {report['train']['n_samples']} "
+            f"({n_real} posizioni reali)\n"
+            f"🎯 Backtest: {report['collect']['total_samples']} sample\n\n"
+            f"Modello aggiornato e salvato."
+        )
+        await send_telegram(msg)
+    except Exception as e:
+        report["telegram"] = f"error: {e}"
+
+    report["finished_at"] = datetime.utcnow().isoformat()
+    return report
