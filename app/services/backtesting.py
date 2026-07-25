@@ -470,8 +470,7 @@ async def run_backtest(
                 spy_curve.append({"date": b["date"], "spy_pct": pct})
                 spy_by_date[b["date"]] = b["c"]
 
-            # Beta + correlazione sui rendimenti giornalieri
-            # Beta +  (difensivo)
+            # Beta + correlazione sui rendimenti giornalieri (difensivo)
             try:
                 eq_map = {e["date"]: e["equity"] for e in equity_curve}
                 common_dates = sorted(set(eq_map.keys()) & set(spy_by_date.keys()))
@@ -515,7 +514,6 @@ async def run_backtest(
             "starting_capital": starting_capital,
         },
         "metrics": metrics,
-        "benchmark": {
         "benchmark": {
             "spy_return_pct": round(spy_return, 2),
             "alpha": round(metrics.get("total_return_pct", 0) - spy_return, 2),
