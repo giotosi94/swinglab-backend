@@ -1,6 +1,6 @@
 """
-SwingLab ML — Feature Extraction
-Extracts 15 features from assets/trades for the XGBoost model.
+SwingLab ML — Feature Extraction v2.0
+Feature engineering: rimossa sector_rank (morta), aggiunte 3 interazioni.
 """
 
 # ---- Feature encoding maps ----
@@ -16,12 +16,17 @@ WYCKOFF_ENCODE = {
 
 REGIME_ENCODE = {"BULL": 0, "NEUTRAL": 1, "BEAR": 2, "CRASH": 3}
 
+# v2.0 — sector_rank rimossa (sempre morta). +3 interazioni.
 FEATURE_NAMES = [
     "rsi", "macd_histogram", "ema_alignment", "relative_volume",
-    "poc_distance_pct", "setup_type_encoded", "sector_rank",
+    "poc_distance_pct", "setup_type_encoded",
     "wyckoff_encoded", "accumulation_score", "range_position",
     "change_pct", "regime_encoded", "confluence_score",
     "has_bullish_patterns", "pct_from_high",
+    # 🆕 v2.0 interaction features
+    "rsi_volume_interaction",
+    "trend_strength",
+    "value_proximity",
 ]
 
 
@@ -61,53 +66,67 @@ def _has_bullish(asset):
 
 def extract_features_from_asset(asset, market_context=None):
     """
-    Extract 15 ML features from an asset document.
-    Returns a dict with feature_name -> value.
+    Extract ML features from an asset document.
+    v2.0: 14 base + 3 interaction = 17 features.
     """
     mc = market_context or {}
     wyckoff = asset.get("wyckoff", {})
     accum = asset.get("accumulation", {})
     macd = asset.get("macd", {})
 
-    # Sector rank from market context
-    sector_rank = 6  # default middle
-    sector_code = asset.get("sector_code", "")
-    rankings = mc.get("sector_rankings", {})
-    if sector_code in rankings:
-        sector_rank = rankings[sector_code]
-
     # Regime
     regime = mc.get("regime", asset.get("market_regime", "NEUTRAL"))
 
+    # ---- Base values ----
+    rsi = round(asset.get("rsi", 50), 2)
+    macd_hist = round(macd.get("histogram", 0) if isinstance(macd, dict) else 0, 4)
+    ema_align = _calc_ema_alignment(asset)
+    rel_vol = round(asset.get("relative_volume", 1), 2)
+    poc_dist = _calc_poc_distance(asset)
+    accum_score = round(accum.get("score", 0) if isinstance(accum, dict) else 0, 1)
+    confluence = round(asset.get("setup_score", 0), 1)
+
+    # ---- 🆕 v2.0 Interaction features ----
+    # 1. RSI sweet-spot × volume: premia RSI vicino a 50 CON volume alto
+    rsi_sweet = max(0.0, 1.0 - abs(rsi - 50) / 50)  # 0..1, picco a rsi=50
+    rsi_volume_interaction = round(rsi_sweet * rel_vol, 3)
+
+    # 2. Trend strength: allineamento EMA × direzione MACD (-2..+2)
+    macd_dir = 1 if macd_hist > 0 else (-1 if macd_hist < 0 else 0)
+    trend_strength = round(ema_align * macd_dir, 2)
+
+    # 3. Value proximity: vicinanza a POC × accumulazione istituzionale (0..1)
+    poc_closeness = max(0.0, (5.0 - poc_dist) / 5.0)  # 1 se sul POC, 0 se >5% lontano
+    value_proximity = round(poc_closeness * (accum_score / 100.0), 3)
+
     features = {
-        "rsi": round(asset.get("rsi", 50), 2),
-        "macd_histogram": round(macd.get("histogram", 0) if isinstance(macd, dict) else 0, 4),
-        "ema_alignment": _calc_ema_alignment(asset),
-        "relative_volume": round(asset.get("relative_volume", 1), 2),
-        "poc_distance_pct": _calc_poc_distance(asset),
+        "rsi": rsi,
+        "macd_histogram": macd_hist,
+        "ema_alignment": ema_align,
+        "relative_volume": rel_vol,
+        "poc_distance_pct": poc_dist,
         "setup_type_encoded": SETUP_ENCODE.get(asset.get("setup_type", "neutral"), 5),
-        "sector_rank": sector_rank,
         "wyckoff_encoded": WYCKOFF_ENCODE.get(wyckoff.get("phase", ""), 5),
-        "accumulation_score": round(accum.get("score", 0) if isinstance(accum, dict) else 0, 1),
+        "accumulation_score": accum_score,
         "range_position": round(asset.get("range_position", 50), 1),
         "change_pct": round(asset.get("change_pct", 0), 2),
         "regime_encoded": REGIME_ENCODE.get(regime, 1),
-        "confluence_score": round(asset.get("setup_score", 0), 1),
+        "confluence_score": confluence,
         "has_bullish_patterns": _has_bullish(asset),
         "pct_from_high": round(asset.get("pct_from_high", -50), 2),
+        # interazioni
+        "rsi_volume_interaction": rsi_volume_interaction,
+        "trend_strength": trend_strength,
+        "value_proximity": value_proximity,
     }
     return features
 
 
 def extract_features_from_trade(trade, asset_at_entry=None, market_context=None):
-    """
-    Extract features from a trade document (from trade_history).
-    Falls back to asset_at_entry if available.
-    """
+    """Extract features from a trade document (from trade_history)."""
     asset = asset_at_entry or {}
     mc = market_context or {}
 
-    # Build a pseudo-asset dict from trade fields
     pseudo = {
         "rsi": trade.get("rsi_at_entry", asset.get("rsi", 50)),
         "macd": trade.get("macd_at_entry", asset.get("macd", {})),
