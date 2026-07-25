@@ -300,7 +300,6 @@ def calc_weekly_trend(df):
     wema50 = float(wclose.ewm(span=min(50, len(w))).mean().iloc[-1])
     wrsi = round(float(calc_rsi(wclose)), 1) if len(w) >= 15 else 50
 
-    # Slope EMA20 sulle ultime 4 settimane
     slope = "flat"
     if len(wema20_series) >= 4:
         prev = float(wema20_series.iloc[-4])
@@ -309,7 +308,6 @@ def calc_weekly_trend(df):
         elif wema20 < prev * 0.995:
             slope = "falling"
 
-    # Trend di fondo weekly
     if wprice > wema10 > wema20 > wema50 and wema50 > 0:
         trend, score = "BULL", 90
     elif wprice > wema20 > wema50 and wema50 > 0:
@@ -341,8 +339,8 @@ def calc_weekly_trend(df):
 # ============================================
 
 async def fetch_bars_from_api(client, symbol, limit=252):
-    """Fetch bars: Alpaca IEX first (fresh), Twelve Data fallback."""
-    # 🔧 v4.3 — Alpaca IEX priority (freschi) invece di Twelve Data (stale)
+    """Fetch bars: Alpaca IEX first (fresh, sort=desc), Twelve Data fallback."""
+    # 🔧 v4.4 — sort=desc per ottenere le barre PIU' RECENTI (non le piu' vecchie)
     end = datetime.utcnow() - timedelta(minutes=20)
     start = end - timedelta(days=400)
     url = f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/bars"
@@ -353,6 +351,7 @@ async def fetch_bars_from_api(client, symbol, limit=252):
         "limit": limit,
         "feed": "iex",
         "adjustment": "split",
+        "sort": "desc",
     }
     try:
         r = await client.get(url, headers=ALPACA_HEADERS, params=params)
@@ -360,6 +359,7 @@ async def fetch_bars_from_api(client, symbol, limit=252):
             data = r.json()
             bars = data.get("bars", [])
             if bars:
+                bars.reverse()  # desc -> cronologico (il resto del codice assume ascendente)
                 return bars
     except Exception as e:
         print(f"  Alpaca error {symbol}: {e}")
@@ -393,7 +393,9 @@ async def fetch_bars_from_api(client, symbol, limit=252):
 
     return []
 
-    # Fallback / bulk: use Alpaca IEX
+
+async def _fetch_bars_alpaca(client, symbol, limit=252):
+    """Fetch bars directly from Alpaca IEX (historical bulk, sort=desc)."""
     end = datetime.utcnow() - timedelta(minutes=20)
     start = end - timedelta(days=400)
     url = f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/bars"
@@ -404,62 +406,45 @@ async def fetch_bars_from_api(client, symbol, limit=252):
         "limit": limit,
         "feed": "iex",
         "adjustment": "split",
+        "sort": "desc",
     }
     try:
         r = await client.get(url, headers=ALPACA_HEADERS, params=params)
         if r.status_code != 200:
             return []
         data = r.json()
-        return data.get("bars", [])
+        bars = data.get("bars", [])
+        bars.reverse()  # desc -> cronologico
+        return bars
     except Exception:
         return []
 
-async def _fetch_bars_alpaca(client, symbol, limit=252):
-    """Fetch bars directly from Alpaca IEX (historical bulk)."""
-    end = datetime.utcnow() - timedelta(minutes=20)
-    start = end - timedelta(days=400)
-    url = f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/bars"
-    params = {
-        "timeframe": "1Day",
-        "start": start.strftime("%Y-%m-%dT00:00:00Z"),
-        "end": end.strftime("%Y-%m-%dT23:59:59Z"),
-        "limit": limit,
-        "feed": "iex",
-        "adjustment": "split",
-    }
-    try:
-        r = await client.get(url, headers=ALPACA_HEADERS, params=params)
-        if r.status_code != 200:
-            return []
-        data = r.json()
-        return data.get("bars", [])
-    except Exception:
-        return []
 
 async def get_or_fetch_bars(client, db, symbol):
     doc = await db.stock_bars.find_one({"ticker": symbol})
 
     if doc and doc.get("bars") and len(doc["bars"]) >= 20:
-        last_date = doc["bars"][-1].get("date", "")
+        # Recency dell'ultima barra salvata
+        last_bar_date = doc["bars"][-1].get("date", "")
         try:
-            days_old = (datetime.utcnow() - datetime.strptime(last_date, "%Y-%m-%d")).days
-        except:
+            days_old = (datetime.utcnow() - datetime.strptime(last_bar_date, "%Y-%m-%d")).days
+        except Exception:
             days_old = 999
 
-        # 🔧 v4.3 — Force refresh se cache vecchia di più di 4 ore (era 1 giorno)
-        # Verifica solo timestamp updated_at invece di last_bar date
+        # Freschezza dell'ultimo update
         last_update = doc.get("updated_at")
+        hours_since_update = 999
         if last_update:
             hours_since_update = (datetime.utcnow() - last_update).total_seconds() / 3600
-            if hours_since_update < 4:  # Cache valida solo per 4 ore
-                return _bars_to_df(doc["bars"])
-        
-        # Altrimenti fetch fresh (era: if days_old <= 1)
-        # (rimossa la logica days_old che era buggy)
+
+        # 🔧 v4.4 — Cache valida SOLO se aggiornata di recente E l'ultima barra è recente.
+        # (max 4 giorni per coprire weekend/festivi). Questo evita il "congelamento"
+        # in cui updated_at è fresco ma le barre sono vecchie di settimane.
+        if hours_since_update < 4 and days_old <= 4:
             return _bars_to_df(doc["bars"])
 
-        fetch_limit = min(days_old + 5, 65)
-        new_bars_raw = await fetch_bars_from_api(client, symbol, limit=fetch_limit)
+        # Altrimenti fetch fresh e merge (fetch_bars_from_api ora ritorna le barre recenti)
+        new_bars_raw = await fetch_bars_from_api(client, symbol, limit=90)
         if new_bars_raw:
             existing_dates = {b["date"] for b in doc["bars"]}
             new_bars = []
@@ -480,10 +465,16 @@ async def get_or_fetch_bars(client, db, symbol):
                     {"$set": {"bars": all_bars, "last_bar_date": last_bar, "updated_at": datetime.utcnow()}}
                 )
                 return _bars_to_df(all_bars)
+
+        # Nessuna barra nuova: aggiorna solo il timestamp per non martellare l'API
+        await db.stock_bars.update_one(
+            {"ticker": symbol},
+            {"$set": {"updated_at": datetime.utcnow()}}
+        )
         return _bars_to_df(doc["bars"])
 
     else:
-        # Step 1: Bulk historical from Alpaca IEX
+        # Step 1: Bulk historical from Alpaca IEX (sort=desc -> recenti)
         alpaca_bars_raw = await _fetch_bars_alpaca(client, symbol, limit=252)
         bars = []
         for b in (alpaca_bars_raw or []):
@@ -492,7 +483,7 @@ async def get_or_fetch_bars(client, db, symbol):
                 "o": b["o"], "h": b["h"], "l": b["l"], "c": b["c"], "v": b["v"],
             })
 
-        # Step 2: Fill recent gap with Twelve Data
+        # Step 2: Fill recent gap con fetch_bars_from_api (Alpaca desc / Twelve Data)
         recent_raw = await fetch_bars_from_api(client, symbol, limit=45)
         if recent_raw:
             existing_dates = {b["date"] for b in bars}
@@ -688,7 +679,6 @@ async def fetch_and_analyze_sectors(force=False):
                 spp = float(sym_df["Close"].iloc[-2])
                 sc = round(((sp - spp) / spp) * 100, 2)
                 extra = {"symbol": sym, "price": round(sp, 2), "change_pct": sc, "updated_at": datetime.utcnow()}
-                # Add RSI and EMAs for richer analysis
                 if len(sym_df) >= 20:
                     try:
                         extra["rsi"] = round(float(calc_rsi(sym_df["Close"])), 1)
@@ -701,7 +691,7 @@ async def fetch_and_analyze_sectors(force=False):
                 print(f"  {sym}: ${sp:.2f} ({sc:+.2f}%)")
             else:
                 print(f"  {sym}: no data")
-        
+
         results = []
         for etf, name in SECTOR_MAP.items():
             try:
