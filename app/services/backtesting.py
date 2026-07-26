@@ -69,7 +69,7 @@ def _weekly_trend_bt(bars_slice):
     return trend, slope
 
 
-def _confluence_and_target(bars_slice, use_mtf=True):
+def _confluence_and_target(bars_slice, use_mtf=True, use_momentum=True):
     """
     Calcola confluence + target dinamico (come Alpha reale).
     Ritorna: (confluence, target_price, stop_price, setup_type)
@@ -140,6 +140,26 @@ def _confluence_and_target(bars_slice, use_mtf=True):
         score += 2
     elif wtrend == "BEAR":
         score -= 10
+
+    # 🎢 MOMENTUM FACTOR — premia i titoli in forte trend (per battere SPY nei bull)
+    if use_momentum:
+        # 1. RSI forte sostenuto (55-70 = trend sano, non ipercomprato)
+        if 55 <= rsi <= 70:
+            score += 10
+        elif 70 < rsi <= 78:
+            score += 5  # ancora forte ma inizia a scaldarsi
+        # 2. Accelerazione: ret_20d robusto
+        if ret_20d > 10:
+            score += 10
+        elif ret_20d > 5:
+            score += 5
+        # 3. Vicino ai massimi = forza relativa (proxy 52w high)
+        high_all = max(highs) if highs else price
+        pfh = (price - high_all) / high_all * 100 if high_all > 0 else -50
+        if pfh > -3:
+            score += 8   # a ridosso dei massimi
+        elif pfh > -8:
+            score += 4
 
     score = max(0, min(score, 100))
 
@@ -234,6 +254,7 @@ async def run_backtest(
     t2_ratio: float = 0.70,
     t3_ratio: float = 1.00,
     use_mtf: bool = True,
+    use_momentum: bool = True,
 ):
     """
     Backtest v2.0 con APM COMPLETO:
@@ -386,7 +407,7 @@ async def run_backtest(
                 bars_slice = bars[:idx + 1]
                 _wt, _ws = _weekly_trend_bt(bars_slice)
                 mtf_debug[_wt] = mtf_debug.get(_wt, 0) + 1
-                conf, target_price, stop_price, setup = _confluence_and_target(bars_slice, use_mtf=use_mtf)
+                conf, target_price, stop_price, setup = _confluence_and_target(bars_slice, use_mtf=use_mtf, use_momentum=use_momentum)
                 if conf >= min_confluence:
                     entry_price = bars_slice[-1]["c"]
                     candidates.append((ticker, conf, entry_price, target_price, stop_price, setup))
