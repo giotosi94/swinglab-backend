@@ -556,6 +556,7 @@ async def backtest_run(
     t2_ratio: float = 0.70,
     t3_ratio: float = 1.00,
     use_preset: bool = True,
+    use_momentum: bool = True,
 ):
     """v2.1 Backtest con APM + parametri dal preset di rischio attivo."""
     from app.services.backtesting import run_backtest
@@ -590,6 +591,7 @@ async def backtest_run(
         t1_ratio=t1_ratio,
         t2_ratio=t2_ratio,
         t3_ratio=t3_ratio,
+        use_momentum=use_momentum,
     )
     result["active_preset"] = preset_name
     return result
