@@ -52,8 +52,10 @@ class RiskManager(BaseAgent):
         weekly_trades = await db.trade_history.find({
             "date": {"$gte": week_ago},
             "side": "sell",
-        }).to_list(100)
-        weekly_pnl_pct = sum(t.get("pnl_pct", 0) for t in weekly_trades)
+        }).to_list(500)
+        # 🔧 FIX: weekly P&L in $ sul capitale, NON somma delle % (bug tipo +159%)
+        weekly_pnl_dollar = sum(t.get("pnl_dollar", 0) for t in weekly_trades)
+        weekly_pnl_pct = (weekly_pnl_dollar / equity * 100) if equity > 0 else 0
         daily_limit = params.get("daily_loss_limit_pct", -3.0)
         drawdown_reduce = params.get("drawdown_reduce_pct", -3.0)
         drawdown_stop = params.get("drawdown_stop_pct", -5.0)
