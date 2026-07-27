@@ -563,27 +563,31 @@ class AdaptivePositionManager(BaseAgent):
         min_negative = params.get("apm_exit_min_negative_factors", 2)
         
         # 🆕 v1.1 — Detect "ML flat" (bug fix)
-        # Se ML score è sospettosamente uguale per tutti (es. 92.3% overfitted),
-        # ignoriamo il factor ML dalle decisioni.
-        # ML flat = probabilmente modello overfit o non discriminatorio.
         ml_score_looks_flat = (
             current_ml_score > 85 and current_ml_score < 95 
-            and abs(current_ml_score - 92.3) < 1.0  # troppo vicino a 92.3%
+            and abs(current_ml_score - 92.3) < 1.0
         )
         
-        # Conta fattori negativi
+        # 🆕 v1.5 — Logica RELATIVA alla tesi d'ingresso (anti-churning strutturale).
+        # L'APM esce se la tesi si è ROTTA rispetto a com'era al buy, NON se un
+        # numero è basso in assoluto. Evita che l'Alpha compri a confluence 44 e
+        # l'APM venda alla stessa confluence 44 (conflitto tra agenti).
+        confluence_drop = original_confluence - current_confluence  # >0 = peggiorata
+
         negative_factors = []
-        if current_confluence < exit_conf_th:
-            negative_factors.append(f"confluence {current_confluence:.0f} < {exit_conf_th}")
+        # Confluence: conta SOLO se è CROLLATA materialmente vs entry (>10 punti),
+        # non se oscilla di rumore. In più deve essere sotto la soglia assoluta.
+        if confluence_drop >= 10 and current_confluence < exit_conf_th:
+            negative_factors.append(
+                f"confluence crollata {original_confluence:.0f}→{current_confluence:.0f}"
+            )
         
-        # 🔧 Ignora ML score se sembra "flat" (bug del modello)
+        # ML: conta solo se predice LOSS con score basso (segnale forte, non rumore)
         if not ml_score_looks_flat:
-            if current_ml_score < exit_ml_th:
-                negative_factors.append(f"ML {current_ml_score:.0f}% < {exit_ml_th}%")
-            if current_ml_pred == "LOSS":
-                negative_factors.append("ML predicts LOSS")
+            if current_ml_pred == "LOSS" and current_ml_score < exit_ml_th:
+                negative_factors.append(f"ML LOSS {current_ml_score:.0f}% < {exit_ml_th}%")
         
-        # Trend è indipendente dal ML score, quindi lo teniamo
+        # Trend girato al ribasso (segnale indipendente)
         if current_trend_pred == "DOWN":
             negative_factors.append("Trend DOWN")
         
