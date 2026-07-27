@@ -590,10 +590,24 @@ class AdaptivePositionManager(BaseAgent):
         # ============================================
         # 🔴 EXIT
         # ============================================
+        # 🆕 v1.4 — Minimum holding period (anti-churning).
+        # Non uscire per "tesi debole" su posizioni appena aperte: evita il loop
+        # compra→vende→ricompra quando Alpha (entry) e APM (exit) hanno soglie
+        # in conflitto (es. confluence 44 basta per comprare ma l'APM la scarta).
+        # Lo STOP LOSS resta attivo (gestito dall'Executor) → la protezione vera c'è.
+        buy_date_ref = buy_trade_ref.get("date") if buy_trade_ref else None
+        hours_held = 999.0
+        if buy_date_ref:
+            try:
+                hours_held = (datetime.utcnow() - buy_date_ref).total_seconds() / 3600
+            except Exception:
+                hours_held = 999.0
+        too_fresh = hours_held < 24  # prime 24h: niente EXIT per tesi debole
+
         # 🆕 v1.3 — Runner protection: se ha già preso T1+ ed è in profitto,
-        # NON uscire per tesi debole. Lascia correre verso T2/T3 col trailing.
+        # NON uscire per tesi debole. Lascia correre verso T2/T3.
         runner_in_profit = last_target_hit_now >= 1 and pnl_pct > 0
-        if len(negative_factors) >= min_negative and not runner_in_profit:
+        if len(negative_factors) >= min_negative and not runner_in_profit and not too_fresh:
             return {
                 "decision": "EXIT",
                 "reason": (
