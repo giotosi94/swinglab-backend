@@ -102,6 +102,84 @@ class MacroAnalyst(BaseAgent):
             "deploy_signal": crash_level in ("DEPLOY", "DEPLOY_MAX"),
         }
 
+    async def _calc_sector_bottom_detector(self, db) -> dict:
+        """
+        🆕 SECTOR BOTTOM DETECTOR (Progetto Alpha) — soglie validate Quant Rea.
+        Per ogni settore calcola la % di titoli sopra la 200 SMA. Se scende
+        sotto la soglia specifica → settore in CAPITOLAZIONE/bottom → segnala
+        di comprare i leader di quel settore (peso = rendimento storico 5Y).
+        """
+        from app.services.data_fetcher import SECTOR_STOCKS
+
+        # Soglie (% titoli sopra 200SMA sotto cui = bottom) + peso (rend. 5Y post-bottom)
+        SECTOR_CFG = {
+            "XLE":  {"threshold": 1,  "weight": 13.63},
+            "XLC":  {"threshold": 5,  "weight": 18.58},
+            "XLI":  {"threshold": 5,  "weight": 18.58},
+            "XLU":  {"threshold": 5,  "weight": 10.0},   # peso prudente (non in studio Max)
+            "XLF":  {"threshold": 6,  "weight": 15.44},
+            "XLK":  {"threshold": 6,  "weight": 17.56},
+            "XLRE": {"threshold": 8,  "weight": 8.81},
+            "XLY":  {"threshold": 8,  "weight": 23.22},
+            "XLB":  {"threshold": 10, "weight": 12.82},
+            "XLP":  {"threshold": 11, "weight": 10.94},
+            "XLV":  {"threshold": 11, "weight": 16.27},
+        }
+
+        # Carica tutte le barre dei titoli dei settori in un colpo
+        all_tickers = [t for lst in SECTOR_STOCKS.values() for t in lst]
+        bars_cursor = db.stock_bars.find(
+            {"ticker": {"$in": all_tickers}}, {"ticker": 1, "bars": 1}
+        )
+        bars_map = {}
+        async for doc in bars_cursor:
+            bars_map[doc["ticker"]] = doc.get("bars", [])
+
+        sectors_status = []
+        bottom_sectors = []
+
+        for sec, tickers in SECTOR_STOCKS.items():
+            cfg = SECTOR_CFG.get(sec)
+            if not cfg:
+                continue
+            counted = 0
+            above = 0
+            for tk in tickers:
+                bars = bars_map.get(tk, [])
+                closes = [b["c"] for b in bars[-200:] if b.get("c")]
+                if len(closes) < 100:  # servono almeno 100 barre per una 200SMA sensata
+                    continue
+                sma = sum(closes) / len(closes)
+                counted += 1
+                if closes[-1] > sma:
+                    above += 1
+
+            if counted == 0:
+                continue
+            pct_above = round(above / counted * 100, 1)
+            is_bottom = pct_above < cfg["threshold"]
+
+            entry = {
+                "sector": sec,
+                "pct_above_200sma": pct_above,
+                "threshold": cfg["threshold"],
+                "weight": cfg["weight"],
+                "is_bottom": is_bottom,
+                "n_stocks": counted,
+            }
+            sectors_status.append(entry)
+            if is_bottom:
+                bottom_sectors.append(entry)
+
+        # Ordina i settori in bottom per peso (i ciclici rimbalzano più forte)
+        bottom_sectors.sort(key=lambda x: x["weight"], reverse=True)
+
+        return {
+            "any_bottom": len(bottom_sectors) > 0,
+            "bottom_sectors": bottom_sectors,
+            "all_sectors": sorted(sectors_status, key=lambda x: x["pct_above_200sma"]),
+        }
+
     async def analyze(self, context: dict = None) -> dict:
         db = get_db()
         params = await self.get_params()
@@ -429,6 +507,13 @@ class MacroAnalyst(BaseAgent):
                   f"(score {crash_radar['crash_risk_score']}, "
                   f"SPY dd {crash_radar['spy_drawdown_pct']}%, VIXY {vixy_price})")
 
+        # 🆕 SECTOR BOTTOM DETECTOR (Progetto Alpha) — settori in capitolazione
+        sector_bottom = await self._calc_sector_bottom_detector(db)
+        if sector_bottom["any_bottom"]:
+            hot = ", ".join(f"{s['sector']}({s['pct_above_200sma']}%)"
+                            for s in sector_bottom["bottom_sectors"])
+            print(f"  🏭 SECTOR BOTTOM: {hot}")
+
         # ============================================
         # BUILD MARKET CONTEXT
         # ============================================
@@ -447,6 +532,7 @@ class MacroAnalyst(BaseAgent):
             "breadth_divergence": breadth_divergence,
             "risk_appetite": risk_appetite,
             "crash_radar": crash_radar,
+            "sector_bottom": sector_bottom,
             "sector_rankings": sector_rankings,
             "details": {
                 "spy": {"price": spy_price, "ema20": spy_ema20, "ema50": spy_ema50,
