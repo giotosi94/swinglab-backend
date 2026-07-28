@@ -606,7 +606,8 @@ async def apm_position_targets():
                     "pct": t1_pct,
                     "price": t1_price,
                     "distance_pct": dist_t1,
-                    "reached": pnl_pct >= t1_pct,
+                    # 🔧 reached PERSISTENTE: vero se scale-out T1 già fatto (DB) O prezzo sopra
+                    "reached": last_target_hit >= 1 or pnl_pct >= t1_pct,
                     "progress": progress_to_t1,
                     "size_pct": 50,
                 },
@@ -614,7 +615,7 @@ async def apm_position_targets():
                     "pct": t2_pct,
                     "price": t2_price,
                     "distance_pct": dist_t2,
-                    "reached": pnl_pct >= t2_pct,
+                    "reached": last_target_hit >= 2 or pnl_pct >= t2_pct,
                     "progress": round(max(0, min(100, (pnl_pct / t2_pct) * 100)), 1) if t2_pct > 0 else 0,
                     "size_pct": 30,
                 },
@@ -622,12 +623,11 @@ async def apm_position_targets():
                     "pct": t3_pct,
                     "price": t3_price,
                     "distance_pct": dist_t3,
-                    "reached": pnl_pct >= t3_pct,
+                    "reached": last_target_hit >= 3 or pnl_pct >= t3_pct,
                     "progress": progress_to_t3,
                     "size_pct": 20,
                 },
             },
-        })
     
     return {
         "positions": results,
