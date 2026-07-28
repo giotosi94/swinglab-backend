@@ -518,24 +518,23 @@ async def dps_kelly_status():
 @router.get("/apm/position-targets")
 async def apm_position_targets():
     """
-    v4.6 — Ritorna target adattivi per ogni posizione aperta.
-    Include: entry, current, target 1/2/3, SL, distanza attuale da ogni target.
+    v4.6 — Target adattivi per ogni posizione aperta.
+    reached = persistente (legge last_target_hit dal DB, non solo il prezzo).
     """
     from app.db.mongodb import get_db
     from app.services.alpaca_trader import get_positions
-    
+
     db = get_db()
-    
+
     positions = await get_positions() or []
     if not positions:
         return {"positions": [], "total": 0}
-    
-    # Legge params default APM (fallback per trade vecchi)
+
     apm_params = await db.agent_memory_adaptive_position_manager.find_one({"_id": "params"}) or {}
     default_t1 = apm_params.get("apm_target_1_pct", 5.0)
     default_t2 = apm_params.get("apm_target_2_pct", 10.0)
     default_t3 = apm_params.get("apm_target_3_pct", 20.0)
-    
+
     results = []
     for pos in positions:
         symbol = pos.get("symbol")
@@ -543,51 +542,44 @@ async def apm_position_targets():
         current_price = float(pos.get("current_price", 0))
         pnl_pct = float(pos.get("unrealized_plpc", 0)) * 100
         qty = float(pos.get("qty", 0))
-        
+
         if not symbol or entry_price <= 0:
             continue
-        
-        # Trova buy_trade per adaptive targets
+
         buy_trade = await db.trade_history.find_one(
             {"ticker": symbol, "side": "buy", "sell_linked": {"$ne": True}},
             sort=[("date", -1)]
         )
-        
-        # Adaptive vs default
+
         adaptive_t1 = buy_trade.get("adaptive_t1_pct") if buy_trade else None
         adaptive_t2 = buy_trade.get("adaptive_t2_pct") if buy_trade else None
         adaptive_t3 = buy_trade.get("adaptive_t3_pct") if buy_trade else None
-        
+
         is_adaptive = bool(adaptive_t1 and adaptive_t1 > 0)
-        
+
         t1_pct = adaptive_t1 if is_adaptive else default_t1
         t2_pct = adaptive_t2 if adaptive_t2 else default_t2
         t3_pct = adaptive_t3 if adaptive_t3 else default_t3
-        
-        # Calcola prezzi target
+
         t1_price = round(entry_price * (1 + t1_pct / 100), 2)
         t2_price = round(entry_price * (1 + t2_pct / 100), 2)
         t3_price = round(entry_price * (1 + t3_pct / 100), 2)
-        
-        # SL e original target Alpha
+
         stop_loss = buy_trade.get("stop_loss", 0) if buy_trade else 0
         original_target = buy_trade.get("target", 0) if buy_trade else 0
         confluence = buy_trade.get("confluence", 0) if buy_trade else 0
         setup_type = buy_trade.get("setup_type", "unknown") if buy_trade else "unknown"
-        
-        # Track progress
+
         last_target_hit = buy_trade.get("last_target_hit", 0) if buy_trade else 0
         partial_scaled_out = buy_trade.get("partial_scaled_out", False) if buy_trade else False
-        
-        # Distanza percentuale da ogni target
+
         dist_t1 = round(t1_pct - pnl_pct, 2)
         dist_t2 = round(t2_pct - pnl_pct, 2)
         dist_t3 = round(t3_pct - pnl_pct, 2)
-        
-        # Progress bar %
+
         progress_to_t1 = round(max(0, min(100, (pnl_pct / t1_pct) * 100)), 1) if t1_pct > 0 else 0
         progress_to_t3 = round(max(0, min(100, (pnl_pct / t3_pct) * 100)), 1) if t3_pct > 0 else 0
-        
+
         results.append({
             "ticker": symbol,
             "entry_price": entry_price,
@@ -606,7 +598,6 @@ async def apm_position_targets():
                     "pct": t1_pct,
                     "price": t1_price,
                     "distance_pct": dist_t1,
-                    # 🔧 reached PERSISTENTE: vero se scale-out T1 già fatto (DB) O prezzo sopra
                     "reached": last_target_hit >= 1 or pnl_pct >= t1_pct,
                     "progress": progress_to_t1,
                     "size_pct": 50,
@@ -628,7 +619,8 @@ async def apm_position_targets():
                     "size_pct": 20,
                 },
             },
-    
+        })
+
     return {
         "positions": results,
         "total": len(results),
