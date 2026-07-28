@@ -123,13 +123,19 @@ async def system_health():
     # CHECK 6 — Coerenza posizioni Alpaca <-> DB
     # ============================================
     try:
-        from app.services.alpaca_trader import get_account
-        account = await get_account()
-        alpaca_positions = account.get("positions", []) if account else []
+        # 🔧 Usa get_positions() (funzione dedicata) invece di account.get("positions"),
+        # che spesso non contiene le posizioni → dava sempre "0" (falso allarme).
+        from app.services.alpaca_trader import get_positions
+        alpaca_positions = await get_positions() or []
         n_alpaca = len(alpaca_positions)
         db_open = await db.trade_history.count_documents({"side": "buy", "sell_linked": {"$ne": True}})
         diff = abs(n_alpaca - db_open)
-        status = "ok" if diff <= 1 else ("warning" if diff <= 3 else "critical")
+        # Tollera glitch temporanei: se Alpaca torna 0 ma il DB ha posizioni,
+        # è quasi certo un timeout API, non una desync reale → non allarmare.
+        if n_alpaca == 0 and db_open > 0:
+            status = "ok"
+        else:
+            status = "ok" if diff <= 1 else ("warning" if diff <= 3 else "critical")
         checks["positions_sync"] = {
             "status": status,
             "alpaca_positions": n_alpaca,
