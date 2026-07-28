@@ -625,3 +625,18 @@ async def apm_position_targets():
         "positions": results,
         "total": len(results),
     }
+
+@router.get("/alpha-radar")
+async def alpha_radar():
+    """🆕 Progetto Alpha — legge Crash Radar + Sector Bottom dall'ultimo market_context."""
+    from app.db.mongodb import get_db
+    db = get_db()
+    ctx = await db.market_context.find_one({"_id": "latest"})
+    if not ctx:
+        return {"error": "No market context. Run macro first."}
+    return {
+        "crash_radar": ctx.get("crash_radar", {}),
+        "sector_bottom": ctx.get("sector_bottom", {}),
+        "market_regime": ctx.get("market_regime", "UNKNOWN"),
+        "updated_at": ctx.get("analyzed_at", ""),
+    }
