@@ -680,10 +680,14 @@ class AdaptivePositionManager(BaseAgent):
         # ============================================
         # 🛡️ TIGHTEN STOP
         # ============================================
+        # 🔧 v1.6 — NON toccare i runner post-T1: il floor "lascia correre" (v4.8)
+        # gestisce già quelle posizioni. TIGHTEN a -2% le strozzerebbe prima di T2/T3.
         tighten_th = params.get("apm_tighten_profit_threshold", 3.0)
         current_price = float(pos.get("current_price", 0))
         
-        if pnl_pct >= tighten_th and (current_ml_pred == "LOSS" or current_trend_pred == "DOWN"):
+        if (last_target_hit_now == 0
+                and pnl_pct >= tighten_th
+                and (current_ml_pred == "LOSS" or current_trend_pred == "DOWN")):
             new_sl_distance = params.get("apm_tighten_new_sl_distance", 2.0) / 100
             new_stop = round(current_price * (1 - new_sl_distance), 2)
             
@@ -910,7 +914,14 @@ class AdaptivePositionManager(BaseAgent):
         """Esegue tightening dello stop loss."""
         db = get_db()
         try:
-            # Aggiorna trailing_stops collection
+            # 🔧 v1.6 — Idempotenza: agisci (e notifica) SOLO se lo stop sale
+            # in modo significativo (>0.3%). Evita lo spam ogni ciclo e non
+            # abbassa mai lo stop. Diventa un vero trailing mono-direzionale.
+            existing = await db.trailing_stops.find_one({"ticker": symbol})
+            current_stop = float(existing.get("stop_price", 0)) if existing else 0
+            if current_stop > 0 and new_stop <= current_stop * 1.003:
+                return False, {"skipped": "stop già adeguato", "current_stop": current_stop}
+
             await db.trailing_stops.update_one(
                 {"ticker": symbol},
                 {"$set": {
@@ -919,6 +930,7 @@ class AdaptivePositionManager(BaseAgent):
                     "reason": f"APM tighten: {reason}",
                     "updated_at": datetime.utcnow(),
                     "source": "apm_v1",
+                    "apm_managed": True,
                 }},
                 upsert=True
             )
