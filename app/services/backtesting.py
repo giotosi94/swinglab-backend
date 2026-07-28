@@ -10,6 +10,55 @@ from app.db.mongodb import get_db
 
 _USE_MTF_BT = True
 
+# 🆕 Sector Bottom Detector — soglie (% titoli sopra 200SMA) + peso (rend. 5Y post-bottom)
+SECTOR_BOTTOM_CFG = {
+    "XLE":  {"threshold": 1,  "weight": 13.63},
+    "XLC":  {"threshold": 5,  "weight": 18.58},
+    "XLI":  {"threshold": 5,  "weight": 18.58},
+    "XLU":  {"threshold": 5,  "weight": 10.0},
+    "XLF":  {"threshold": 6,  "weight": 15.44},
+    "XLK":  {"threshold": 6,  "weight": 17.56},
+    "XLRE": {"threshold": 8,  "weight": 8.81},
+    "XLY":  {"threshold": 8,  "weight": 23.22},
+    "XLB":  {"threshold": 10, "weight": 12.82},
+    "XLP":  {"threshold": 11, "weight": 10.94},
+    "XLV":  {"threshold": 11, "weight": 16.27},
+}
+
+
+def _sectors_in_bottom_at(ticker_bars, ticker_to_sector, date_idx_map, date):
+    """
+    Per una data storica, calcola quali settori sono in capitolazione:
+    % titoli del settore sopra la propria 200SMA < soglia settore.
+    Ritorna dict {sector: weight} dei settori in bottom.
+    """
+    counts = {}   # sector -> [above, total]
+    for ticker, sec in ticker_to_sector.items():
+        if sec not in SECTOR_BOTTOM_CFG:
+            continue
+        idx = date_idx_map.get(ticker, {}).get(date)
+        if idx is None or idx < 100:
+            continue
+        bars = ticker_bars[ticker]
+        window = bars[max(0, idx - 199):idx + 1]
+        closes = [b["c"] for b in window if b.get("c")]
+        if len(closes) < 100:
+            continue
+        sma = sum(closes) / len(closes)
+        c = counts.setdefault(sec, [0, 0])
+        c[1] += 1
+        if closes[-1] > sma:
+            c[0] += 1
+
+    bottom = {}
+    for sec, (above, total) in counts.items():
+        if total == 0:
+            continue
+        pct_above = above / total * 100
+        if pct_above < SECTOR_BOTTOM_CFG[sec]["threshold"]:
+            bottom[sec] = SECTOR_BOTTOM_CFG[sec]["weight"]
+    return bottom
+
 
 def _calc_rsi(prices, period=14):
     if len(prices) < period + 1:
@@ -255,6 +304,7 @@ async def run_backtest(
     t3_ratio: float = 1.00,
     use_mtf: bool = True,
     use_momentum: bool = True,
+    use_sector_bottom: bool = True,
 ):
     """
     Backtest v2.0 con APM COMPLETO:
@@ -283,6 +333,20 @@ async def run_backtest(
 
     sorted_dates = sorted(all_dates)
     backtest_dates = sorted_dates[-days:] if len(sorted_dates) > days else sorted_dates
+
+    # 🆕 Mappe per Sector Bottom Detector
+    from app.services.data_fetcher import SECTOR_STOCKS
+    ticker_to_sector = {}
+    for sec, tickers in SECTOR_STOCKS.items():
+        for tk in tickers:
+            if tk in ticker_bars:
+                ticker_to_sector[tk] = sec
+    # date -> index per ogni ticker (per 200SMA veloce)
+    date_idx_map = {}
+    for tk, bars in ticker_bars.items():
+        date_idx_map[tk] = {b["date"]: i for i, b in enumerate(bars)}
+    sector_bottom_cache = {}   # date -> {sector: weight}
+    sector_bottom_hits = {}    # sector -> count (debug)
 
     cash = starting_capital
     positions = {}
@@ -396,27 +460,50 @@ async def run_backtest(
                 del positions[ticker]
 
         # ===== 2. ENTRIES =====
+        # 🆕 Settori in bottom a questa data (cache per performance)
+        bottom_sectors = {}
+        if use_sector_bottom:
+            if date not in sector_bottom_cache:
+                sector_bottom_cache[date] = _sectors_in_bottom_at(
+                    ticker_bars, ticker_to_sector, date_idx_map, date
+                )
+            bottom_sectors = sector_bottom_cache[date]
+            for sec in bottom_sectors:
+                sector_bottom_hits[sec] = sector_bottom_hits.get(sec, 0) + 1
+
         if len(positions) < max_positions:
             candidates = []
             for ticker, bars in ticker_bars.items():
                 if ticker in positions:
                     continue
-                idx = next((i for i, b in enumerate(bars) if b["date"] == date), None)
+                idx = date_idx_map.get(ticker, {}).get(date)
                 if idx is None or idx < 50:
                     continue
                 bars_slice = bars[:idx + 1]
                 _wt, _ws = _weekly_trend_bt(bars_slice)
                 mtf_debug[_wt] = mtf_debug.get(_wt, 0) + 1
                 conf, target_price, stop_price, setup = _confluence_and_target(bars_slice, use_mtf=use_mtf, use_momentum=use_momentum)
+
+                # 🆕 SECTOR BOTTOM BOOST: se il titolo è in un settore in capitolazione,
+                # boosta la confluence (entra il leader) — proporzionale al peso settore.
+                sec = ticker_to_sector.get(ticker)
+                sec_weight = bottom_sectors.get(sec, 0)
+                if sec_weight > 0:
+                    conf += min(25, sec_weight)  # boost 8-23 pt secondo il peso storico
+
                 if conf >= min_confluence:
                     entry_price = bars_slice[-1]["c"]
-                    candidates.append((ticker, conf, entry_price, target_price, stop_price, setup))
+                    candidates.append((ticker, conf, entry_price, target_price, stop_price, setup, sec_weight))
 
             candidates.sort(key=lambda x: x[1], reverse=True)
             slots = max_positions - len(positions)
 
-            for ticker, conf, entry_price, target_price, stop_price, setup in candidates[:slots]:
-                notional = cash * (position_size_pct / 100)
+            for ticker, conf, entry_price, target_price, stop_price, setup, sec_weight in candidates[:slots]:
+                # 🆕 SIZE BOOST: i settori in bottom ricevono più capitale (doppio peso)
+                size_mult = 1.0 + min(0.5, sec_weight / 46) if sec_weight > 0 else 1.0
+                notional = cash * (position_size_pct / 100) * size_mult
+                if notional < 100 or notional > cash:
+                    notional = min(cash * (position_size_pct / 100), cash)
                 if notional < 100 or notional > cash:
                     continue
                 shares = notional / entry_price
@@ -551,6 +638,8 @@ async def run_backtest(
         },
         "mtf_debug": mtf_debug,
         "config_use_mtf": use_mtf,
+        "config_use_sector_bottom": use_sector_bottom,
+        "sector_bottom_hits": sector_bottom_hits,
         "equity_curve": equity_curve[::max(1, len(equity_curve) // 100)],
         "trades": sorted(trades, key=lambda x: x["exit_date"], reverse=True)[:60],
         "total_trades": len(trades),
