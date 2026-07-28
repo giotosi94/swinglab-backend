@@ -581,14 +581,23 @@ class MacroAnalyst(BaseAgent):
                     f"RSP vs SPY gap: {breadth_gap:+.2f}%\n"
                     f"Top sectors: {', '.join(s['code'] for s in sector_rankings[:3])}\n"
                     f"Rotation: {rotation_signal}\n"
-                    f"Calculated regime: {market_regime} (confidence {regime_confidence}%)"
+                    f"Calculated regime: {market_regime} (confidence {regime_confidence}%)\n"
+                    f"--- PROGETTO ALPHA ---\n"
+                    f"Crash Radar: score {crash_radar['crash_risk_score']}/100 "
+                    f"({crash_radar['crash_level']}), SPY drawdown {crash_radar['spy_drawdown_pct']}%, "
+                    f"VIXY {crash_radar['vixy_price']}. Deploy signal: {crash_radar['deploy_signal']}\n"
+                    f"Settori in capitolazione (bottom): "
+                    f"{', '.join(s['sector'] for s in sector_bottom['bottom_sectors']) if sector_bottom['any_bottom'] else 'nessuno'}"
                 )
                 llm_reasoning = llm_ask(
                     system_prompt=(
                         "Sei un analista macro esperto di swing trading. "
-                        "Analizza i dati di mercato in max 3 frasi in italiano. "
-                        "Indica: 1) Regime e perché, 2) Rischio principale, 3) Suggerimento operativo. "
-                        "Sii diretto, no disclaimers."
+                        "Analizza i dati di mercato in max 4 frasi in italiano. "
+                        "Indica: 1) Regime e perché, 2) Rischio principale, "
+                        "3) Il Crash Radar: se lo score è basso spiega che il mercato è calmo, "
+                        "se sale verso DEPLOY segnala l'opportunità di comprare i bottom, "
+                        "4) Se ci sono settori in capitolazione, evidenziali come occasioni. "
+                        "Sii diretto, concreto, no disclaimers."
                     ),
                     user_prompt=f"Dati di mercato oggi:\n{data_summary}",
                     max_tokens=200,
