@@ -39,6 +39,69 @@ class MacroAnalyst(BaseAgent):
         """Limita valore in range."""
         return max(min_val, min(max_val, value))
 
+    async def _calc_crash_radar(self, db, vixy_price: float) -> dict:
+        """
+        🆕 CRASH RADAR (Progetto Alpha) — indicatore, non ancora azione.
+        Combina 3 trigger validati su Quant Rea (dati 1950-2025):
+          1. Drawdown SPY dal massimo (win rate 100% a -20%)
+          2. VIX/VIXY elevato
+        Ritorna crash_risk_score 0-100 + livello + drawdown corrente.
+        """
+        # ---- 1. Drawdown SPY dal massimo (ultimi ~252 giorni) ----
+        spy_dd_pct = 0.0
+        spy_bars_doc = await db.stock_bars.find_one({"ticker": "SPY"})
+        if spy_bars_doc and spy_bars_doc.get("bars"):
+            closes = [b["c"] for b in spy_bars_doc["bars"][-252:] if b.get("c")]
+            if len(closes) >= 20:
+                peak = max(closes)
+                current = closes[-1]
+                spy_dd_pct = round((current - peak) / peak * 100, 2)  # <= 0
+
+        # ---- 2. Punteggio drawdown (soglie Rea: -20% forte, -30% estremo) ----
+        dd_abs = abs(spy_dd_pct)
+        if dd_abs >= 30:
+            dd_score = 100
+        elif dd_abs >= 20:
+            dd_score = 70 + (dd_abs - 20)   # 70-80
+        elif dd_abs >= 10:
+            dd_score = 30 + (dd_abs - 10) * 4  # 30-70
+        else:
+            dd_score = dd_abs * 3  # 0-30
+
+        # ---- 3. Punteggio VIX (proxy VIXY): >30 equiv, scala fino a >50 ----
+        # VIXY ~ metà del VIX in questi regimi; soglie tarate su VIXY grezzo
+        if vixy_price >= 45:
+            vix_score = 100
+        elif vixy_price >= 35:
+            vix_score = 70 + (vixy_price - 35) * 3   # 70-100
+        elif vixy_price >= 28:
+            vix_score = 40 + (vixy_price - 28) * 4.3  # 40-70
+        else:
+            vix_score = self._clamp(vixy_price * 1.4, 0, 40)  # 0-40
+
+        # ---- 4. Crash Risk Score combinato (drawdown pesa di più) ----
+        crash_risk_score = round(self._clamp(dd_score * 0.65 + vix_score * 0.35), 1)
+
+        # ---- 5. Livello + zona deploy ----
+        if crash_risk_score >= 70:
+            crash_level = "DEPLOY_MAX"      # -30% zone / panico estremo
+        elif crash_risk_score >= 50:
+            crash_level = "DEPLOY"          # -20% zone → compra l'inferno
+        elif crash_risk_score >= 30:
+            crash_level = "WATCH"           # attenzione, difesa
+        else:
+            crash_level = "NORMAL"
+
+        return {
+            "crash_risk_score": crash_risk_score,
+            "crash_level": crash_level,
+            "spy_drawdown_pct": spy_dd_pct,
+            "vixy_price": round(vixy_price, 2),
+            "dd_score": round(dd_score, 1),
+            "vix_score": round(vix_score, 1),
+            "deploy_signal": crash_level in ("DEPLOY", "DEPLOY_MAX"),
+        }
+
     async def analyze(self, context: dict = None) -> dict:
         db = get_db()
         params = await self.get_params()
@@ -359,6 +422,13 @@ class MacroAnalyst(BaseAgent):
             exposure_multiplier = min(exposure_multiplier, 0.7)
             regime_confidence = min(regime_confidence, 65)
 
+        # 🆕 CRASH RADAR (Progetto Alpha) — calcola il rischio crash / segnale di deploy
+        crash_radar = await self._calc_crash_radar(db, vixy_price)
+        if crash_radar["deploy_signal"]:
+            print(f"  🔴 CRASH RADAR: {crash_radar['crash_level']} "
+                  f"(score {crash_radar['crash_risk_score']}, "
+                  f"SPY dd {crash_radar['spy_drawdown_pct']}%, VIXY {vixy_price})")
+
         # ============================================
         # BUILD MARKET CONTEXT
         # ============================================
@@ -376,6 +446,7 @@ class MacroAnalyst(BaseAgent):
             "commodities_signal": commodities_signal,
             "breadth_divergence": breadth_divergence,
             "risk_appetite": risk_appetite,
+            "crash_radar": crash_radar,
             "sector_rankings": sector_rankings,
             "details": {
                 "spy": {"price": spy_price, "ema20": spy_ema20, "ema50": spy_ema50,
