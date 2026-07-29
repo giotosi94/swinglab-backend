@@ -522,6 +522,47 @@ class AlphaStrategist(BaseAgent):
 
         return sell_signals
 
+    async def _enrich_with_sentiment(self, candidates: list) -> list:
+        """
+        🆕 SentimentAgent — arricchisce i top candidati con news sentiment.
+        Solo sui top (efficiente). Aggiusta confluence + flag earnings.
+        """
+        from app.services.news_service import get_stock_news_with_sentiment
+        for c in candidates:
+            try:
+                data = await get_stock_news_with_sentiment(c["ticker"])
+                raw = (data.get("sentiment") or "").upper()
+                c["news_count"] = data.get("news_count", 0)
+
+                sent = "NEUTRO"
+                if "SENTIMENT: POSITIVO" in raw or "\nPOSITIVO" in raw:
+                    sent = "POSITIVO"
+                elif "SENTIMENT: NEGATIVO" in raw or "\nNEGATIVO" in raw:
+                    sent = "NEGATIVO"
+
+                # Rileva earnings imminenti dalle news
+                earnings_soon = any(k in raw for k in
+                    ["EARNINGS", "TRIMESTRAL", "QUARTERLY", "RISULTATI", "UTILI"])
+
+                adj = 0
+                if sent == "POSITIVO":
+                    adj += 5
+                elif sent == "NEGATIVO":
+                    adj -= 8
+                if earnings_soon:
+                    adj -= 6  # rischio gap notturno
+
+                c["sentiment"] = sent
+                c["earnings_soon"] = earnings_soon
+                c["sentiment_adj"] = adj
+                c["confluence"] = round(max(0, c["confluence"] + adj), 1)
+            except Exception as e:
+                c["sentiment"] = "N/A"
+                c["sentiment_adj"] = 0
+        # Ri-ordina con il sentiment incluso
+        candidates.sort(key=lambda x: x["confluence"], reverse=True)
+        return candidates
+
     async def analyze(self, context: dict) -> dict:
         db = get_db()
         params = await self.get_params()
@@ -687,6 +728,9 @@ class AlphaStrategist(BaseAgent):
         candidates.sort(key=lambda x: x["confluence"], reverse=True)
         top_candidates = candidates[:10]
 
+        # 🆕 SentimentAgent — arricchisce i top con news sentiment + earnings
+        top_candidates = await self._enrich_with_sentiment(top_candidates)
+
         # ============================================
         # LLM REASONING per top candidates
         # ============================================
@@ -771,6 +815,14 @@ class AlphaStrategist(BaseAgent):
             "top_confluence": top_candidates[0]["confluence"] if top_candidates else 0,
             # 🆕 v2.0 — ML stats
             "ml_data_loaded": len(ml_map),
+            # 🆕 Sentiment stats
+            "sentiment_summary": {
+                c["ticker"]: {
+                    "sentiment": c.get("sentiment", "N/A"),
+                    "earnings_soon": c.get("earnings_soon", False),
+                    "adj": c.get("sentiment_adj", 0),
+                } for c in top_candidates
+            },
         }
 
         await self.log_decision(
