@@ -540,9 +540,9 @@ class AlphaStrategist(BaseAgent):
                 elif "SENTIMENT: NEGATIVO" in raw or "\nNEGATIVO" in raw:
                     sent = "NEGATIVO"
 
-                # Rileva earnings imminenti dalle news
-                earnings_soon = any(k in raw for k in
-                    ["EARNINGS", "TRIMESTRAL", "QUARTERLY", "RISULTATI", "UTILI"])
+                # Rileva earnings imminenti — legge il campo dedicato dell'LLM
+                earnings_soon = ("EARNINGS_IMMINENTI: SI" in raw or
+                                 "EARNINGS_IMMINENTI:SI" in raw)
 
                 adj = 0
                 if sent == "POSITIVO":
