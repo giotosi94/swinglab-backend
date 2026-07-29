@@ -26,6 +26,27 @@ SECTOR_BOTTOM_CFG = {
 }
 
 
+def _spy_drawdown_at(spy_closes_upto):
+    """Drawdown % di SPY dal massimo, dato l'array di chiusure fino alla data."""
+    if len(spy_closes_upto) < 20:
+        return 0.0
+    peak = max(spy_closes_upto)
+    current = spy_closes_upto[-1]
+    return (current - peak) / peak * 100 if peak > 0 else 0.0
+
+
+def _crash_level_from_dd(dd_pct):
+    """Livello crash da drawdown SPY (soglie Rea validate)."""
+    dd = abs(dd_pct)
+    if dd >= 30:
+        return "DEPLOY_MAX"
+    elif dd >= 20:
+        return "DEPLOY"
+    elif dd >= 10:
+        return "WATCH"
+    return "NORMAL"
+
+
 def _sectors_in_bottom_at(ticker_bars, ticker_to_sector, date_idx_map, date):
     """
     Per una data storica, calcola quali settori sono in capitolazione:
@@ -305,6 +326,7 @@ async def run_backtest(
     use_mtf: bool = True,
     use_momentum: bool = True,
     use_sector_bottom: bool = True,
+    use_crash_deploy: bool = True,
 ):
     """
     Backtest v2.0 con APM COMPLETO:
@@ -348,6 +370,19 @@ async def run_backtest(
     sector_bottom_cache = {}   # date -> {sector: weight}
     sector_bottom_hits = {}    # sector -> count (debug)
 
+    # 🆕 Crash Deploy: SPY closes indicizzate per data
+    spy_doc_cd = await db.stock_bars.find_one({"ticker": "SPY"})
+    spy_bars_cd = spy_doc_cd.get("bars", []) if spy_doc_cd else []
+    spy_close_by_date = {}
+    spy_closes_ordered = []
+    for b in sorted(spy_bars_cd, key=lambda x: x["date"]):
+        if b.get("c"):
+            spy_closes_ordered.append(b["c"])
+            spy_close_by_date[b["date"]] = len(spy_closes_ordered)  # n. closes fino a qui
+    spy_position = None   # posizione SPY del crash deploy
+    crash_deploy_events = []
+    crash_reserve = 0.0   # capitale accantonato (munizione)
+
     cash = starting_capital
     positions = {}
     trades = []
@@ -356,6 +391,38 @@ async def run_backtest(
     mtf_debug = {}
 
     for date in backtest_dates:
+        # ===== 0. CRASH DEPLOY (Progetto Alpha) =====
+        crash_level = "NORMAL"
+        if use_crash_deploy and date in spy_close_by_date:
+            n_closes = spy_close_by_date[date]
+            spy_dd = _spy_drawdown_at(spy_closes_ordered[:n_closes])
+            crash_level = _crash_level_from_dd(spy_dd)
+            spy_price_today = spy_closes_ordered[n_closes - 1]
+
+            # DEPLOY / DEPLOY_MAX: compra SPY col capitale disponibile (fetta)
+            if crash_level in ("DEPLOY", "DEPLOY_MAX") and spy_position is None:
+                deploy_frac = 0.5 if crash_level == "DEPLOY" else 0.9
+                deploy_cash = (cash + crash_reserve) * deploy_frac
+                if deploy_cash > 100:
+                    spy_shares = deploy_cash / spy_price_today
+                    spy_position = {"shares": spy_shares, "entry": spy_price_today,
+                                    "entry_date": date, "level": crash_level}
+                    cash -= max(0, deploy_cash - crash_reserve)
+                    crash_reserve = max(0, crash_reserve - deploy_cash)
+                    crash_deploy_events.append(
+                        {"date": date, "action": "DEPLOY_SPY", "level": crash_level,
+                         "spy_price": round(spy_price_today, 2), "cash_used": round(deploy_cash, 2)})
+
+            # RECOVERY: quando SPY risale sopra -8% dal max, chiudi il deploy (incassa il rimbalzo)
+            if spy_position is not None and spy_dd > -8:
+                exit_val = spy_position["shares"] * spy_price_today
+                cash += exit_val
+                pnl_spy = (spy_price_today - spy_position["entry"]) / spy_position["entry"] * 100
+                crash_deploy_events.append(
+                    {"date": date, "action": "EXIT_SPY", "pnl_pct": round(pnl_spy, 2),
+                     "value": round(exit_val, 2)})
+                spy_position = None
+
         # ===== 1. GESTIONE POSIZIONI APERTE (APM logic) =====
         for ticker in list(positions.keys()):
             pos = positions[ticker]
@@ -537,7 +604,12 @@ async def run_backtest(
                 pos["last_price"] = bar["c"]
             else:
                 positions_value += pos.get("last_price", pos["entry_price"]) * pos["shares"]
-        total_equity = cash + positions_value
+        # 🆕 Aggiungi valore della posizione SPY del crash deploy
+        spy_deploy_value = 0
+        if spy_position is not None and date in spy_close_by_date:
+            spy_deploy_value = spy_position["shares"] * spy_closes_ordered[spy_close_by_date[date] - 1]
+
+        total_equity = cash + positions_value + crash_reserve + spy_deploy_value
         equity_curve.append({"date": date, "equity": round(total_equity, 2)})
 
     # Chiudi posizioni residue
@@ -640,6 +712,8 @@ async def run_backtest(
         "config_use_mtf": use_mtf,
         "config_use_sector_bottom": use_sector_bottom,
         "sector_bottom_hits": sector_bottom_hits,
+        "config_use_crash_deploy": use_crash_deploy,
+        "crash_deploy_events": crash_deploy_events,
         "equity_curve": equity_curve[::max(1, len(equity_curve) // 100)],
         "trades": sorted(trades, key=lambda x: x["exit_date"], reverse=True)[:60],
         "total_trades": len(trades),
