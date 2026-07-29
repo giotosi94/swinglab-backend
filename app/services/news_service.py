@@ -56,7 +56,8 @@ async def analyze_news_sentiment(symbol, news_items):
                 "Sei un analista finanziario. Analizza queste news per il ticker indicato. "
                 "Rispondi in italiano con ESATTAMENTE questo formato:\n"
                 "SENTIMENT: POSITIVO/NEGATIVO/NEUTRO\n"
-                "SINTESI: [una frase che riassume il sentiment delle news]\n"
+                "EARNINGS_IMMINENTI: SI/NO (SI solo se le news annunciano earnings/trimestrale nei prossimi 7 giorni)\n"
+                "SINTESI: [una frase]\n"
                 "Sii diretto, no disclaimers."
             ),
             user_prompt=f"Ticker: {symbol}\nNews recenti:\n{headlines}",
