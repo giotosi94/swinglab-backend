@@ -522,6 +522,56 @@ class AlphaStrategist(BaseAgent):
 
         return sell_signals
 
+    async def _recalc_targets_atr(self, db, candidates: list) -> list:
+        """
+        🆕 Target/Stop ATR-based (allineato al backtest) sui top candidati.
+        Risolve il R/R schiacciato a 1.0 sui titoli estesi: target proporzionale
+        alla volatilità + setup, stop stretto ATR-based → R/R realistici.
+        """
+        for c in candidates:
+            try:
+                doc = await db.stock_bars.find_one({"ticker": c["ticker"]}, {"bars": 1})
+                bars = (doc or {}).get("bars", [])
+                if len(bars) < 20:
+                    continue
+                price = c["price"]
+
+                # ATR% sugli ultimi 14 giorni
+                period = 14
+                trs = []
+                for i in range(max(1, len(bars) - period), len(bars)):
+                    h, l, pc = bars[i]["h"], bars[i]["l"], bars[i - 1]["c"]
+                    trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+                atr = sum(trs) / len(trs) if trs else price * 0.02
+                atr_pct = (atr / price * 100) if price > 0 else 2.0
+
+                # Target multiplier per setup (come backtest)
+                mult = {
+                    "breakout": 4.0,
+                    "ema_bounce": 3.0,
+                    "pullback_to_poc": 3.5,
+                    "oversold_reversal": 3.5,
+                    "neutral": 3.0,
+                }.get(c.get("setup_type", "neutral"), 3.0)
+
+                target_dist = min(40, max(5, atr_pct * mult))
+                sl_dist = min(12, max(3, atr_pct * 1.5))
+
+                target_price = round(price * (1 + target_dist / 100), 2)
+                stop_loss = round(price * (1 - sl_dist / 100), 2)
+
+                risk = price - stop_loss
+                reward = target_price - price
+                rr = round(reward / risk, 2) if risk > 0 else 0
+
+                c["target_price"] = target_price
+                c["stop_loss"] = stop_loss
+                c["risk_reward"] = rr
+                c["atr_pct"] = round(atr_pct, 2)
+            except Exception as e:
+                print(f"  ATR recalc error {c.get('ticker')}: {e}")
+        return candidates
+
     async def _enrich_with_sentiment(self, candidates: list) -> list:
         """
         🆕 SentimentAgent — arricchisce i top candidati con news sentiment.
@@ -727,6 +777,9 @@ class AlphaStrategist(BaseAgent):
 
         candidates.sort(key=lambda x: x["confluence"], reverse=True)
         top_candidates = candidates[:10]
+
+        # 🆕 Ricalcola target/stop ATR-based (R/R realistici, come backtest)
+        top_candidates = await self._recalc_targets_atr(db, top_candidates)
 
         # 🆕 SentimentAgent — arricchisce i top con news sentiment + earnings
         top_candidates = await self._enrich_with_sentiment(top_candidates)
