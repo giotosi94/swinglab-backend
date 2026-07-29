@@ -600,7 +600,7 @@ class AlphaStrategist(BaseAgent):
                 elif sent == "NEGATIVO":
                     adj -= 8
                 if earnings_soon:
-                    adj -= 6  # rischio gap notturno
+                    adj -= 15  # 🆕 rischio gap notturno FORTE — earnings = pericolo n.1 swing
 
                 c["sentiment"] = sent
                 c["earnings_soon"] = earnings_soon
