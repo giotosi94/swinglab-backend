@@ -646,16 +646,17 @@ async def run_backtest(
                 if sec_weight > 0:
                     conf += min(25, sec_weight)
 
-                # 🆕 SECTOR ROTATION BOOST (metodo Rea): premia i titoli dei settori
-                # dove i soldi stanno rientrando (EXPLOSIVE/ROTATING_IN), penalizza OUT.
+                # 🆕 SECTOR ROTATION FILTER (metodo Rea): SCARTA i titoli dei settori
+                # da cui i soldi escono (ROTATING_OUT). Compra solo dove il capitale
+                # resta o rientra. Boost extra sugli EXPLOSIVE.
                 if use_rotation:
                     rsig = rotation_signals.get(sec, "NEUTRAL")
-                    if rsig == "EXPLOSIVE":
-                        conf += 12   # molla carica + soldi che rientrano
+                    if rsig == "ROTATING_OUT":
+                        continue   # 🚫 filtro netto: salta il titolo
+                    elif rsig == "EXPLOSIVE":
+                        conf += 8   # premia i settori esplosivi
                     elif rsig == "ROTATING_IN":
-                        conf += 7
-                    elif rsig == "ROTATING_OUT":
-                        conf -= 10   # evita i settori da cui i soldi escono
+                        conf += 4
 
                 if conf >= min_confluence:
                     entry_price = bars_slice[-1]["c"]
