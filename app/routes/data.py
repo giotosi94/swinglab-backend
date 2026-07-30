@@ -595,3 +595,16 @@ async def backtest_run(
     )
     result["active_preset"] = preset_name
     return result
+
+@router.post("/load-spy-history")
+async def load_spy_history_endpoint(years: int = 7):
+    """One-shot: carica storico lungo SPY in spy_history (isolato)."""
+    from app.services.spy_history import load_spy_history
+    return await load_spy_history(years=years)
+
+
+@router.post("/backtest-crash-spy")
+async def backtest_crash_spy(start_date: str = None, end_date: str = None):
+    """Mini-backtest crash deploy vs buy&hold su SPY storico."""
+    from app.services.spy_history import backtest_crash_deploy_spy
+    return await backtest_crash_deploy_spy(start_date=start_date, end_date=end_date)
