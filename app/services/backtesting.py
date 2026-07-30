@@ -392,16 +392,17 @@ async def run_backtest(
 
     for date in backtest_dates:
         # ===== 0. CRASH DEPLOY a FETTE progressive (Progetto Alpha) =====
-        # Entry scalato: più il mercato crolla, più carichi. Non indovini il fondo,
-        # lo compri a fette scendendo (dollar-cost averaging sul crash).
+        # Entry scalato: più il mercato crolla, più carichi. Libera capitale dallo
+        # swing per avere munizioni. Tiene fino al massimo precedente, poi lascia
+        # una fetta minima a correre (long-term).
         crash_level = "NORMAL"
         if use_crash_deploy and date in spy_close_by_date:
             n_closes = spy_close_by_date[date]
-            spy_dd = _spy_drawdown_at(spy_closes_ordered[:n_closes])
+            spy_closes_upto = spy_closes_ordered[:n_closes]
+            spy_dd = _spy_drawdown_at(spy_closes_upto)
+            spy_peak = max(spy_closes_upto) if spy_closes_upto else 0
             spy_price_today = spy_closes_ordered[n_closes - 1]
 
-            # Soglie fette (abbassate per catturare anche crash "medi" tipo -13%)
-            # Fetta 1: -8%, Fetta 2: -15%, Fetta 3: -25%
             fette = [
                 {"dd": -8,  "id": 1, "frac": 0.30},
                 {"dd": -15, "id": 2, "frac": 0.40},
@@ -409,35 +410,57 @@ async def run_backtest(
             ]
             if spy_position is None:
                 spy_position = {"shares": 0.0, "invested": 0.0, "fette_done": set(),
-                                "entry_dates": []}
+                                "entry_dates": [], "peak_at_entry": spy_peak,
+                                "trimmed": False}
 
+            # 🆕 LIBERA CAPITALE: al primo trigger crash, vendi metà dello swing
+            # per generare munizioni (più capitale da deployare su SPY).
             for f in fette:
                 if spy_dd <= f["dd"] and f["id"] not in spy_position["fette_done"]:
-                    # capitale per questa fetta = frazione del totale disponibile ORA
-                    avail = cash
-                    deploy_cash = avail * f["frac"]
+                    if f["id"] == 1 and positions:
+                        # libera ~50% dello swing (chiudi metà posizioni al prezzo corrente)
+                        for tk in list(positions.keys()):
+                            p = positions[tk]
+                            bars_p = ticker_bars.get(tk, [])
+                            bp = next((b for b in bars_p if b["date"] == date), None)
+                            px = bp["c"] if bp else p.get("last_price", p["entry_price"])
+                            freed = px * p["shares"] * 0.5
+                            cash += freed
+                            p["shares"] *= 0.5
+                        crash_deploy_events.append(
+                            {"date": date, "action": "FREE_CAPITAL",
+                             "spy_dd": round(spy_dd, 1), "note": "liberato 50% swing"})
+
+                    deploy_cash = cash * f["frac"]
                     if deploy_cash > 100:
                         sh = deploy_cash / spy_price_today
                         spy_position["shares"] += sh
                         spy_position["invested"] += deploy_cash
                         spy_position["fette_done"].add(f["id"])
-                        spy_position["entry_dates"].append(date)
+                        spy_position["peak_at_entry"] = max(spy_position["peak_at_entry"], spy_peak)
                         cash -= deploy_cash
                         crash_deploy_events.append(
                             {"date": date, "action": f"DEPLOY_FETTA_{f['id']}",
                              "spy_dd": round(spy_dd, 1), "spy_price": round(spy_price_today, 2),
                              "cash_used": round(deploy_cash, 2)})
 
-            # RECOVERY: SPY risale sopra -5% dal max → incassa tutto il deploy
-            if spy_position and spy_position["shares"] > 0 and spy_dd > -5:
-                exit_val = spy_position["shares"] * spy_price_today
+            # 🆕 USCITA: quando SPY torna al massimo precedente → vendi 80%,
+            # lascia il 20% a correre (fetta minima long-term).
+            if (spy_position and spy_position["shares"] > 0
+                    and not spy_position["trimmed"]
+                    and spy_price_today >= spy_position["peak_at_entry"]):
+                sell_sh = spy_position["shares"] * 0.80
+                exit_val = sell_sh * spy_price_today
                 cash += exit_val
                 invested = spy_position["invested"]
-                pnl_spy = (exit_val - invested) / invested * 100 if invested > 0 else 0
+                sold_cost = invested * 0.80
+                pnl_spy = (exit_val - sold_cost) / sold_cost * 100 if sold_cost > 0 else 0
+                spy_position["shares"] -= sell_sh
+                spy_position["invested"] -= sold_cost
+                spy_position["trimmed"] = True
                 crash_deploy_events.append(
-                    {"date": date, "action": "EXIT_SPY", "pnl_pct": round(pnl_spy, 2),
-                     "value": round(exit_val, 2), "invested": round(invested, 2)})
-                spy_position = None
+                    {"date": date, "action": "TRIM_80_AT_PEAK", "pnl_pct": round(pnl_spy, 2),
+                     "value": round(exit_val, 2), "spy_price": round(spy_price_today, 2)})
 
         # ===== 1. GESTIONE POSIZIONI APERTE (APM logic) =====
         for ticker in list(positions.keys()):
@@ -642,6 +665,25 @@ async def run_backtest(
             "pnl_pct": round(pnl_pct, 2), "pnl_dollar": round(pnl_d, 2),
             "reason": "END_OF_BACKTEST",
         })
+
+    # 🆕 Chiudi la fetta SPY residua (il 20% long-term) a fine backtest
+    if spy_position and spy_position.get("shares", 0) > 0 and spy_closes_ordered:
+        final_spy = spy_closes_ordered[-1]
+        exit_val = spy_position["shares"] * final_spy
+        cash += exit_val
+        inv = spy_position["invested"]
+        pnl_spy = (exit_val - inv) / inv * 100 if inv > 0 else 0
+        crash_deploy_events.append(
+            {"date": backtest_dates[-1], "action": "EXIT_SPY_FINAL",
+             "pnl_pct": round(pnl_spy, 2), "value": round(exit_val, 2)})
+        spy_position = None
+        # ricalcola l'ultimo punto equity col cash aggiornato
+        if equity_curve:
+            equity_curve[-1]["equity"] = round(cash + sum(
+                (next((b["c"] for b in ticker_bars.get(tk, []) if b["date"] == backtest_dates[-1]),
+                      p.get("last_price", p["entry_price"])) * p["shares"])
+                for tk, p in positions.items()
+            ), 2) if positions else round(cash, 2)
 
     metrics = _calc_metrics(equity_curve, trades)
 
