@@ -335,17 +335,17 @@ class Orchestrator:
         # ============================================
         try:
             crash = market_context.get("crash_radar", {})
-            if crash.get("crash_level") in ("DEPLOY", "DEPLOY_MAX"):
-                print(f"  🔴 CRASH RADAR {crash.get('crash_level')} — valuto deploy SPY")
+            dd = crash.get("spy_drawdown_pct", 0)
+            if dd <= -8:  # primo livello scalare toccato → valuta deploy a fette
+                print(f"  🔴 CRASH RADAR dd {dd}% — valuto deploy scalare SPY")
                 from app.routes.crash_deploy import crash_deploy_execute
                 deploy_res = await crash_deploy_execute()
                 report["steps"]["crash_deploy"] = deploy_res
-                print(f"  🎯 Crash Deploy: {deploy_res.get('status')}")
+                print(f"  🎯 Crash Deploy scalare: {deploy_res.get('status')}")
             else:
                 report["steps"]["crash_deploy"] = {
                     "status": "no_deploy",
-                    "crash_level": crash.get("crash_level", "NORMAL"),
-                    "score": crash.get("crash_risk_score", 0),
+                    "spy_drawdown_pct": dd,
                 }
         except Exception as e:
             report["errors"].append(f"CrashDeploy: {str(e)}")
