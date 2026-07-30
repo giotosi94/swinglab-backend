@@ -305,3 +305,57 @@ async def backtest_scalar_deploy(fwd_days: int = 180):
         "episodes": episodes,
         "scalar_levels": SCALAR_LEVELS,
     }
+
+@router.get("/spy-pocs")
+async def spy_support_pocs(bins: int = 40, n_pocs: int = 4):
+    """
+    🎯 Calcola i POC di supporto di SPY dal volume profile (storico lungo).
+    Ritorna i livelli di prezzo SOTTO il prezzo attuale dove c'è più volume
+    accumulato = supporti reali dove deployare le fette (PIC al POC).
+    """
+    db = get_db()
+    doc = await db.spy_longterm.find_one({"_id": "SPY"})
+    if not doc or not doc.get("bars"):
+        return {"error": "No SPY longterm data. Run /load-spy-history first."}
+
+    bars = doc["bars"]
+    current_price = bars[-1]["c"]
+
+    # Volume profile: bucket di prezzo → volume accumulato
+    lows = [b["l"] for b in bars]
+    highs = [b["h"] for b in bars]
+    price_min, price_max = min(lows), max(highs)
+    if price_max <= price_min:
+        return {"error": "Invalid price range"}
+
+    bin_size = (price_max - price_min) / bins
+    vp = {}
+    for b in bars:
+        mid = (b["h"] + b["l"]) / 2
+        idx = min(int((mid - price_min) / bin_size), bins - 1)
+        level = round(price_min + idx * bin_size + bin_size / 2, 2)
+        vp[level] = vp.get(level, 0) + b["v"]
+
+    # POC di supporto = livelli SOTTO il prezzo attuale, ordinati per volume
+    supports = [(lvl, vol) for lvl, vol in vp.items() if lvl < current_price]
+    supports.sort(key=lambda x: x[1], reverse=True)  # più volume prima
+    top_supports = supports[:n_pocs]
+    # Ordina per prezzo decrescente (dal più vicino al prezzo attuale)
+    top_supports.sort(key=lambda x: x[0], reverse=True)
+
+    pocs = []
+    for lvl, vol in top_supports:
+        dd_from_current = round((lvl - current_price) / current_price * 100, 2)
+        pocs.append({
+            "poc_price": lvl,
+            "volume": int(vol),
+            "drawdown_from_current_pct": dd_from_current,
+        })
+
+    return {
+        "current_price": round(current_price, 2),
+        "price_range": {"min": round(price_min, 2), "max": round(price_max, 2)},
+        "support_pocs": pocs,
+        "bars_analyzed": len(bars),
+    }
+
