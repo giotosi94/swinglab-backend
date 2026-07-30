@@ -701,6 +701,51 @@ async def fetch_and_analyze_sectors(force=False):
                 ret_20d = ((float(close.iloc[-1]) / float(close.iloc[-20])) - 1) * 100
                 strength = round(float(ret_20d - spy_return), 2)
                 rsi = round(float(calc_rsi(close)), 2)
+
+                # 🆕 SECTOR ROTATION (metodo Rea: Ann3M vs Ann6M + Compressione 20d)
+                n = len(close)
+                # Rendimenti annualizzati 3M (~63d) e 6M (~126d)
+                if n >= 63:
+                    r3 = (float(close.iloc[-1]) / float(close.iloc[-63])) - 1
+                    ann_3m = round(((1 + r3) ** (252/63) - 1) * 100, 2)
+                else:
+                    ann_3m = 0
+                if n >= 126:
+                    r6 = (float(close.iloc[-1]) / float(close.iloc[-126])) - 1
+                    ann_6m = round(((1 + r6) ** (252/126) - 1) * 100, 2)
+                else:
+                    ann_6m = ann_3m
+                # Accelerazione momentum: >0 = soldi che rientrano (rotazione IN)
+                momentum_accel = round(ann_3m - ann_6m, 2)
+                # Compressione 20d: banda stretta = molla carica (pronto a esplodere)
+                last20 = close.iloc[-20:]
+                mean20 = float(last20.mean())
+                compression_20d = round((float(last20.max()) - float(last20.min())) / mean20, 3) if mean20 > 0 else 0.5
+
+                # 200SMA breadth-proxy dell'ETF (sopra/sotto la sua 200)
+                if n >= 200:
+                    sma200 = float(close.iloc[-200:].mean())
+                    above_200 = float(close.iloc[-1]) > sma200
+                else:
+                    above_200 = None
+
+                # ROTATION SCORE (0-100): momentum accel + compressione + forza relativa
+                rot = 50
+                rot += min(25, max(-25, momentum_accel * 0.5))   # accelerazione pesa
+                rot += 10 if compression_20d < 0.05 else (5 if compression_20d < 0.08 else 0)  # molla carica
+                rot += min(10, max(-10, strength))                # forza vs SPY
+                rotation_score = round(max(0, min(100, rot)), 1)
+
+                # Classificazione quadrante Rea
+                if momentum_accel > 5 and compression_20d < 0.07:
+                    rotation_signal = "EXPLOSIVE"      # 🎯 rotazione IN + compresso
+                elif momentum_accel > 5:
+                    rotation_signal = "ROTATING_IN"    # 🚀 soldi rientrano
+                elif momentum_accel < -8:
+                    rotation_signal = "ROTATING_OUT"   # 📉 soldi escono
+                else:
+                    rotation_signal = "NEUTRAL"
+                rsi = round(float(calc_rsi(close)), 2)
                 ema10 = float(calc_ema(close, 10)); ema20_val = float(calc_ema(close, 20)); ema50 = float(calc_ema(close, 50))
                 price = float(close.iloc[-1])
                 avg_vol = float(volume.rolling(20).mean().iloc[-1]); curr_vol = float(volume.iloc[-1])
@@ -720,7 +765,13 @@ async def fetch_and_analyze_sectors(force=False):
                 sector_doc = {"code": etf, "name": name, "etf_ticker": etf, "price": round(price, 2),
                     "return_20d": round(float(ret_20d), 2), "strength_score": strength, "trend_score": trend,
                     "volume_score": round(rel_vol * 30, 2), "rsi": rsi, "composite_score": composite,
-                    "history": history, "updated_at": datetime.utcnow()}
+                    "history": history,
+                    # 🆕 Sector Rotation (metodo Rea)
+                    "ann_3m": ann_3m, "ann_6m": ann_6m,
+                    "momentum_accel": momentum_accel, "compression_20d": compression_20d,
+                    "rotation_score": rotation_score, "rotation_signal": rotation_signal,
+                    "above_200sma": above_200,
+                    "updated_at": datetime.utcnow()}
                 await db.sectors.update_one({"code": etf}, {"$set": sector_doc}, upsert=True)
                 results.append(sector_doc)
                 print(f"  OK {etf}: ${price:.2f} score={composite:.2f}")
