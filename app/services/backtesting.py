@@ -81,6 +81,40 @@ def _sectors_in_bottom_at(ticker_bars, ticker_to_sector, date_idx_map, date):
     return bottom
 
 
+def _sector_rotation_at(ticker_bars, sector_etf_map, date_idx_map, date):
+    """
+    Rotazione settoriale a una data storica (metodo Rea):
+    Ann3M vs Ann6M (accelerazione) + compressione 20d.
+    Ritorna dict {sector: rotation_signal}.
+    """
+    signals = {}
+    for sec, etf in sector_etf_map.items():
+        bars = ticker_bars.get(etf, [])
+        idx = date_idx_map.get(etf, {}).get(date)
+        if idx is None or idx < 126:
+            continue
+        closes = [b["c"] for b in bars[:idx + 1]]
+        c_now = closes[-1]
+        r3 = c_now / closes[-63] - 1 if len(closes) >= 63 else 0
+        r6 = c_now / closes[-126] - 1 if len(closes) >= 126 else r3
+        ann3 = ((1 + r3) ** (252/63) - 1) * 100 if r3 > -1 else 0
+        ann6 = ((1 + r6) ** (252/126) - 1) * 100 if r6 > -1 else 0
+        accel = ann3 - ann6
+        last20 = closes[-20:]
+        mean20 = sum(last20) / len(last20)
+        compr = (max(last20) - min(last20)) / mean20 if mean20 > 0 else 0.5
+
+        if accel > 5 and compr < 0.07:
+            signals[sec] = "EXPLOSIVE"
+        elif accel > 5:
+            signals[sec] = "ROTATING_IN"
+        elif accel < -8:
+            signals[sec] = "ROTATING_OUT"
+        else:
+            signals[sec] = "NEUTRAL"
+    return signals
+
+
 def _calc_rsi(prices, period=14):
     if len(prices) < period + 1:
         return 50.0
@@ -327,6 +361,7 @@ async def run_backtest(
     use_momentum: bool = True,
     use_sector_bottom: bool = True,
     use_crash_deploy: bool = True,
+    use_rotation: bool = True,
 ):
     """
     Backtest v2.0 con APM COMPLETO:
@@ -369,6 +404,10 @@ async def run_backtest(
         date_idx_map[tk] = {b["date"]: i for i, b in enumerate(bars)}
     sector_bottom_cache = {}   # date -> {sector: weight}
     sector_bottom_hits = {}    # sector -> count (debug)
+    # 🆕 Mappa settore -> ETF (per rotazione: gli ETF devono essere in ticker_bars)
+    sector_etf_map = {s: s for s in SECTOR_BOTTOM_CFG if s in ticker_bars}
+    rotation_cache = {}
+    rotation_hits = {}
 
     # 🆕 Crash Deploy: SPY closes indicizzate per data
     spy_doc_cd = await db.stock_bars.find_one({"ticker": "SPY"})
@@ -577,6 +616,17 @@ async def run_backtest(
             for sec in bottom_sectors:
                 sector_bottom_hits[sec] = sector_bottom_hits.get(sec, 0) + 1
 
+        # 🆕 Rotazione settoriale a questa data
+        rotation_signals = {}
+        if use_rotation:
+            if date not in rotation_cache:
+                rotation_cache[date] = _sector_rotation_at(
+                    ticker_bars, sector_etf_map, date_idx_map, date)
+            rotation_signals = rotation_cache[date]
+            for sec, sig in rotation_signals.items():
+                if sig in ("EXPLOSIVE", "ROTATING_IN"):
+                    rotation_hits[sec] = rotation_hits.get(sec, 0) + 1
+
         if len(positions) < max_positions:
             candidates = []
             for ticker, bars in ticker_bars.items():
@@ -590,12 +640,22 @@ async def run_backtest(
                 mtf_debug[_wt] = mtf_debug.get(_wt, 0) + 1
                 conf, target_price, stop_price, setup = _confluence_and_target(bars_slice, use_mtf=use_mtf, use_momentum=use_momentum)
 
-                # 🆕 SECTOR BOTTOM BOOST: se il titolo è in un settore in capitolazione,
-                # boosta la confluence (entra il leader) — proporzionale al peso settore.
+                # 🆕 SECTOR BOTTOM BOOST
                 sec = ticker_to_sector.get(ticker)
                 sec_weight = bottom_sectors.get(sec, 0)
                 if sec_weight > 0:
-                    conf += min(25, sec_weight)  # boost 8-23 pt secondo il peso storico
+                    conf += min(25, sec_weight)
+
+                # 🆕 SECTOR ROTATION BOOST (metodo Rea): premia i titoli dei settori
+                # dove i soldi stanno rientrando (EXPLOSIVE/ROTATING_IN), penalizza OUT.
+                if use_rotation:
+                    rsig = rotation_signals.get(sec, "NEUTRAL")
+                    if rsig == "EXPLOSIVE":
+                        conf += 12   # molla carica + soldi che rientrano
+                    elif rsig == "ROTATING_IN":
+                        conf += 7
+                    elif rsig == "ROTATING_OUT":
+                        conf -= 10   # evita i settori da cui i soldi escono
 
                 if conf >= min_confluence:
                     entry_price = bars_slice[-1]["c"]
@@ -772,6 +832,8 @@ async def run_backtest(
         "sector_bottom_hits": sector_bottom_hits,
         "config_use_crash_deploy": use_crash_deploy,
         "crash_deploy_events": crash_deploy_events,
+        "config_use_rotation": use_rotation,
+        "rotation_hits": rotation_hits,
         "equity_curve": equity_curve[::max(1, len(equity_curve) // 100)],
         "trades": sorted(trades, key=lambda x: x["exit_date"], reverse=True)[:60],
         "total_trades": len(trades),
