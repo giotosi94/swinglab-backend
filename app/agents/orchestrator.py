@@ -316,11 +316,41 @@ class Orchestrator:
                 print(f"  ⚠️ Brain write error (executions): {be}")
 
         except Exception as e:
-            report["errors"].append(f"Executor: {str(e)}")
-            report["steps"]["executor"] = {"status": "error", "error": str(e)}
-            exec_result = {}
-            print(f"❌ Executor ERROR: {e}")
-        report["timing"]["executor"] = round(time.time() - t4, 2)
+            report["errors"].append(f"MacroAnalyst: {str(e)}")
+            report["steps"]["macro_analyst"] = {"status": "error", "error": str(e)}
+            print(f"❌ MacroAnalyst ERROR: {e}")
+            # Fallback: usa context minimo
+            market_context = {
+                "market_regime": "NEUTRAL",
+                "regime_confidence": 50,
+                "exposure_multiplier": 0.5,
+                "sector_rankings": [],
+            }
+        report["timing"]["macro_analyst"] = round(time.time() - t1, 2)
+
+        # ============================================
+        # 🆕 STEP 1.5: 🎯 CRASH DEPLOY (Progetto Alpha)
+        # Se il Crash Radar segnala DEPLOY → compra SPY con la fetta long-term.
+        # Cooldown 3 giorni dentro crash_deploy_execute. Intrinseco alla pipeline.
+        # ============================================
+        try:
+            crash = market_context.get("crash_radar", {})
+            if crash.get("crash_level") in ("DEPLOY", "DEPLOY_MAX"):
+                print(f"  🔴 CRASH RADAR {crash.get('crash_level')} — valuto deploy SPY")
+                from app.routes.crash_deploy import crash_deploy_execute
+                deploy_res = await crash_deploy_execute()
+                report["steps"]["crash_deploy"] = deploy_res
+                print(f"  🎯 Crash Deploy: {deploy_res.get('status')}")
+            else:
+                report["steps"]["crash_deploy"] = {
+                    "status": "no_deploy",
+                    "crash_level": crash.get("crash_level", "NORMAL"),
+                    "score": crash.get("crash_risk_score", 0),
+                }
+        except Exception as e:
+            report["errors"].append(f"CrashDeploy: {str(e)}")
+            report["steps"]["crash_deploy"] = {"status": "error", "error": str(e)}
+            print(f"❌ Crash Deploy ERROR: {e}")
 
         # ============================================
         # STEP 5: Save pipeline state (backward compat con auto_trader)
