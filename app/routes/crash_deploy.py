@@ -83,9 +83,18 @@ async def crash_deploy_execute():
     if not plan["would_buy"]:
         return {"status": "skipped", "reason": "Deploy amount too small or no cash", "plan": plan}
 
+    # 🆕 Cooldown 3 giorni: non ricomprare in continuo durante lo stesso crash
+    from datetime import timedelta
+    db = get_db()
+    recent = await db.crash_deploy_log.find_one(
+        {"date": {"$gte": datetime.utcnow() - timedelta(days=3)}}
+    )
+    if recent:
+        return {"status": "cooldown", "reason": "Deploy già fatto negli ultimi 3 giorni",
+                "last_deploy": str(recent.get("date"))[:19], "plan": plan}
+
     # ESEGUE il buy notional su SPY
     from app.services.alpaca_trader import place_notional_buy
-    db = get_db()
     try:
         result = await place_notional_buy(DEPLOY_TICKER, plan["deploy_usd"])
         if not result:
