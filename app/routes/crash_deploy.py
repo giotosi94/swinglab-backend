@@ -197,3 +197,101 @@ async def load_spy_history(days: int = 730):
         "last_date": all_bars[-1]["date"],
     }
 
+@router.get("/backtest-scalar")
+async def backtest_scalar_deploy(fwd_days: int = 180):
+    """
+    🔬 Valida il deploy SCALARE ai livelli vs SECCO vs BUY-ALL, su storico SPY reale.
+    Per ogni crash trovato: simula le 3 strategie e confronta il rendimento forward.
+    """
+    db = get_db()
+    doc = await db.spy_longterm.find_one({"_id": "SPY"})
+    if not doc or not doc.get("bars"):
+        return {"error": "No SPY longterm data. Run /load-spy-history first."}
+
+    bars = doc["bars"]
+    closes = [b["c"] for b in bars]
+    dates = [b["date"] for b in bars]
+    n = len(bars)
+
+    # Livelli di deploy scalare (drawdown dal picco → % della fetta da deployare)
+    SCALAR_LEVELS = [
+        {"dd": -8,  "fraction": 0.25},
+        {"dd": -13, "fraction": 0.25},
+        {"dd": -18, "fraction": 0.25},
+        {"dd": -25, "fraction": 0.25},
+    ]
+    SECCO_DD = -20  # deploy secco: tutto a -20%
+
+    # Trova gli EPISODI di crash: drawdown dal max mobile a 252g che scende sotto -8%
+    episodes = []
+    i = 60
+    while i < n:
+        window = closes[max(0, i - 252):i + 1]
+        peak = max(window)
+        dd = (closes[i] - peak) / peak * 100
+        if dd <= -8:
+            # inizio episodio: trova il bottom e traccia i deploy scalari
+            start_i = i
+            peak_ref = peak
+            filled_levels = []
+            slice_capital = 10000.0  # fetta simulata $10k
+            scalar_shares = 0.0
+            scalar_spent = 0.0
+            secco_shares = 0.0
+            secco_spent = 0.0
+            j = i
+            while j < n:
+                w = closes[max(0, j - 252):j + 1]
+                pk = max(w)
+                d = (closes[j] - pk) / pk * 100
+                # deploy scalare: riempi i livelli toccati
+                for lvl in SCALAR_LEVELS:
+                    if d <= lvl["dd"] and lvl["dd"] not in filled_levels:
+                        amt = slice_capital * lvl["fraction"]
+                        scalar_shares += amt / closes[j]
+                        scalar_spent += amt
+                        filled_levels.append(lvl["dd"])
+                # deploy secco: tutto a -20%
+                if d <= SECCO_DD and secco_spent == 0:
+                    secco_shares = slice_capital / closes[j]
+                    secco_spent = slice_capital
+                # fine episodio: risalito sopra -5% dal picco
+                if d > -5 and j > start_i + 5:
+                    break
+                j += 1
+
+            bottom_idx = min(range(start_i, min(j + 1, n)), key=lambda k: closes[k])
+            # rendimento forward dal bottom
+            fwd_idx = min(bottom_idx + fwd_days, n - 1)
+            price_at_fwd = closes[fwd_idx]
+
+            # BUY-ALL: compra tutto all'inizio dell'episodio
+            buyall_shares = slice_capital / closes[start_i]
+
+            def value(shares, spent):
+                if spent == 0:
+                    return None
+                return round((shares * price_at_fwd - spent) / spent * 100, 2)
+
+            episodes.append({
+                "start_date": dates[start_i],
+                "bottom_date": dates[bottom_idx],
+                "max_drawdown_pct": round((closes[bottom_idx] - peak_ref) / peak_ref * 100, 2),
+                "levels_filled": filled_levels,
+                "fwd_days": fwd_days,
+                "return_scalar_pct": value(scalar_shares, scalar_spent),
+                "return_secco_pct": value(secco_shares, secco_spent),
+                "return_buyall_pct": value(buyall_shares, slice_capital),
+                "scalar_capital_deployed": round(scalar_spent, 0),
+                "secco_capital_deployed": round(secco_spent, 0),
+            })
+            i = j + 20  # salta oltre l'episodio
+        else:
+            i += 1
+
+    return {
+        "spy_period": {"first": dates[0], "last": dates[-1], "bars": n},
+        "episodes_found": len(episodes),
+        "episodes": episodes,
+        "scalar_levels": SCALAR_LEVELS,
+    }
