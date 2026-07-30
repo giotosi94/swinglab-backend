@@ -127,3 +127,73 @@ async def crash_deploy_execute():
         return {"status": "executed", "order_id": result.get("id", ""), "plan": plan}
     except Exception as e:
         return {"status": "error", "reason": str(e), "plan": plan}
+
+
+@router.post("/load-spy-history")
+async def load_spy_history(days: int = 730):
+    """
+    🔬 Carica storico lungo SPY (default 2 anni) in collection dedicata.
+    Serve per validare il deploy scalare ai POC su crash reali (es. dazi aprile 2025).
+    NON tocca stock_bars (resta a 300 barre).
+    """
+    import httpx
+    from datetime import timedelta
+    from app.config import settings
+
+    db = get_db()
+    end = datetime.utcnow() - timedelta(minutes=20)
+    start = end - timedelta(days=days)
+
+    url = "https://data.alpaca.markets/v2/stocks/SPY/bars"
+    headers = {
+        "APCA-API-KEY-ID": settings.ALPACA_API_KEY,
+        "APCA-API-SECRET-KEY": settings.ALPACA_SECRET_KEY,
+    }
+    all_bars = []
+    page_token = None
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            for _ in range(10):  # max 10 pagine (paginazione Alpaca)
+                params = {
+                    "timeframe": "1Day",
+                    "start": start.strftime("%Y-%m-%dT00:00:00Z"),
+                    "end": end.strftime("%Y-%m-%dT23:59:59Z"),
+                    "limit": 1000,
+                    "feed": "iex",
+                    "adjustment": "split",
+                }
+                if page_token:
+                    params["page_token"] = page_token
+                r = await client.get(url, headers=headers, params=params)
+                if r.status_code != 200:
+                    return {"error": f"Alpaca {r.status_code}: {r.text[:200]}"}
+                data = r.json()
+                for b in data.get("bars", []):
+                    all_bars.append({
+                        "date": b["t"][:10],
+                        "o": b["o"], "h": b["h"], "l": b["l"], "c": b["c"], "v": b["v"],
+                    })
+                page_token = data.get("next_page_token")
+                if not page_token:
+                    break
+    except Exception as e:
+        return {"error": str(e)}
+
+    if not all_bars:
+        return {"error": "No bars returned"}
+
+    all_bars.sort(key=lambda x: x["date"])
+    await db.spy_longterm.update_one(
+        {"_id": "SPY"},
+        {"$set": {"bars": all_bars, "updated_at": datetime.utcnow(),
+                  "count": len(all_bars),
+                  "first": all_bars[0]["date"], "last": all_bars[-1]["date"]}},
+        upsert=True,
+    )
+    return {
+        "status": "ok",
+        "bars_loaded": len(all_bars),
+        "first_date": all_bars[0]["date"],
+        "last_date": all_bars[-1]["date"],
+    }
+
