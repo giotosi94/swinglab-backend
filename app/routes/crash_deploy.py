@@ -14,54 +14,67 @@ router = APIRouter(prefix="/api/crash-deploy", tags=["crash-deploy"])
 LONGTERM_SLICE_PCT = 20.0   # % capitale riservata ai crash (fetta long-term)
 DEPLOY_TICKER = "SPY"
 
+# 🆕 Deploy SCALARE a fette (validato su crash reale dazi 2025: +32.84% vs 0% del secco)
+# Ogni livello di drawdown SPY toccato → deploya la sua fetta della riserva long-term.
+SCALAR_LEVELS = [
+    {"level": "L1", "dd": -8,  "fraction": 0.25},
+    {"level": "L2", "dd": -13, "fraction": 0.25},
+    {"level": "L3", "dd": -18, "fraction": 0.25},
+    {"level": "L4", "dd": -25, "fraction": 0.25},
+]
+LEVEL_COOLDOWN_DAYS = 30   # stesso livello non si ri-deploya entro l'episodio
+
 
 async def _build_deploy_plan():
-    """Legge il Crash Radar e calcola il piano di deploy (senza eseguire)."""
+    """Deploy SCALARE: legge il drawdown SPY e determina quali livelli deployare."""
     db = get_db()
     ctx = await db.market_context.find_one({"_id": "latest"})
     if not ctx:
         return {"error": "No market context. Run macro first."}
 
     cr = ctx.get("crash_radar", {})
-    level = cr.get("crash_level", "NORMAL")
-    score = cr.get("crash_risk_score", 0)
+    dd = cr.get("spy_drawdown_pct", 0)  # <= 0
 
-    # Frazione della fetta da deployare secondo il livello
-    deploy_fraction = {"DEPLOY": 0.5, "DEPLOY_MAX": 1.0}.get(level, 0.0)
-
-    # Account
     from app.services.alpaca_trader import get_account, get_positions
     account = await get_account()
     equity = float(account.get("equity", 0)) if account else 0
     cash = float(account.get("cash", 0)) if account else 0
-
     slice_usd = equity * (LONGTERM_SLICE_PCT / 100)
-    deploy_usd = round(slice_usd * deploy_fraction, 2)
 
-    # Quanto SPY ho già (per non sovra-deployare)
+    # Livelli ATTIVI (drawdown li ha toccati) e NON già deployati di recente
+    from datetime import timedelta
+    cutoff = datetime.utcnow() - timedelta(days=LEVEL_COOLDOWN_DAYS)
+    recent_logs = await db.crash_deploy_log.find(
+        {"date": {"$gte": cutoff}}
+    ).to_list(50)
+    already_done = {log.get("level") for log in recent_logs}
+
+    pending = []
+    for lvl in SCALAR_LEVELS:
+        if dd <= lvl["dd"] and lvl["level"] not in already_done:
+            amt = round(slice_usd * lvl["fraction"], 2)
+            pending.append({"level": lvl["level"], "dd_threshold": lvl["dd"], "usd": amt})
+
+    total_pending = sum(p["usd"] for p in pending)
+    total_pending = min(total_pending, cash * 0.95)
+    if total_pending < 0:
+        total_pending = 0
+
     positions = await get_positions() or []
     spy_held = sum(float(p.get("market_value", 0)) for p in positions if p.get("symbol") == DEPLOY_TICKER)
 
-    # Non superare il cash disponibile
-    deploy_usd = min(deploy_usd, cash * 0.95)
-    if deploy_usd < 0:
-        deploy_usd = 0
-
     return {
-        "crash_level": level,
-        "crash_score": score,
-        "spy_drawdown_pct": cr.get("spy_drawdown_pct", 0),
+        "spy_drawdown_pct": dd,
         "vixy": cr.get("vixy_price", 0),
-        "deploy_signal": level in ("DEPLOY", "DEPLOY_MAX"),
-        "deploy_fraction": deploy_fraction,
-        "longterm_slice_pct": LONGTERM_SLICE_PCT,
         "equity": round(equity, 2),
         "cash": round(cash, 2),
         "slice_usd": round(slice_usd, 2),
         "spy_already_held_usd": round(spy_held, 2),
-        "deploy_usd": deploy_usd,
+        "pending_levels": pending,
+        "deploy_usd": round(total_pending, 2),
+        "levels_already_done": list(already_done),
         "ticker": DEPLOY_TICKER,
-        "would_buy": deploy_usd >= 100,
+        "would_buy": total_pending >= 100 and len(pending) > 0,
     }
 
 
@@ -74,59 +87,56 @@ async def crash_deploy_simulate():
 
 @router.post("/execute")
 async def crash_deploy_execute():
-    """🚨 REALE — compra SPY con la fetta long-term. Solo se DEPLOY attivo."""
+    """🚨 REALE — deploy SCALARE: compra SPY per ogni livello di drawdown toccato."""
     plan = await _build_deploy_plan()
     if plan.get("error"):
         return plan
-    if not plan["deploy_signal"]:
-        return {"status": "skipped", "reason": f"Crash level {plan['crash_level']} — no deploy", "plan": plan}
     if not plan["would_buy"]:
-        return {"status": "skipped", "reason": "Deploy amount too small or no cash", "plan": plan}
+        return {"status": "skipped",
+                "reason": f"Nessun livello nuovo da deployare (dd {plan['spy_drawdown_pct']}%)",
+                "plan": plan}
 
-    # 🆕 Cooldown 3 giorni: non ricomprare in continuo durante lo stesso crash
-    from datetime import timedelta
-    db = get_db()
-    recent = await db.crash_deploy_log.find_one(
-        {"date": {"$gte": datetime.utcnow() - timedelta(days=3)}}
-    )
-    if recent:
-        return {"status": "cooldown", "reason": "Deploy già fatto negli ultimi 3 giorni",
-                "last_deploy": str(recent.get("date"))[:19], "plan": plan}
-
-    # ESEGUE il buy notional su SPY
     from app.services.alpaca_trader import place_notional_buy
-    try:
-        result = await place_notional_buy(DEPLOY_TICKER, plan["deploy_usd"])
-        if not result:
-            return {"status": "error", "reason": "Buy order failed", "plan": plan}
+    from app.services.telegram_bot import send_telegram
+    db = get_db()
+    executed = []
 
-        # Log
-        await db.crash_deploy_log.insert_one({
-            "ticker": DEPLOY_TICKER,
-            "deploy_usd": plan["deploy_usd"],
-            "crash_level": plan["crash_level"],
-            "crash_score": plan["crash_score"],
-            "spy_drawdown_pct": plan["spy_drawdown_pct"],
-            "order_id": result.get("id", ""),
-            "date": datetime.utcnow(),
-        })
-
-        # Telegram
+    for lvl in plan["pending_levels"]:
+        usd = lvl["usd"]
+        if usd < 100:
+            continue
         try:
-            from app.services.telegram_bot import send_telegram
-            await send_telegram(
-                f"🚨 <b>CRASH DEPLOY ESEGUITO</b>\n\n"
-                f"Comprato SPY per ${plan['deploy_usd']:,.0f}\n"
-                f"Crash level: {plan['crash_level']} (score {plan['crash_score']})\n"
-                f"SPY drawdown: {plan['spy_drawdown_pct']}%\n"
-                f"'Compra l'inferno' 🔥"
-            )
-        except Exception:
-            pass
+            result = await place_notional_buy(DEPLOY_TICKER, usd)
+            if not result:
+                continue
+            await db.crash_deploy_log.insert_one({
+                "ticker": DEPLOY_TICKER,
+                "level": lvl["level"],
+                "dd_threshold": lvl["dd_threshold"],
+                "deploy_usd": usd,
+                "spy_drawdown_pct": plan["spy_drawdown_pct"],
+                "order_id": result.get("id", ""),
+                "date": datetime.utcnow(),
+            })
+            executed.append({"level": lvl["level"], "usd": usd, "order_id": result.get("id", "")})
+        except Exception as e:
+            print(f"  Crash deploy {lvl['level']} error: {e}")
 
-        return {"status": "executed", "order_id": result.get("id", ""), "plan": plan}
-    except Exception as e:
-        return {"status": "error", "reason": str(e), "plan": plan}
+    if not executed:
+        return {"status": "error", "reason": "Nessun ordine eseguito", "plan": plan}
+
+    try:
+        lines = "\n".join(f"  {e['level']}: ${e['usd']:,.0f}" for e in executed)
+        await send_telegram(
+            f"🚨 <b>CRASH DEPLOY SCALARE</b>\n\n"
+            f"SPY drawdown {plan['spy_drawdown_pct']}%\n"
+            f"Fette deployate:\n{lines}\n"
+            f"'Compra l'inferno a fette' 🔥"
+        )
+    except Exception:
+        pass
+
+    return {"status": "executed", "deployed": executed, "plan": plan}
 
 
 @router.post("/load-spy-history")
