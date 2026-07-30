@@ -83,3 +83,99 @@ async def load_spy_history(years: int = 7):
         "first": bars_sorted[0]["date"],
         "last": bars_sorted[-1]["date"],
     }
+
+def _drawdown_from_peak(closes_upto):
+    if len(closes_upto) < 20:
+        return 0.0
+    peak = max(closes_upto)
+    return (closes_upto[-1] - peak) / peak * 100 if peak > 0 else 0.0
+
+
+async def backtest_crash_deploy_spy(start_date: str = None, end_date: str = None,
+                                    starting_capital: float = 100000):
+    """
+    Mini-backtest ISOLATO del crash deploy SOLO su SPY storico.
+    Confronta: DEPLOY (compra le fette nei crash) vs BUY&HOLD SPY.
+    """
+    db = get_db()
+    doc = await db.spy_history.find_one({"ticker": "SPY"})
+    if not doc or not doc.get("bars"):
+        return {"error": "No spy_history. Run load-spy-history first."}
+
+    bars = doc["bars"]
+    if start_date:
+        bars = [b for b in bars if b["date"] >= start_date]
+    if end_date:
+        bars = [b for b in bars if b["date"] <= end_date]
+    if len(bars) < 60:
+        return {"error": "Not enough bars in range"}
+
+    closes = [b["c"] for b in bars]
+    dates = [b["date"] for b in bars]
+
+    # ===== Strategia CRASH DEPLOY a fette =====
+    cash = starting_capital
+    spy_pos = {"shares": 0.0, "invested": 0.0, "fette": set(), "peak_at_entry": 0, "trimmed": False}
+    events = []
+    fette = [{"dd": -8, "id": 1, "frac": 0.30},
+             {"dd": -15, "id": 2, "frac": 0.40},
+             {"dd": -25, "id": 3, "frac": 0.30}]
+
+    for i in range(len(bars)):
+        dd = _drawdown_from_peak(closes[:i + 1])
+        peak = max(closes[:i + 1])
+        px = closes[i]
+
+        for f in fette:
+            if dd <= f["dd"] and f["id"] not in spy_pos["fette"]:
+                deploy = cash * f["frac"]
+                if deploy > 100:
+                    spy_pos["shares"] += deploy / px
+                    spy_pos["invested"] += deploy
+                    spy_pos["fette"].add(f["id"])
+                    spy_pos["peak_at_entry"] = max(spy_pos["peak_at_entry"], peak)
+                    cash -= deploy
+                    events.append({"date": dates[i], "action": f"FETTA_{f['id']}",
+                                   "dd": round(dd, 1), "price": round(px, 2)})
+
+        # trim 80% al ritorno sul massimo
+        if (spy_pos["shares"] > 0 and not spy_pos["trimmed"]
+                and px >= spy_pos["peak_at_entry"] and spy_pos["peak_at_entry"] > 0):
+            sell = spy_pos["shares"] * 0.80
+            cash += sell * px
+            cost = spy_pos["invested"] * 0.80
+            pnl = (sell * px - cost) / cost * 100 if cost > 0 else 0
+            spy_pos["shares"] -= sell
+            spy_pos["invested"] -= cost
+            spy_pos["trimmed"] = True
+            events.append({"date": dates[i], "action": "TRIM_80", "pnl_pct": round(pnl, 2)})
+
+    # chiudi residuo a fine periodo
+    final_val = cash + spy_pos["shares"] * closes[-1]
+    deploy_return = (final_val - starting_capital) / starting_capital * 100
+
+    # ===== Benchmark: BUY & HOLD SPY =====
+    bh_return = (closes[-1] - closes[0]) / closes[0] * 100
+
+    # max drawdown delle 2 strategie (semplificato: buy&hold)
+    peak_bh = closes[0]
+    max_dd_bh = 0
+    for c in closes:
+        peak_bh = max(peak_bh, c)
+        max_dd_bh = max(max_dd_bh, (peak_bh - c) / peak_bh * 100)
+
+    return {
+        "period": {"start": dates[0], "end": dates[-1], "days": len(bars)},
+        "crash_deploy": {
+            "return_pct": round(deploy_return, 2),
+            "final_value": round(final_val, 2),
+            "events": events,
+            "n_deploys": len([e for e in events if "FETTA" in e["action"]]),
+        },
+        "buy_and_hold": {
+            "return_pct": round(bh_return, 2),
+            "max_drawdown_pct": round(max_dd_bh, 2),
+        },
+        "verdict": "DEPLOY meglio" if deploy_return > bh_return else "BUY&HOLD meglio",
+        "difference_pct": round(deploy_return - bh_return, 2),
+    }
