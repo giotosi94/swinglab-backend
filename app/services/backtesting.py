@@ -413,11 +413,11 @@ async def run_backtest(
                                 "entry_dates": [], "peak_at_entry": spy_peak,
                                 "trimmed": False}
 
-            # 🆕 LIBERA CAPITALE: al primo trigger crash, vendi metà dello swing
-            # per generare munizioni (più capitale da deployare su SPY).
+            # 🆕 LIBERA CAPITALE: solo a drawdown BEAR (-15%+), non nei dip da bull.
+            # Nei bull un -8% è un pullback normale → NON liberare swing (perderesti il rally).
             for f in fette:
                 if spy_dd <= f["dd"] and f["id"] not in spy_position["fette_done"]:
-                    if f["id"] == 1 and positions:
+                    if f["id"] == 2 and positions:  # libera solo dalla fetta 2 (-15% = bear vero)
                         # libera ~50% dello swing (chiudi metà posizioni al prezzo corrente)
                         for tk in list(positions.keys()):
                             p = positions[tk]
