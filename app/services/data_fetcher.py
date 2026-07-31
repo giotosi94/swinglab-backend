@@ -276,35 +276,29 @@ def get_pattern_score_bonus(patterns):
     return max(-10, min(15, bonus))
 
 
-# Cache in-memory del POC precedente per rilevare lo shift (per ticker)
-_poc_history = {}
-
-def _detect_poc_shift(ticker, price, poc):
+def _detect_poc_shift(ticker, price, poc, prev_position=None):
     """
-    🆕 POC SHIFT (metodo Rea) sui daily.
-    Rileva quando il POC passa da SOPRA il prezzo (resistenza/muro sopra la testa)
-    a SOTTO (supporto/pavimento). Lo shift sopra→sotto è un segnale bullish:
-    il baricentro del volume si è spostato sotto → il muro è diventato supporto.
+    🆕 POC SHIFT (metodo Rea) sui daily — PERSISTENTE (prev letto dal DB).
+    Rileva quando il POC passa da SOPRA il prezzo (resistenza) a SOTTO (supporto).
+    Lo shift sopra→sotto è bullish: il muro è diventato pavimento.
     """
     result = {
-        "poc_position": "unknown",   # "above" (resistenza) / "below" (supporto)
-        "shifted_bull": False,        # True se appena passato sopra→sotto
+        "poc_position": "unknown",
+        "shifted_bull": False,
         "poc_distance_pct": None,
     }
     if not poc or not price or poc <= 0 or price <= 0:
         return result
 
-    dist_pct = (price - poc) / poc * 100  # >0 = prezzo sopra POC (POC sotto = supporto)
+    dist_pct = (price - poc) / poc * 100
     result["poc_distance_pct"] = round(dist_pct, 2)
-    current_pos = "below" if dist_pct > 0 else "above"  # POC sotto/sopra il prezzo
+    current_pos = "below" if dist_pct > 0 else "above"
     result["poc_position"] = current_pos
 
-    prev = _poc_history.get(ticker)
-    # Shift bull: prima il POC era sopra il prezzo (above), ora è sotto (below)
-    if prev == "above" and current_pos == "below":
+    # Shift bull: prima POC sopra (above), ora sotto (below)
+    if prev_position == "above" and current_pos == "below":
         result["shifted_bull"] = True
 
-    _poc_history[ticker] = current_pos
     return result
 
 
@@ -573,7 +567,7 @@ async def fetch_bars(client, symbol):
 # STOCK ANALYSIS
 # ============================================
 
-def analyze_stock(ticker, df, sector_code, sector_scores):
+def analyze_stock(ticker, df, sector_code, sector_scores, prev_poc_position=None):
     if df is None or len(df) < 20:
         return None
     close = df["Close"]; volume = df["Volume"]; high = df["High"]; low = df["Low"]
@@ -592,9 +586,8 @@ def analyze_stock(ticker, df, sector_code, sector_scores):
     range_position = round(((price - low_52w) / (high_52w - low_52w)) * 100, 1) if (high_52w - low_52w) > 0 else 50
     poc = poc_result[0]; va_high = poc_result[1]; va_low = poc_result[2]; vp_distribution = poc_result[3]
 
-    # 🆕 POC SHIFT (metodo Rea): rileva quando il POC passa da SOPRA il prezzo
-    # (resistenza) a SOTTO (supporto). Shift sopra→sotto + volume = segnale bull.
-    poc_shift = _detect_poc_shift(ticker, price, poc)
+    # 🆕 POC SHIFT (metodo Rea) — prev_poc_position letto dal DB (persistente)
+    poc_shift = _detect_poc_shift(ticker, price, poc, prev_position=prev_poc_position)
 
     patterns = detect_candlestick_patterns(df)
     fvgs = detect_fvg(df); wyckoff = detect_wyckoff_phase(df)
@@ -863,7 +856,10 @@ async def fetch_and_analyze_stocks(force=False):
             for ticker in batch:
                 df = bars_map.get(ticker)
                 sector_code = ticker_to_sector.get(ticker, "UNKNOWN")
-                asset_doc = analyze_stock(ticker, df, sector_code, sector_scores)
+                # 🆕 Leggi la posizione POC precedente dal DB (per lo shift persistente)
+                prev_doc = await db.assets.find_one({"ticker": ticker}, {"poc_shift": 1})
+                prev_pos = (prev_doc or {}).get("poc_shift", {}).get("poc_position")
+                asset_doc = analyze_stock(ticker, df, sector_code, sector_scores, prev_poc_position=prev_pos)
                 if asset_doc:
                     await db.assets.update_one({"ticker": ticker}, {"$set": asset_doc}, upsert=True)
                     results.append(asset_doc)
