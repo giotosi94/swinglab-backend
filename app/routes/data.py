@@ -622,3 +622,21 @@ async def backtest_sector_rotation_endpoint(start_date: str, end_date: str):
     """Mini-backtest rotazione settoriale vs equal-weight su ETF storici."""
     from app.services.spy_history import backtest_sector_rotation
     return await backtest_sector_rotation(start_date=start_date, end_date=end_date)
+
+@router.get("/crash-deploy/status")
+async def crash_deploy_status():
+    from app.services.crash_deploy_live import get_crash_deploy_state
+    return await get_crash_deploy_state()
+
+
+@router.post("/crash-deploy/flags")
+async def crash_deploy_flags(enabled: bool = None, dry_run: bool = None):
+    from app.services.crash_deploy_live import set_crash_deploy_flags
+    return await set_crash_deploy_flags(enabled=enabled, dry_run=dry_run)
+
+
+@router.post("/crash-deploy/check")
+async def crash_deploy_check():
+    """Valuta il crash deploy ORA (rispetta flag + dry_run)."""
+    from app.services.crash_deploy_live import check_and_deploy
+    return await check_and_deploy()
