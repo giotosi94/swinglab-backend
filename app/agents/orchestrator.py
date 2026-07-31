@@ -316,37 +316,25 @@ class Orchestrator:
                 print(f"  ⚠️ Brain write error (executions): {be}")
 
         except Exception as e:
-            report["errors"].append(f"MacroAnalyst: {str(e)}")
-            report["steps"]["macro_analyst"] = {"status": "error", "error": str(e)}
-            print(f"❌ MacroAnalyst ERROR: {e}")
-            # Fallback: usa context minimo
-            market_context = {
-                "market_regime": "NEUTRAL",
-                "regime_confidence": 50,
-                "exposure_multiplier": 0.5,
-                "sector_rankings": [],
-            }
-        report["timing"]["macro_analyst"] = round(time.time() - t1, 2)
+            report["errors"].append(f"Executor: {str(e)}")
+            report["steps"]["executor"] = {"status": "error", "error": str(e)}
+            exec_result = {}
+            print(f"❌ Executor ERROR: {e}")
+        report["timing"]["executor"] = round(time.time() - t4, 2)
 
         # ============================================
-        # 🆕 STEP 1.5: 🎯 CRASH DEPLOY (Progetto Alpha)
-        # Se il Crash Radar segnala DEPLOY → compra SPY con la fetta long-term.
-        # Cooldown 3 giorni dentro crash_deploy_execute. Intrinseco alla pipeline.
+        # 🔴 CRASH DEPLOY LIVE (Progetto Alpha) — modulo sicuro isolato
+        # Tripla sicurezza: flag master + dry_run + gate regime BEAR/CRASH.
+        # Gira ad ogni ciclo ma il gate interno lo blocca in bull o se flag OFF.
         # ============================================
         try:
-            crash = market_context.get("crash_radar", {})
-            dd = crash.get("spy_drawdown_pct", 0)
-            if dd <= -8:  # primo livello scalare toccato → valuta deploy a fette
-                print(f"  🔴 CRASH RADAR dd {dd}% — valuto deploy scalare SPY")
-                from app.routes.crash_deploy import crash_deploy_execute
-                deploy_res = await crash_deploy_execute()
-                report["steps"]["crash_deploy"] = deploy_res
-                print(f"  🎯 Crash Deploy scalare: {deploy_res.get('status')}")
+            from app.services.crash_deploy_live import check_and_deploy
+            deploy_res = await check_and_deploy()
+            report["steps"]["crash_deploy"] = deploy_res
+            if deploy_res.get("actions"):
+                print(f"  🔴 Crash Deploy: {deploy_res['status']} — {deploy_res['actions']}")
             else:
-                report["steps"]["crash_deploy"] = {
-                    "status": "no_deploy",
-                    "spy_drawdown_pct": dd,
-                }
+                print(f"  🔴 Crash Deploy: {deploy_res.get('status')} (regime {deploy_res.get('regime', '—')})")
         except Exception as e:
             report["errors"].append(f"CrashDeploy: {str(e)}")
             report["steps"]["crash_deploy"] = {"status": "error", "error": str(e)}
