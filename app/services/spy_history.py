@@ -179,3 +179,175 @@ async def backtest_crash_deploy_spy(start_date: str = None, end_date: str = None
         "verdict": "DEPLOY meglio" if deploy_return > bh_return else "BUY&HOLD meglio",
         "difference_pct": round(deploy_return - bh_return, 2),
     }
+
+async def load_sectors_history(years: int = 7):
+    """
+    Scarica storico lungo degli 11 ETF settoriali da Alpaca.
+    Collection separata 'sectors_history'. One-shot.
+    """
+    db = get_db()
+    sectors = ["XLE","XLC","XLI","XLU","XLF","XLK","XLRE","XLY","XLB","XLP","XLV"]
+    end = datetime.utcnow() - timedelta(minutes=20)
+    start = end - timedelta(days=years * 365)
+    saved = {}
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        for etf in sectors:
+            all_bars = []
+            page_token = None
+            for _ in range(50):
+                params = {
+                    "timeframe": "1Day",
+                    "start": start.strftime("%Y-%m-%dT00:00:00Z"),
+                    "end": end.strftime("%Y-%m-%dT23:59:59Z"),
+                    "limit": 10000, "feed": "iex", "adjustment": "split",
+                }
+                if page_token:
+                    params["page_token"] = page_token
+                try:
+                    r = await client.get(
+                        f"{ALPACA_DATA_URL}/v2/stocks/{etf}/bars",
+                        headers=ALPACA_HEADERS, params=params,
+                    )
+                    if r.status_code != 200:
+                        break
+                    data = r.json()
+                    for b in data.get("bars", []):
+                        all_bars.append({
+                            "date": b["t"][:10],
+                            "o": b["o"], "h": b["h"], "l": b["l"], "c": b["c"], "v": b["v"],
+                        })
+                    page_token = data.get("next_page_token")
+                    if not page_token:
+                        break
+                except Exception:
+                    break
+
+            if all_bars:
+                seen = {b["date"]: b for b in all_bars}
+                bars_sorted = sorted(seen.values(), key=lambda x: x["date"])
+                await db.sectors_history.update_one(
+                    {"ticker": etf},
+                    {"$set": {"ticker": etf, "bars": bars_sorted,
+                              "count": len(bars_sorted),
+                              "first": bars_sorted[0]["date"],
+                              "last": bars_sorted[-1]["date"],
+                              "loaded_at": datetime.utcnow()}},
+                    upsert=True,
+                )
+                saved[etf] = len(bars_sorted)
+
+    return {"status": "ok", "sectors": saved}
+
+
+def _rotation_signal_from_closes(closes):
+    """Rotazione (metodo Rea) da array di chiusure fino a una data."""
+    if len(closes) < 126:
+        return "NEUTRAL", 0
+    c_now = closes[-1]
+    r3 = c_now / closes[-63] - 1
+    r6 = c_now / closes[-126] - 1
+    ann3 = ((1 + r3) ** (252/63) - 1) * 100 if r3 > -1 else 0
+    ann6 = ((1 + r6) ** (252/126) - 1) * 100 if r6 > -1 else 0
+    accel = ann3 - ann6
+    last20 = closes[-20:]
+    mean20 = sum(last20) / len(last20)
+    compr = (max(last20) - min(last20)) / mean20 if mean20 > 0 else 0.5
+    if accel > 5 and compr < 0.07:
+        return "EXPLOSIVE", accel
+    elif accel > 5:
+        return "ROTATING_IN", accel
+    elif accel < -8:
+        return "ROTATING_OUT", accel
+    return "NEUTRAL", accel
+
+
+async def backtest_sector_rotation(start_date: str, end_date: str,
+                                   starting_capital: float = 100000):
+    """
+    Mini-backtest ISOLATO: rotazione settoriale sui soli ETF.
+    Strategia: ogni mese, tieni gli ETF in EXPLOSIVE/ROTATING_IN (equipesati),
+    evita ROTATING_OUT. Confronta vs equal-weight di tutti gli 11 ETF (buy&hold).
+    """
+    db = get_db()
+    docs = await db.sectors_history.find({}).to_list(20)
+    if not docs:
+        return {"error": "No sectors_history. Run load-sectors-history first."}
+
+    # closes per ETF, filtrati per periodo, indicizzati per data
+    etf_data = {}
+    all_dates = set()
+    for d in docs:
+        bars = [b for b in d["bars"] if start_date <= b["date"] <= end_date]
+        if len(bars) < 130:
+            continue
+        etf_data[d["ticker"]] = {b["date"]: b["c"] for b in bars}
+        etf_data[d["ticker"]]["_ordered"] = [b["c"] for b in sorted(bars, key=lambda x: x["date"])]
+        etf_data[d["ticker"]]["_dates"] = [b["date"] for b in sorted(bars, key=lambda x: x["date"])]
+        all_dates.update(b["date"] for b in bars)
+
+    if not etf_data:
+        return {"error": "Not enough data in range"}
+
+    dates = sorted(all_dates)
+    # ribilancio mensile (ogni ~21 giorni)
+    rebal_idx = list(range(126, len(dates), 21))
+
+    # Strategia ROTAZIONE
+    cash_rot = starting_capital
+    holdings_rot = {}  # etf -> shares
+    equity_rot = []
+
+    for i, date in enumerate(dates):
+        # valore corrente
+        val = cash_rot + sum(
+            sh * etf_data[etf].get(date, etf_data[etf]["_ordered"][-1])
+            for etf, sh in holdings_rot.items()
+        )
+        equity_rot.append(val)
+
+        if i in rebal_idx:
+            # calcola segnali a questa data
+            chosen = []
+            for etf, data in etf_data.items():
+                if date not in data:
+                    continue
+                d_idx = data["_dates"].index(date) if date in data["_dates"] else -1
+                if d_idx < 126:
+                    continue
+                closes_upto = data["_ordered"][:d_idx + 1]
+                sig, _ = _rotation_signal_from_closes(closes_upto)
+                if sig in ("EXPLOSIVE", "ROTATING_IN"):
+                    chosen.append(etf)
+            # vendi tutto
+            for etf, sh in holdings_rot.items():
+                cash_rot += sh * etf_data[etf].get(date, etf_data[etf]["_ordered"][-1])
+            holdings_rot = {}
+            # compra equipesato i chosen
+            if chosen:
+                per = cash_rot / len(chosen)
+                for etf in chosen:
+                    px = etf_data[etf].get(date)
+                    if px:
+                        holdings_rot[etf] = per / px
+                        cash_rot -= per
+
+    final_rot = cash_rot + sum(
+        sh * etf_data[etf]["_ordered"][-1] for etf, sh in holdings_rot.items()
+    )
+    rot_return = (final_rot - starting_capital) / starting_capital * 100
+
+    # Benchmark: equal-weight buy&hold di tutti gli 11 ETF
+    bh_returns = []
+    for etf, data in etf_data.items():
+        o = data["_ordered"]
+        bh_returns.append((o[-1] - o[0]) / o[0] * 100)
+    bh_return = sum(bh_returns) / len(bh_returns) if bh_returns else 0
+
+    return {
+        "period": {"start": dates[0], "end": dates[-1], "days": len(dates)},
+        "rotation": {"return_pct": round(rot_return, 2), "final": round(final_rot, 2)},
+        "equal_weight_hold": {"return_pct": round(bh_return, 2)},
+        "difference_pct": round(rot_return - bh_return, 2),
+        "verdict": "ROTATION meglio" if rot_return > bh_return else "HOLD meglio",
+    }
