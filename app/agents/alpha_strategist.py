@@ -50,7 +50,7 @@ class AlphaStrategist(BaseAgent):
                 "mtf_alignment": 1.0,     # 🆕 v2.1 MTF Weekly trend filter
             },
             # Filtri
-            "min_confluence": 35,
+            "min_confluence": 48,
             "max_rsi_entry": 68,
             "min_rsi_entry": 25,
             "min_price": 2.0,
@@ -998,13 +998,13 @@ class AlphaStrategist(BaseAgent):
         if low_total >= 3:
             low_wr = conf_buckets["low"]["w"] / low_total
             if low_wr < 0.35:
-                min_conf = min(min_conf + 3, 55)
+                min_conf = min(min_conf + 3, 60)
             elif low_wr < 0.45:
-                min_conf = min(min_conf + 1, 50)
+                min_conf = min(min_conf + 1, 55)
         if mid_total >= 3:
             mid_wr = conf_buckets["mid"]["w"] / mid_total
             if mid_wr > 0.65:
-                min_conf = max(min_conf - 2, 25)
+                min_conf = max(min_conf - 2, 42)  # 🔧 floor a 42 (non scende sotto)
 
         rsi_losses = [t.get("rsi_at_entry", 50) for t in losses if t.get("rsi_at_entry")]
         max_rsi = params.get("max_rsi_entry", 68)
