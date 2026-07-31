@@ -608,3 +608,17 @@ async def backtest_crash_spy(start_date: str = None, end_date: str = None):
     """Mini-backtest crash deploy vs buy&hold su SPY storico."""
     from app.services.spy_history import backtest_crash_deploy_spy
     return await backtest_crash_deploy_spy(start_date=start_date, end_date=end_date)
+
+
+@router.post("/load-sectors-history")
+async def load_sectors_history_endpoint(years: int = 7):
+    """One-shot: carica storico lungo degli 11 ETF settoriali (isolato)."""
+    from app.services.spy_history import load_sectors_history
+    return await load_sectors_history(years=years)
+
+
+@router.post("/backtest-sector-rotation")
+async def backtest_sector_rotation_endpoint(start_date: str, end_date: str):
+    """Mini-backtest rotazione settoriale vs equal-weight su ETF storici."""
+    from app.services.spy_history import backtest_sector_rotation
+    return await backtest_sector_rotation(start_date=start_date, end_date=end_date)
