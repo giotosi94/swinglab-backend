@@ -276,6 +276,38 @@ def get_pattern_score_bonus(patterns):
     return max(-10, min(15, bonus))
 
 
+# Cache in-memory del POC precedente per rilevare lo shift (per ticker)
+_poc_history = {}
+
+def _detect_poc_shift(ticker, price, poc):
+    """
+    🆕 POC SHIFT (metodo Rea) sui daily.
+    Rileva quando il POC passa da SOPRA il prezzo (resistenza/muro sopra la testa)
+    a SOTTO (supporto/pavimento). Lo shift sopra→sotto è un segnale bullish:
+    il baricentro del volume si è spostato sotto → il muro è diventato supporto.
+    """
+    result = {
+        "poc_position": "unknown",   # "above" (resistenza) / "below" (supporto)
+        "shifted_bull": False,        # True se appena passato sopra→sotto
+        "poc_distance_pct": None,
+    }
+    if not poc or not price or poc <= 0 or price <= 0:
+        return result
+
+    dist_pct = (price - poc) / poc * 100  # >0 = prezzo sopra POC (POC sotto = supporto)
+    result["poc_distance_pct"] = round(dist_pct, 2)
+    current_pos = "below" if dist_pct > 0 else "above"  # POC sotto/sopra il prezzo
+    result["poc_position"] = current_pos
+
+    prev = _poc_history.get(ticker)
+    # Shift bull: prima il POC era sopra il prezzo (above), ora è sotto (below)
+    if prev == "above" and current_pos == "below":
+        result["shifted_bull"] = True
+
+    _poc_history[ticker] = current_pos
+    return result
+
+
 def calc_weekly_trend(df):
     """MTF Light: resample daily bars -> weekly per il trend di fondo. Zero API extra."""
     default = {"weekly_trend": "UNKNOWN", "aligned": True, "score": 50,
@@ -559,6 +591,11 @@ def analyze_stock(ticker, df, sector_code, sector_scores):
     pct_from_low = round(((price - low_52w) / low_52w) * 100, 2) if low_52w > 0 else 0
     range_position = round(((price - low_52w) / (high_52w - low_52w)) * 100, 1) if (high_52w - low_52w) > 0 else 50
     poc = poc_result[0]; va_high = poc_result[1]; va_low = poc_result[2]; vp_distribution = poc_result[3]
+
+    # 🆕 POC SHIFT (metodo Rea): rileva quando il POC passa da SOPRA il prezzo
+    # (resistenza) a SOTTO (supporto). Shift sopra→sotto + volume = segnale bull.
+    poc_shift = _detect_poc_shift(ticker, price, poc)
+
     patterns = detect_candlestick_patterns(df)
     fvgs = detect_fvg(df); wyckoff = detect_wyckoff_phase(df)
     accumulation = calc_accumulation_score(df, poc, va_low, va_high)
@@ -594,6 +631,7 @@ def analyze_stock(ticker, df, sector_code, sector_scores):
         "setup_score": setup_score, "setup_type": setup_type, "vp_distribution": vp_distribution,
         "candlestick_patterns": patterns_list, "fvg": fvgs, "wyckoff": wyckoff,
         "accumulation": accumulation, "mtf": mtf, "price_history": price_history, "pattern_bonus": pattern_bonus,
+        "poc_shift": poc_shift,
         "high_52w": high_52w, "low_52w": low_52w, "pct_from_high": pct_from_high,
         "pct_from_low": pct_from_low, "range_position": range_position,
         "updated_at": datetime.utcnow(),
