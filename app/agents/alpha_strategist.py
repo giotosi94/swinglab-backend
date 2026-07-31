@@ -442,11 +442,29 @@ class AlphaStrategist(BaseAgent):
         """
         sell_signals = []
 
+        from datetime import datetime
+        db = get_db()
+
         for p in positions:
             symbol = p.get("symbol")
             asset = assets_map.get(symbol)
             if not asset:
                 continue
+
+            # 🆕 Minimum holding anche lato Alpha (anti-churning): non generare
+            # sell signal "soft" (pattern/score/ML) su posizioni aperte da <24h.
+            # Evita il loop vende→ricompra quando Alpha vende e poi ricompra.
+            try:
+                buy_t = await db.trade_history.find_one(
+                    {"ticker": symbol, "side": "buy", "sell_linked": {"$ne": True}},
+                    sort=[("date", -1)]
+                )
+                if buy_t and buy_t.get("date"):
+                    hours_held = (datetime.utcnow() - buy_t["date"]).total_seconds() / 3600
+                    if hours_held < 24:
+                        continue  # troppo fresca: niente sell soft
+            except Exception:
+                pass
 
             current_price = float(p.get("current_price", 0))
             entry_price = float(p.get("avg_entry_price", 0))
