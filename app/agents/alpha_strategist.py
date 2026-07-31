@@ -25,7 +25,7 @@ class AlphaStrategist(BaseAgent):
         # + Factor 15 (Trend Predictor): 2.0 max
         # = 19.5 total
         # v2.1 — +Factor 16 MTF Weekly Alignment (2.5 max) = 22.0
-        self.MAX_RAW_CONFLUENCE = 22.0
+        self.MAX_RAW_CONFLUENCE = 25.0  # +3.0 POC Shift factor
 
     def default_params(self) -> dict:
         return {
@@ -48,6 +48,7 @@ class AlphaStrategist(BaseAgent):
                 "ml_winloss": 0.8,       # WIN/LOSS accuracy 46.7% → peso ridotto
                 "trend_predictor": 0.7,   # Trend accuracy 50.7% → peso ridotto
                 "mtf_alignment": 1.0,     # 🆕 v2.1 MTF Weekly trend filter
+                "poc_shift": 1.0,         # 🆕 POC Shift Contrarian (Rea)
             },
             # Filtri
             "min_confluence": 48,
@@ -415,6 +416,28 @@ class AlphaStrategist(BaseAgent):
         else:
             pts = 0
             factors.append({"name": "MTF", "pts": 0, "max": 2.5, "detail": "N/A", "pass": False})
+        raw_score += pts
+
+        # --- 17. 🆕 POC SHIFT CONTRARIAN (metodo Rea) ---
+        # Segnale forte: POC passato da sopra a sotto (shift bull) CONFERMATO da
+        # accumulazione + rottura. Non "vicino al POC alla cieca" — serve la conferma.
+        w = fw.get("poc_shift", 1.0)
+        poc_shift = asset.get("poc_shift", {})
+        accum_sc = accum.get("score", 0)
+        has_bullish = any(p.get("type") == "bullish" for p in patterns)
+        wy_ph = wyckoff.get("phase", "")
+
+        if poc_shift.get("shifted_bull") and accum_sc >= 50 and (has_bullish or wy_ph in ("accumulation", "spring")):
+            # SHIFT confermato: POC sotto + accumulo + rottura → setup contrarian top
+            pts = 3.0 * w
+            factors.append({"name": "POCShift", "pts": pts, "max": 3.0, "detail": "Shift bull + accum + rottura!", "pass": True})
+        elif poc_shift.get("poc_position") == "below" and accum_sc >= 40:
+            # POC già sotto (supporto) + accumulo → buono ma non lo shift fresco
+            pts = 1.0 * w
+            factors.append({"name": "POCShift", "pts": pts, "max": 3.0, "detail": "POC sotto + accum", "pass": True})
+        else:
+            pts = 0
+            factors.append({"name": "POCShift", "pts": 0, "max": 3.0, "detail": "no shift", "pass": False})
         raw_score += pts
 
         # Normalize to 0-100
