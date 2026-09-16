@@ -640,3 +640,16 @@ async def alpha_radar():
         "market_regime": ctx.get("market_regime", "UNKNOWN"),
         "updated_at": ctx.get("analyzed_at", ""),
     }
+
+@router.post("/{agent_name}/set-param")
+async def set_agent_param(agent_name: str, key: str, value: float):
+    """🔧 Forza un parametro di un agente nel DB (override di learn/default)."""
+    orch = _get_orch()
+    agent = orch.agents.get(agent_name)
+    if not agent:
+        return {"error": f"Agent '{agent_name}' not found"}
+    params = await agent.get_params()
+    old = params.get(key)
+    params[key] = int(value) if float(value).is_integer() else float(value)
+    await agent.save_params(params)
+    return {"agent": agent_name, "param": key, "old": old, "new": params[key]}
