@@ -42,12 +42,12 @@ class AdaptivePositionManager(BaseAgent):
             # ===== EXIT thresholds =====
             "apm_exit_confluence_threshold": 30,    # Se scende sotto → considera exit
             "apm_exit_ml_threshold": 40,            # Se ML WIN scende sotto → considera exit
-            "apm_exit_min_negative_factors": 2,     # Minimo fattori negativi
+            "apm_exit_min_negative_factors": 3,     # 🔧 2→3: dati reali 41% uscite premature, +1.13% dopo exit
             
             # ===== SCALE OUT targets =====
             "apm_scaling_enabled": True,
-            "apm_target_1_pct": 5.0,     # +5% → chiude 50%
-            "apm_target_1_size": 50,     # % da chiudere al T1
+            "apm_target_1_pct": 5.0,     # +5% → chiude 30%
+            "apm_target_1_size": 30,     # 🔧 50→30: attacca l'asimmetria (vinci sul 30%, perdi sul 100%)
             "apm_target_2_pct": 10.0,    # +10% → chiude 30%
             "apm_target_2_size": 30,
             "apm_target_3_pct": 20.0,    # +20% → chiude 20% residuo
