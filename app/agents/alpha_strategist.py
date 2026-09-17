@@ -739,6 +739,7 @@ class AlphaStrategist(BaseAgent):
         weak_sectors = params.get("weak_sectors", [])
 
         candidates = []
+        rejected_by_confluence = []
         skipped_reasons = {"low_confluence": 0, "rsi_filter": 0, "setup_filter": 0,
                           "sector_full": 0, "price_filter": 0, "volume_filter": 0,
                           "already_open": 0}
@@ -799,6 +800,24 @@ class AlphaStrategist(BaseAgent):
 
             if conf_score < min_conf:
                 skipped_reasons["low_confluence"] += 1
+                rejected_by_confluence.append({
+                    "ticker": ticker,
+                    "confluence": conf_score,
+                    "distance_to_threshold": round(min_conf - conf_score, 1),
+                    "raw_score": conf.get("raw_score", 0),
+                    "rules_contribution": conf.get("rules_contribution", 0),
+                    "ml_contribution": conf.get("ml_contribution", 0),
+                    "passing_factors": conf.get("passing_factors", 0),
+                    "setup_type": stype,
+                    "setup_adjustment": setup_adjustment,
+                    "sector": sector,
+                    "sector_is_weak": sector_is_weak,
+                    "rsi": round(rsi, 1),
+                    "relative_volume": round(rel_vol, 2),
+                    "ml_prediction": ml_data.get("ml_prediction", "N/A") if ml_data else "N/A",
+                    "ml_score": ml_data.get("ml_score", 0) if ml_data else 0,
+                    "trend_prediction": ml_data.get("trend_prediction", "N/A") if ml_data else "N/A",
+                })
                 continue
 
             # 🔧 v1.2 — Target e stop loss safety
@@ -851,6 +870,8 @@ class AlphaStrategist(BaseAgent):
             })
 
         candidates.sort(key=lambda x: x["confluence"], reverse=True)
+        rejected_by_confluence.sort(key=lambda x: x["confluence"], reverse=True)
+        top_rejected = rejected_by_confluence[:10]
         top_candidates = candidates[:10]
 
         # 🆕 Ricalcola target/stop ATR-based (R/R realistici, come backtest)
@@ -960,6 +981,15 @@ class AlphaStrategist(BaseAgent):
             # 🆕 v2.0 — ML stats
             "ml_data_loaded": len(ml_map),
             # 🆕 Sentiment stats
+            "top_rejected_by_confluence": top_rejected,
+            "confluence_distribution": {
+                "threshold": min_conf,
+                "rejected_count": len(rejected_by_confluence),
+                "best_rejected": top_rejected[0]["confluence"] if top_rejected else None,
+                "within_1_point": sum(1 for x in rejected_by_confluence if x["distance_to_threshold"] <= 1),
+                "within_3_points": sum(1 for x in rejected_by_confluence if x["distance_to_threshold"] <= 3),
+                "within_5_points": sum(1 for x in rejected_by_confluence if x["distance_to_threshold"] <= 5),
+            },
             "sentiment_summary": {
                 c["ticker"]: {
                     "sentiment": c.get("sentiment", "N/A"),
@@ -985,8 +1015,14 @@ class AlphaStrategist(BaseAgent):
             confidence=min(100, summary["top_confluence"]) if top_candidates else 20,
         )
 
-        print(f"🎯 AlphaStrategist v2.0: {len(top_candidates)} candidates, "
-              f"{len(sell_signals)} sell signals (ML: {len(ml_map)} tickers)")
+        best_rejected_score = top_rejected[0]["confluence"] if top_rejected else 0
+        print(f"🎯 AlphaStrategist v2.1: {len(top_candidates)} candidates, "
+              f"{len(sell_signals)} sell signals (ML: {len(ml_map)} tickers, "
+              f"best rejected: {best_rejected_score})")
+        if top_rejected:
+            print("  🔎 Top rejected: " + ", ".join(
+                f"{x['ticker']}={x['confluence']}" for x in top_rejected[:5]
+            ))
 
         return {
             "buy_candidates": top_candidates,
