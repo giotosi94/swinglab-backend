@@ -90,22 +90,30 @@ async def get_daily_summary():
 
 @router.get("/open")
 async def get_open_trades():
-    """Trade aperti (buy senza sell corrispondente)."""
+    """
+    Trade aperti secondo la fonte di verita' del sistema.
+
+    Uno scale-out T1/T2/T3 crea un record SELL parziale, ma il BUY resta
+    aperto finche' sell_linked non diventa True. La vecchia logica cercava
+    qualsiasi SELL successivo al BUY e quindi nascondeva AMD, MTCH e TMO.
+    """
     db = get_db()
     buys = await db.trade_history.find(
-        {"side": "buy"}
-    ).sort("date", -1).to_list(100)
+        {"side": "buy", "sell_linked": {"$ne": True}}
+    ).sort("date", -1).to_list(200)
+
+    latest_by_ticker = {}
+    for buy in buys:
+        ticker = buy.get("ticker")
+        if ticker and ticker not in latest_by_ticker:
+            latest_by_ticker[ticker] = buy
 
     open_trades = []
-    for b in buys:
-        ticker = b.get("ticker")
-        sell = await db.trade_history.find_one(
-            {"ticker": ticker, "side": "sell", "date": {"$gt": b.get("date")}},
-            sort=[("date", 1)]
-        )
-        if not sell:
-            b["_id"] = str(b["_id"])
-            open_trades.append(b)
+    for buy in latest_by_ticker.values():
+        buy["_id"] = str(buy["_id"])
+        if buy.get("date") and hasattr(buy["date"], "isoformat"):
+            buy["date"] = buy["date"].isoformat()
+        open_trades.append(buy)
 
     return open_trades
 
@@ -124,7 +132,7 @@ class TradeInsert(BaseModel):
     ticker: str
     side: str
     entry_price: float = 0
-    shares: int = 0
+    shares: float = 0
     setup_type: str = "unknown"
     sector: str = "unknown"
     rsi_at_entry: float = 50
