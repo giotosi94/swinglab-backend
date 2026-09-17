@@ -25,7 +25,7 @@ class AlphaStrategist(BaseAgent):
         # + Factor 15 (Trend Predictor): 2.0 max
         # = 19.5 total
         # v2.1 — +Factor 16 MTF Weekly Alignment (2.5 max) = 22.0
-        self.MAX_RAW_CONFLUENCE = 25.0  # +3.0 POC Shift factor
+        self.MAX_RAW_CONFLUENCE = 23.9
 
     def default_params(self) -> dict:
         return {
@@ -56,7 +56,7 @@ class AlphaStrategist(BaseAgent):
             "min_rsi_entry": 25,
             "min_price": 2.0,
             "max_relative_volume": 3.0,
-            "max_per_sector": 2,
+            "max_per_sector": 3,
             # Setup preferences
             "best_setups": ["pullback_to_poc", "ema_bounce", "breakout",
                             "oversold_reversal"],
@@ -66,6 +66,7 @@ class AlphaStrategist(BaseAgent):
             "sell_rsi_extreme": 78,
             "sell_score_collapsed": 20,
             "sell_min_pnl_for_rsi_sell": 3.0,
+            "min_holding_hours": 24,
             # 🆕 v2.0 — ML thresholds
             "ml_winloss_threshold_strong": 0.75,   # WIN score >75% = forte
             "ml_winloss_threshold_medium": 0.60,   # WIN score >60% = medio
@@ -484,8 +485,18 @@ class AlphaStrategist(BaseAgent):
                 )
                 if buy_t and buy_t.get("date"):
                     hours_held = (datetime.utcnow() - buy_t["date"]).total_seconds() / 3600
-                    if hours_held < 24:
-                        continue  # troppo fresca: niente sell soft
+                    min_holding_hours = params.get("min_holding_hours", 24)
+                    if hours_held < min_holding_hours:
+                        regime_now = market_ctx.get("market_regime", "NEUTRAL")
+                        rsi_now = asset.get("rsi", 50)
+                        pnl_now = float(p.get("unrealized_plpc", 0)) * 100
+                        crash_override = regime_now == "CRASH" and pnl_now < -1
+                        rsi_override = (
+                            rsi_now > params.get("sell_rsi_extreme", 78)
+                            and pnl_now > params.get("sell_min_pnl_for_rsi_sell", 3.0)
+                        )
+                        if not crash_override and not rsi_override:
+                            continue
             except Exception:
                 pass
 
@@ -717,12 +728,12 @@ class AlphaStrategist(BaseAgent):
         # ============================================
         # BUY CANDIDATES
         # ============================================
-        min_conf = params.get("min_confluence", 35)
+        min_conf = params.get("min_confluence", 48)
         max_rsi = params.get("max_rsi_entry", 68)
         min_rsi = params.get("min_rsi_entry", 25)
         min_price_val = params.get("min_price", 2.0)
         max_rv = params.get("max_relative_volume", 3.0)
-        max_per_sector = params.get("max_per_sector", 2)
+        max_per_sector = params.get("max_per_sector", 3)
         best_setups = params.get("best_setups", [])
         worst_setups = params.get("worst_setups", [])
         weak_sectors = params.get("weak_sectors", [])
@@ -770,23 +781,21 @@ class AlphaStrategist(BaseAgent):
                     skipped_reasons["volume_filter"] += 1
                     continue
 
-            if best_setups and stype not in best_setups:
-                skipped_reasons["setup_filter"] += 1
-                continue
+            setup_adjustment = 0
+            if best_setups and stype in best_setups:
+                setup_adjustment += 2
             if stype in worst_setups:
-                skipped_reasons["setup_filter"] += 1
-                continue
+                setup_adjustment -= 3
             sector_count = open_sectors.count(sector)
             if sector_count >= max_per_sector:
                 skipped_reasons["sector_full"] += 1
                 continue
 
-            sector_penalty = -5 if sector in weak_sectors else 0
+            sector_is_weak = sector in weak_sectors
 
-            # 🆕 v2.0 — Passa ml_data al calc_confluence
             ml_data = ml_map.get(ticker)
             conf = self._calc_confluence(a, market_ctx, params, ml_data)
-            conf_score = conf["score"] + sector_penalty
+            conf_score = round(max(0, min(100, conf["score"] + setup_adjustment)), 1)
 
             if conf_score < min_conf:
                 skipped_reasons["low_confluence"] += 1
@@ -837,6 +846,8 @@ class AlphaStrategist(BaseAgent):
                 "trend_prediction": ml_data.get("trend_prediction", "N/A") if ml_data else "N/A",
                 "trend_up_prob": ml_data.get("trend_up_prob", 0) if ml_data else 0,
                 "weekly_trend": a.get("mtf", {}).get("weekly_trend", "UNKNOWN"),
+                "setup_adjustment": setup_adjustment,
+                "sector_is_weak": sector_is_weak,
             })
 
         candidates.sort(key=lambda x: x["confluence"], reverse=True)
@@ -869,7 +880,7 @@ class AlphaStrategist(BaseAgent):
         # ============================================
         from app.services.llm_service import llm_ask, llm_available
         if llm_available() and top_candidates:
-            for candidate in top_candidates[:5]:
+            for candidate in top_candidates[:3]:
                 try:
                     factors_pass = [f["name"] for f in candidate.get("confluence_detail", {}).get("factors", []) if f.get("pass")]
                     factors_fail = [f["name"] for f in candidate.get("confluence_detail", {}).get("factors", []) if not f.get("pass")]
@@ -1053,7 +1064,7 @@ class AlphaStrategist(BaseAgent):
             else:
                 conf_buckets[bucket]["l"] += 1
 
-        min_conf = params.get("min_confluence", 35)
+        min_conf = params.get("min_confluence", 48)
         low_total = conf_buckets["low"]["w"] + conf_buckets["low"]["l"]
         mid_total = conf_buckets["mid"]["w"] + conf_buckets["mid"]["l"]
 
