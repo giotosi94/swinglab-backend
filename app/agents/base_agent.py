@@ -1,4 +1,3 @@
-
 from datetime import datetime, timedelta
 from app.db.mongodb import get_db
 import math
@@ -7,11 +6,17 @@ import math
 class BaseAgent:
     """
     Classe base per tutti gli agenti SwingLab.
+
     Ogni agente ha:
     - Un nome univoco (usato per le collection MongoDB)
     - Parametri appresi (memory) che si aggiornano nel tempo
     - Log di ogni decisione con contesto completo
     - Sistema di learning con time decay
+
+    v2.0 — get_params() ora fa il MERGE con default_params().
+    Prima ritornava il doc DB cosi' com'era: se una chiave mancava,
+    valeva il fallback inline della singola .get(), spesso divergente
+    dai default dichiarati. Ora i default sono la base e il DB sovrascrive.
     """
 
     def __init__(self, name: str, version: str = "1.0"):
@@ -33,17 +38,41 @@ class BaseAgent:
         return get_db()[f"agent_performance_{self.name}"]
 
     # ---- MEMORY (parametri appresi) ----
-
     async def get_params(self) -> dict:
-        """Recupera i parametri appresi dal DB"""
+        """
+        Recupera i parametri appresi dal DB, mergiati sui default.
+
+        Ordine di precedenza:
+        1. default_params()  → base sempre completa
+        2. doc DB            → sovrascrive quello che e' stato salvato/appreso
+
+        Cosi' una chiave assente nel DB usa il default dichiarato,
+        non un fallback inline sparso nel codice.
+        """
+        params = self.default_params()
+        doc = await self._col_memory().find_one({"_id": "params"})
+        if doc:
+            doc.pop("_id", None)
+            doc.pop("updated_at", None)
+            doc.pop("agent_version", None)
+            params.update(doc)
+        return params
+
+    async def get_params_raw(self) -> dict:
+        """
+        Parametri COSI' COME SONO nel DB, senza merge.
+        Utile per audit: mostra quali chiavi sono davvero persistite.
+        """
         doc = await self._col_memory().find_one({"_id": "params"})
         if doc:
             doc.pop("_id", None)
             return doc
-        return self.default_params()
+        return {}
 
     async def save_params(self, params: dict):
         """Salva i parametri appresi nel DB"""
+        params = dict(params)
+        params.pop("_id", None)
         params["updated_at"] = datetime.utcnow()
         params["agent_version"] = self.version
         await self._col_memory().update_one(
@@ -55,11 +84,11 @@ class BaseAgent:
         return {}
 
     # ---- DECISION LOGGING ----
-
     async def log_decision(self, decision_type: str, data: dict,
                            reasoning: str = "", confidence: float = 50.0):
         """
         Logga una decisione con contesto completo.
+
         Ogni decisione viene salvata con:
         - Tipo (es. "regime_change", "buy_signal", "risk_reject")
         - Dati completi del contesto
@@ -81,12 +110,13 @@ class BaseAgent:
         return str(result.inserted_id)
 
     # ---- TIME DECAY ----
-
     def calc_weight(self, created_at: datetime) -> float:
         """
         Calcola il peso di una decisione in base a quanto e' vecchia.
+
         Exponential decay: peso = e^(-lambda * days)
         dove lambda = ln(2) / decay_days
+
         Dopo decay_days (60), il peso e' 0.5
         Dopo 120 giorni, il peso e' 0.25
         """
@@ -99,7 +129,6 @@ class BaseAgent:
         return math.exp(-lam * days_old)
 
     # ---- LEARNING ----
-
     async def evaluate_past_decisions(self, lookback_days: int = 90) -> list:
         """
         Recupera le decisioni passate con outcome gia' registrato.
@@ -138,7 +167,6 @@ class BaseAgent:
         )
 
     # ---- PERFORMANCE TRACKING ----
-
     async def save_performance(self, metrics: dict):
         """Salva snapshot delle performance dell'agente"""
         doc = {
@@ -158,7 +186,6 @@ class BaseAgent:
         return docs
 
     # ---- ABSTRACT METHODS (override in ogni agente) ----
-
     async def analyze(self, context: dict) -> dict:
         """Metodo principale: analizza e produce output. Override obbligatorio."""
         raise NotImplementedError
