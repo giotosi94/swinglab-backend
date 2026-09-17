@@ -1014,7 +1014,13 @@ async def run_backtest(
         "rotation_hits": rotation_hits,
         "equity_curve": equity_curve[::max(1, len(equity_curve) // 100)],
         "trades": sorted(trades, key=lambda x: x["exit_date"], reverse=True)[:60],
-        "total_trades": len(trades),
+        "position_trades": sorted(
+            position_trades,
+            key=lambda x: str(x.get("exit_date", "")),
+            reverse=True,
+        )[:60],
+        "total_trades": len(position_trades),
+        "total_exit_records": len(trades),
         "period": {
             "start": backtest_dates[0] if backtest_dates else "",
             "end": backtest_dates[-1] if backtest_dates else "",
