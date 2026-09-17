@@ -12,26 +12,26 @@ class SettingsModel(BaseModel):
     Fonte capitale = Alpaca (endpoint /api/data/starting-capital).
     """
     # ===== RISK MANAGEMENT =====
-    max_positions: int = 8
-    risk_pct_per_trade: float = 2.0
-    max_position_pct: float = 20.0
-    min_risk_reward: float = 1.5
-    max_per_sector: int = 2
-    daily_loss_limit_pct: float = -3.0
-    weekly_loss_limit_pct: float = -5.0
+    max_positions: int = 12
+    risk_pct_per_trade: float = 3.0
+    max_position_pct: float = 25.0
+    min_risk_reward: float = 1.3
+    max_per_sector: int = 3
+    daily_loss_limit_pct: float = -5.0
+    weekly_loss_limit_pct: float = -8.0
     
     # ===== FRACTIONAL / NOTIONAL TRADING =====
     position_sizing_mode: str = "notional"
-    position_size_pct: float = 12.0
+    position_size_pct: float = 18.0
     fractionable_only: bool = True
     min_notional_per_trade: float = 100.0
-    min_cash_reserve_pct: float = 10.0
+    min_cash_reserve_pct: float = 5.0
     dps_enabled: bool = True
-    dps_max_multiplier: float = 1.4
-    dps_min_multiplier: float = 0.6
-    dps_aggressiveness: float = 1.0
+    dps_max_multiplier: float = 1.6
+    dps_min_multiplier: float = 0.5
+    dps_aggressiveness: float = 1.3
     kelly_enabled: bool = True
-    kelly_fractional_factor: float = 0.20
+    kelly_fractional_factor: float = 0.25
     kelly_min_trades: int = 20
     active_preset: Optional[str] = None
     
@@ -39,25 +39,25 @@ class SettingsModel(BaseModel):
     apm_enabled: bool = True
     
     # EXIT thresholds
-    apm_exit_confluence_threshold: int = 30
-    apm_exit_ml_threshold: int = 40
-    apm_exit_min_negative_factors: int = 2
+    apm_exit_confluence_threshold: int = 25
+    apm_exit_ml_threshold: int = 35
+    apm_exit_min_negative_factors: int = 3
     
     # SCALE OUT targets
     apm_scaling_enabled: bool = True
-    apm_target_1_pct: float = 5.0
-    apm_target_1_size: int = 50
-    apm_target_2_pct: float = 10.0
+    apm_target_1_pct: float = 6.0
+    apm_target_1_size: int = 30
+    apm_target_2_pct: float = 12.0
     apm_target_2_size: int = 30
-    apm_target_3_pct: float = 20.0
-    apm_target_3_size: int = 20
+    apm_target_3_pct: float = 25.0
+    apm_target_3_size: int = 25
     
     # TIGHTEN STOP
     apm_tighten_profit_threshold: float = 3.0
     apm_tighten_new_sl_distance: float = 2.0
     
     # FREQUENCY
-    apm_check_interval_hours: int = 3
+    apm_check_interval_hours: int = 1
     apm_urgent_check_drop_pct: float = 5.0
 
 
@@ -69,134 +69,80 @@ async def get_settings():
     """
     db = get_db()
     doc = await db.app_settings.find_one({"_id": "risk_params"})
+    defaults = SettingsModel().model_dump()
     if doc:
-        doc["_id"] = str(doc["_id"])
-        # Rimuove starting_capital residuo (legacy)
+        doc.pop("_id", None)
         doc.pop("starting_capital", None)
-        return doc
-    return SettingsModel().dict()
+        defaults.update(doc)
+    return defaults
 
 
 @router.post("/")
-async def save_settings(s: SettingsModel):
-    """
-    Save settings + propagazione ai 5 agenti (incluso APM).
-    """
+async def save_settings(payload: dict):
     db = get_db()
-    data = s.dict()
-    
-    # 1. Salva settings principali
+    allowed = set(SettingsModel.model_fields.keys())
+    data = {k: v for k, v in payload.items() if k in allowed and v is not None}
+
+    if not data:
+        return {"message": "Nessun parametro modificato", "settings": {}}
+
+    validated = SettingsModel(**{**SettingsModel().model_dump(), **data})
+    clean = validated.model_dump()
+    data = {k: clean[k] for k in data}
+
     await db.app_settings.update_one(
         {"_id": "risk_params"},
-        {"$set": data},
+        {"$set": data, "$unset": {"starting_capital": ""}},
         upsert=True,
     )
-    
-    # Cleanup starting_capital residuo (legacy)
-    await db.app_settings.update_one(
-        {"_id": "risk_params"},
-        {"$unset": {"starting_capital": ""}},
-    )
-    
-    # 2. RiskManager
-    await db.agent_memory_risk_manager.update_one(
-        {"_id": "params"},
-        {"$set": {
-            "max_positions": s.max_positions,
-            "risk_pct_per_trade": s.risk_pct_per_trade,
-            "max_position_pct": s.max_position_pct,
-            "min_risk_reward": s.min_risk_reward,
-            "max_per_sector": s.max_per_sector,
-            "daily_loss_limit_pct": s.daily_loss_limit_pct,
-            "weekly_loss_limit_pct": s.weekly_loss_limit_pct,
-            "position_sizing_mode": s.position_sizing_mode,
-            "position_size_pct": s.position_size_pct,
-            "fractionable_only": s.fractionable_only,
-            "min_notional_per_trade": s.min_notional_per_trade,
-            "min_cash_reserve_pct": s.min_cash_reserve_pct,
-            "dps_enabled": s.dps_enabled,
-            "dps_max_multiplier": s.dps_max_multiplier,
-            "dps_min_multiplier": s.dps_min_multiplier,
-            "dps_aggressiveness": s.dps_aggressiveness,
-            "kelly_enabled": s.kelly_enabled,
-            "kelly_fractional_factor": s.kelly_fractional_factor,
-            "kelly_min_trades": s.kelly_min_trades,
-        }},
-        upsert=True,
-    )
-    
-    # 3. AlphaStrategist
-    await db.agent_memory_alpha_strategist.update_one(
-        {"_id": "params"},
-        {"$set": {
-            "max_candidates": s.max_positions * 2,
-            "max_positions": s.max_positions,
-            "fractionable_only": s.fractionable_only,
-        }},
-        upsert=True,
-    )
-    
-    # 4. Executor
-    await db.agent_memory_executor.update_one(
-        {"_id": "params"},
-        {"$set": {
-            "max_positions": s.max_positions,
-            "position_sizing_mode": s.position_sizing_mode,
-        }},
-        upsert=True,
-    )
-    
-    # 5. 🧹 MacroAnalyst — cleanup vecchio starting_capital
-    await db.agent_memory_macro_analyst.update_one(
-        {"_id": "params"},
-        {"$unset": {"starting_capital": ""}},
-    )
-    
-    # 6. 🆕 v4.0 — APM (Adaptive Position Manager)
-    await db.agent_memory_adaptive_position_manager.update_one(
-        {"_id": "params"},
-        {"$set": {
-            "apm_enabled": s.apm_enabled,
-            # EXIT
-            "apm_exit_confluence_threshold": s.apm_exit_confluence_threshold,
-            "apm_exit_ml_threshold": s.apm_exit_ml_threshold,
-            "apm_exit_min_negative_factors": s.apm_exit_min_negative_factors,
-            # SCALE OUT
-            "apm_scaling_enabled": s.apm_scaling_enabled,
-            "apm_target_1_pct": s.apm_target_1_pct,
-            "apm_target_1_size": s.apm_target_1_size,
-            "apm_target_2_pct": s.apm_target_2_pct,
-            "apm_target_2_size": s.apm_target_2_size,
-            "apm_target_3_pct": s.apm_target_3_pct,
-            "apm_target_3_size": s.apm_target_3_size,
-            # TIGHTEN
-            "apm_tighten_profit_threshold": s.apm_tighten_profit_threshold,
-            "apm_tighten_new_sl_distance": s.apm_tighten_new_sl_distance,
-            # FREQUENCY
-            "apm_check_interval_hours": s.apm_check_interval_hours,
-            "apm_urgent_check_drop_pct": s.apm_urgent_check_drop_pct,
-        }},
-        upsert=True,
-    )
-    
-    print(
-        f"✅ Settings propagated to 5 agents: "
-        f"max_pos={s.max_positions}, "
-        f"risk={s.risk_pct_per_trade}%, "
-        f"sizing_mode={s.position_sizing_mode}, "
-        f"pos_size={s.position_size_pct}%, "
-        f"fractional={s.fractionable_only}, "
-        f"APM={s.apm_enabled} (every {s.apm_check_interval_hours}h)"
-    )
-    
-    return {
-        "message": "Settings saved & propagated to all agents (capital from Alpaca)",
-        "settings": data,
-        "capital_source": "alpaca",
-        "apm_enabled": s.apm_enabled,
+
+    risk_keys = {
+        "max_positions", "risk_pct_per_trade", "max_position_pct", "min_risk_reward",
+        "max_per_sector", "daily_loss_limit_pct", "weekly_loss_limit_pct",
+        "position_sizing_mode", "position_size_pct", "fractionable_only",
+        "min_notional_per_trade", "min_cash_reserve_pct", "dps_enabled",
+        "dps_max_multiplier", "dps_min_multiplier", "dps_aggressiveness",
+        "kelly_enabled", "kelly_fractional_factor", "kelly_min_trades",
     }
+    risk_update = {k: v for k, v in data.items() if k in risk_keys}
+    if risk_update:
+        await db.agent_memory_risk_manager.update_one(
+            {"_id": "params"}, {"$set": risk_update}, upsert=True
+        )
 
+    alpha_update = {}
+    if "max_positions" in data:
+        alpha_update["max_positions"] = data["max_positions"]
+        alpha_update["max_candidates"] = data["max_positions"] * 2
+    if "fractionable_only" in data:
+        alpha_update["fractionable_only"] = data["fractionable_only"]
+    if alpha_update:
+        await db.agent_memory_alpha_strategist.update_one(
+            {"_id": "params"}, {"$set": alpha_update}, upsert=True
+        )
 
+    executor_update = {k: data[k] for k in ("max_positions", "position_sizing_mode") if k in data}
+    if executor_update:
+        await db.agent_memory_executor.update_one(
+            {"_id": "params"}, {"$set": executor_update}, upsert=True
+        )
+
+    apm_update = {k: v for k, v in data.items() if k.startswith("apm_")}
+    if apm_update:
+        await db.agent_memory_adaptive_position_manager.update_one(
+            {"_id": "params"}, {"$set": apm_update}, upsert=True
+        )
+
+    return {
+        "message": "Settings salvate e propagate senza sovrascrivere gli altri parametri",
+        "settings": data,
+        "propagated": {
+            "risk_manager": list(risk_update.keys()),
+            "alpha_strategist": list(alpha_update.keys()),
+            "executor": list(executor_update.keys()),
+            "adaptive_position_manager": list(apm_update.keys()),
+        },
+    }
 
 # ============================================
 # v4.3 — RISK PROFILE PRESETS
