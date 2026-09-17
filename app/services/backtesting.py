@@ -359,16 +359,25 @@ async def run_backtest(
     t3_ratio: float = 1.00,
     use_mtf: bool = True,
     use_momentum: bool = True,
-    use_sector_bottom: bool = True,
-    use_crash_deploy: bool = True,
-    use_rotation: bool = True,
+    use_sector_bottom: bool = False,
+    use_crash_deploy: bool = False,
+    use_rotation: bool = False,
+    t1_size_pct: float = 30.0,
+    t2_size_pct: float = 30.0,
+    t3_size_pct: float = 25.0,
+    floor_t1_pct: float = 0.0,
+    floor_t2_pct: float = 3.0,
+    floor_t3_pct: float = 8.0,
+    min_holding_days: int = 1,
 ):
     """
     Backtest v2.0 con APM COMPLETO:
     - Adaptive targets (T1/T2/T3 = ratio × target Alpha)
-    - Scale-out 50%/30%/20%
-    - Break-even SL dopo T1
-    - Trailing stop dopo T2
+    - Scale-out 30%/30%/25% sulla quantita' residua
+    - Floor 0%/+3%/+8% dopo T1/T2/T3
+    - Il T3 e' parziale: il runner resta aperto
+    - Holding minimo 1 giorno prima degli scale-out
+    - Rotazione settoriale disattivata di default e solo testabile in isolamento
     """
     db = get_db()
     all_bars = await db.stock_bars.find({}).to_list(300)
@@ -408,6 +417,7 @@ async def run_backtest(
     sector_etf_map = {s: s for s in SECTOR_BOTTOM_CFG if s in ticker_bars}
     rotation_cache = {}
     rotation_hits = {}
+    backtest_date_index = {date: i for i, date in enumerate(backtest_dates)}
 
     # 🆕 Crash Deploy: SPY closes indicizzate per data
     spy_doc_cd = await db.stock_bars.find_one({"ticker": "SPY"})
@@ -518,55 +528,58 @@ async def run_backtest(
             if use_apm:
                 # APM Adaptive scale-out multi-target
                 pnl_pct_high = (high - entry) / entry * 100
+                entry_idx = pos.get("entry_index", backtest_date_index.get(pos["entry_date"], 0))
+                holding_days = backtest_date_index.get(date, entry_idx) - entry_idx
+                can_scale = holding_days >= min_holding_days
 
-                # T1 hit (chiude 50%, SL → break-even)
-                if pos["last_target_hit"] < 1 and pnl_pct_high >= pos["t1_pct"]:
+                if can_scale and pos["last_target_hit"] < 1 and pnl_pct_high >= pos["t1_pct"]:
                     exit_price = entry * (1 + pos["t1_pct"] / 100)
-                    qty_close = pos["shares"] * 0.50
+                    qty_close = pos["shares"] * (t1_size_pct / 100)
                     pnl_d = (exit_price - entry) * qty_close
                     cash += exit_price * qty_close
                     pos["shares"] -= qty_close
                     pos["last_target_hit"] = 1
-                    pos["sl"] = entry  # break-even
+                    pos["sl"] = max(pos["sl"], entry * (1 + floor_t1_pct / 100))
                     scale_out_events += 1
                     trades.append({
                         "ticker": ticker, "entry_date": pos["entry_date"], "exit_date": date,
                         "entry_price": round(entry, 2), "exit_price": round(exit_price, 2),
+                        "shares": qty_close, "initial_shares": pos["initial_shares"],
                         "pnl_pct": round(pos["t1_pct"], 2), "pnl_dollar": round(pnl_d, 2),
                         "reason": "APM_SCALE_T1",
                     })
-
-                # T2 hit (chiude 30%, SL → entry+3%)
-                elif pos["last_target_hit"] == 1 and pnl_pct_high >= pos["t2_pct"]:
+                elif can_scale and pos["last_target_hit"] == 1 and pnl_pct_high >= pos["t2_pct"]:
                     exit_price = entry * (1 + pos["t2_pct"] / 100)
-                    qty_close = pos["shares"] * 0.60  # 30% del totale = 60% del residuo
+                    qty_close = pos["shares"] * (t2_size_pct / 100)
                     pnl_d = (exit_price - entry) * qty_close
                     cash += exit_price * qty_close
                     pos["shares"] -= qty_close
                     pos["last_target_hit"] = 2
-                    pos["sl"] = entry * 1.03
+                    pos["sl"] = max(pos["sl"], entry * (1 + floor_t2_pct / 100))
                     scale_out_events += 1
                     trades.append({
                         "ticker": ticker, "entry_date": pos["entry_date"], "exit_date": date,
                         "entry_price": round(entry, 2), "exit_price": round(exit_price, 2),
+                        "shares": qty_close, "initial_shares": pos["initial_shares"],
                         "pnl_pct": round(pos["t2_pct"], 2), "pnl_dollar": round(pnl_d, 2),
                         "reason": "APM_SCALE_T2",
                     })
-
-                # T3 hit (chiude tutto il residuo)
-                elif pos["last_target_hit"] == 2 and pnl_pct_high >= pos["t3_pct"]:
+                elif can_scale and pos["last_target_hit"] == 2 and pnl_pct_high >= pos["t3_pct"]:
                     exit_price = entry * (1 + pos["t3_pct"] / 100)
-                    pnl_d = (exit_price - entry) * pos["shares"]
-                    cash += exit_price * pos["shares"]
+                    qty_close = pos["shares"] * (t3_size_pct / 100)
+                    pnl_d = (exit_price - entry) * qty_close
+                    cash += exit_price * qty_close
+                    pos["shares"] -= qty_close
+                    pos["last_target_hit"] = 3
+                    pos["sl"] = max(pos["sl"], entry * (1 + floor_t3_pct / 100))
+                    scale_out_events += 1
                     trades.append({
                         "ticker": ticker, "entry_date": pos["entry_date"], "exit_date": date,
                         "entry_price": round(entry, 2), "exit_price": round(exit_price, 2),
+                        "shares": qty_close, "initial_shares": pos["initial_shares"],
                         "pnl_pct": round(pos["t3_pct"], 2), "pnl_dollar": round(pnl_d, 2),
                         "reason": "APM_SCALE_T3",
                     })
-                    del positions[ticker]
-                    continue
-
                 # SL hit (su qualsiasi residuo)
                 if low <= pos["sl"]:
                     exit_price = pos["sl"]
@@ -577,6 +590,7 @@ async def run_backtest(
                     trades.append({
                         "ticker": ticker, "entry_date": pos["entry_date"], "exit_date": date,
                         "entry_price": round(entry, 2), "exit_price": round(exit_price, 2),
+                        "shares": pos["shares"], "initial_shares": pos["initial_shares"],
                         "pnl_pct": round(pnl_pct, 2), "pnl_dollar": round(pnl_d, 2),
                         "reason": reason,
                     })
@@ -682,6 +696,7 @@ async def run_backtest(
                 positions[ticker] = {
                     "entry_price": entry_price,
                     "shares": shares,
+                    "initial_shares": shares,
                     "sl": stop_price,
                     "tp": target_price,  # per modalità semplice
                     "t1_pct": round(target_dist * t1_ratio, 2),
@@ -689,6 +704,7 @@ async def run_backtest(
                     "t3_pct": round(target_dist * t3_ratio, 2),
                     "last_target_hit": 0,
                     "entry_date": date,
+                    "entry_index": backtest_date_index.get(date, 0),
                     "confluence": conf,
                     "setup": setup,
                     "last_price": entry_price,
@@ -723,6 +739,7 @@ async def run_backtest(
         trades.append({
             "ticker": ticker, "entry_date": pos["entry_date"], "exit_date": last_date,
             "entry_price": round(pos["entry_price"], 2), "exit_price": round(exit_price, 2),
+            "shares": pos["shares"], "initial_shares": pos["initial_shares"],
             "pnl_pct": round(pnl_pct, 2), "pnl_dollar": round(pnl_d, 2),
             "reason": "END_OF_BACKTEST",
         })
@@ -814,9 +831,26 @@ async def run_backtest(
             "t1_ratio": t1_ratio,
             "t2_ratio": t2_ratio,
             "t3_ratio": t3_ratio,
+            "t1_size_pct": t1_size_pct,
+            "t2_size_pct": t2_size_pct,
+            "t3_size_pct": t3_size_pct,
+            "floor_t1_pct": floor_t1_pct,
+            "floor_t2_pct": floor_t2_pct,
+            "floor_t3_pct": floor_t3_pct,
+            "min_holding_days": min_holding_days,
+            "use_mtf": use_mtf,
+            "use_momentum": use_momentum,
+            "use_sector_bottom": use_sector_bottom,
+            "use_crash_deploy": use_crash_deploy,
+            "use_rotation": use_rotation,
             "starting_capital": starting_capital,
         },
         "metrics": metrics,
+        "validation_notes": [
+            "La rotazione settoriale e' disattivata di default: resta un test informativo.",
+            "APM_EXIT non e' simulato: mancano snapshot storici point-in-time di ML, trend e confluence.",
+            "Il backtest usa barre daily: il minimum holding di 24 ore equivale a 1 giorno di borsa.",
+        ],
         "benchmark": {
             "spy_return_pct": round(spy_return, 2),
             "alpha": round(metrics.get("total_return_pct", 0) - spy_return, 2),
