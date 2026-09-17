@@ -556,31 +556,39 @@ async def backtest_run(
     t2_ratio: float = 0.70,
     t3_ratio: float = 1.00,
     use_preset: bool = True,
-    use_momentum: bool = True,
+    use_mtf: bool = True,
+    use_momentum: bool = False,
+    use_sector_bottom: bool = False,
+    use_crash_deploy: bool = False,
+    use_rotation: bool = False,
+    t1_size_pct: float = 30.0,
+    t2_size_pct: float = 30.0,
+    t3_size_pct: float = 25.0,
+    floor_t1_pct: float = 0.0,
+    floor_t2_pct: float = 3.0,
+    floor_t3_pct: float = 8.0,
+    min_holding_days: int = 1,
 ):
-    """v2.1 Backtest con APM + parametri dal preset di rischio attivo."""
     from app.services.backtesting import run_backtest
+
     db = get_db()
-
-    # 🆕 v2.1 — Usa i parametri del preset attivo (se non forzati via query)
     preset_name = None
-    if use_preset:
-        settings = await db.app_settings.find_one({"_id": "risk_params"})
-        if settings:
-            preset_name = settings.get("active_preset")
-            if max_positions is None:
-                max_positions = settings.get("max_positions", 8)
-            if position_size_pct is None:
-                position_size_pct = settings.get("position_size_pct", 12.0)
-            if min_confluence is None:
-                # deriva soglia dal min_risk_reward: profili aggressivi = soglia più bassa
-                mrr = settings.get("min_risk_reward", 1.5)
-                min_confluence = 45 if mrr <= 1.3 else (50 if mrr <= 1.5 else 55)
 
-    # Fallback finali
-    max_positions = max_positions if max_positions is not None else 8
-    position_size_pct = position_size_pct if position_size_pct is not None else 12.0
-    min_confluence = min_confluence if min_confluence is not None else 55
+    if use_preset:
+        app_settings = await db.app_settings.find_one({"_id": "risk_params"}) or {}
+        alpha_params = await db.agent_memory_alpha_strategist.find_one({"_id": "params"}) or {}
+        preset_name = app_settings.get("active_preset")
+
+        if max_positions is None:
+            max_positions = app_settings.get("max_positions", 12)
+        if position_size_pct is None:
+            position_size_pct = app_settings.get("position_size_pct", 18.0)
+        if min_confluence is None:
+            min_confluence = alpha_params.get("min_confluence", 48)
+
+    max_positions = max_positions if max_positions is not None else 12
+    position_size_pct = position_size_pct if position_size_pct is not None else 18.0
+    min_confluence = min_confluence if min_confluence is not None else 48
 
     result = await run_backtest(
         days=days,
@@ -591,7 +599,18 @@ async def backtest_run(
         t1_ratio=t1_ratio,
         t2_ratio=t2_ratio,
         t3_ratio=t3_ratio,
+        use_mtf=use_mtf,
         use_momentum=use_momentum,
+        use_sector_bottom=use_sector_bottom,
+        use_crash_deploy=use_crash_deploy,
+        use_rotation=use_rotation,
+        t1_size_pct=t1_size_pct,
+        t2_size_pct=t2_size_pct,
+        t3_size_pct=t3_size_pct,
+        floor_t1_pct=floor_t1_pct,
+        floor_t2_pct=floor_t2_pct,
+        floor_t3_pct=floor_t3_pct,
+        min_holding_days=min_holding_days,
     )
     result["active_preset"] = preset_name
     return result
