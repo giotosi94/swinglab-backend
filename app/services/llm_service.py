@@ -78,7 +78,7 @@ def _ask_gemini(system_prompt, user_prompt, max_tokens, temperature):
     if not client:
         return None
     response = client.models.generate_content(
-        model="gemini-2.0-flash",
+        model="gemini-3.6-flash",
         contents=f"{system_prompt}\n\n{user_prompt}",
         config={"max_output_tokens": max_tokens, "temperature": temperature},
     )
@@ -94,13 +94,11 @@ def _ask_groq(system_prompt, user_prompt, max_tokens, temperature):
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        model="llama-3.3-70b-versatile",
+        model="llama-3.1-8b-instant",
         max_tokens=max_tokens,
         temperature=temperature,
     )
     return response.choices[0].message.content
-
-
 def _ask_cerebras(system_prompt, user_prompt, max_tokens, temperature):
     client = _get_cerebras()
     if not client:
