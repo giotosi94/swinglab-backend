@@ -337,13 +337,120 @@ def _calc_metrics(equity_curve, trades):
         "sortino_ratio": round(sortino, 2),
         "max_drawdown_pct": round(max_dd, 2),
         "win_rate": round(win_rate, 1),
-        "total_trades": len(trades),
+        "total_trades": len(position_trades),
+        "total_exit_records": len(trades),
+        "position_trades": sorted(position_trades, key=lambda x: str(x.get("exit_date", "")), reverse=True)[:60],
         "wins": len(wins),
         "losses": len(losses),
         "avg_win_pct": round(avg_win, 2),
         "avg_loss_pct": round(avg_loss, 2),
         "profit_factor": round(profit_factor, 2),
         "expectancy_pct": round(expectancy, 2),
+    }
+
+
+def _aggregate_positions(trades):
+    position_map = {}
+    for trade in trades:
+        key = f"{trade.get('ticker', '?')}|{trade.get('entry_date', '')}"
+        position = position_map.setdefault(key, {
+            "position_id": key,
+            "ticker": trade.get("ticker", "?"),
+            "entry_date": trade.get("entry_date"),
+            "exit_date": trade.get("exit_date"),
+            "entry_price": float(trade.get("entry_price", 0) or 0),
+            "initial_shares": float(trade.get("initial_shares", 0) or 0),
+            "pnl_dollar": 0.0,
+            "exit_value": 0.0,
+            "closed_shares": 0.0,
+            "tranches": 0,
+            "reasons": [],
+            "max_target_hit": 0,
+            "final_reason": "",
+        })
+        shares = float(trade.get("shares", 0) or 0)
+        exit_price = float(trade.get("exit_price", 0) or 0)
+        reason = trade.get("reason", "")
+        position["exit_date"] = max(str(position.get("exit_date") or ""), str(trade.get("exit_date") or ""))
+        position["pnl_dollar"] += float(trade.get("pnl_dollar", 0) or 0)
+        position["exit_value"] += exit_price * shares
+        position["closed_shares"] += shares
+        position["tranches"] += 1
+        position["reasons"].append(reason)
+        if reason == "APM_SCALE_T1":
+            position["max_target_hit"] = max(position["max_target_hit"], 1)
+        elif reason == "APM_SCALE_T2":
+            position["max_target_hit"] = max(position["max_target_hit"], 2)
+        elif reason == "APM_SCALE_T3":
+            position["max_target_hit"] = max(position["max_target_hit"], 3)
+        else:
+            position["final_reason"] = reason
+
+    positions = []
+    for position in position_map.values():
+        initial_cost = position["entry_price"] * position["initial_shares"]
+        position["pnl_pct"] = (
+            position["pnl_dollar"] / initial_cost * 100 if initial_cost > 0 else 0
+        )
+        position["pnl_dollar"] = round(position["pnl_dollar"], 2)
+        position["pnl_pct"] = round(position["pnl_pct"], 2)
+        position["closed_shares"] = round(position["closed_shares"], 6)
+        positions.append(position)
+    return positions
+
+
+def _calc_position_metrics(position_trades):
+    if not position_trades:
+        return {
+            "total_positions": 0, "wins": 0, "losses": 0,
+            "win_rate": 0, "profit_factor": 0,
+            "avg_win_pct": 0, "avg_loss_pct": 0,
+            "expectancy_pct": 0,
+        }
+    wins = [p for p in position_trades if p["pnl_dollar"] > 0]
+    losses = [p for p in position_trades if p["pnl_dollar"] <= 0]
+    gross_profit = sum(p["pnl_dollar"] for p in wins)
+    gross_loss = abs(sum(p["pnl_dollar"] for p in losses))
+    avg_win = float(np.mean([p["pnl_pct"] for p in wins])) if wins else 0
+    avg_loss = abs(float(np.mean([p["pnl_pct"] for p in losses]))) if losses else 0
+    win_rate = len(wins) / len(position_trades) * 100
+    expectancy = (win_rate / 100 * avg_win) - ((100 - win_rate) / 100 * avg_loss)
+    return {
+        "total_positions": len(position_trades),
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate": round(win_rate, 1),
+        "profit_factor": round(gross_profit / gross_loss, 2) if gross_loss > 0 else 999,
+        "avg_win_pct": round(avg_win, 2),
+        "avg_loss_pct": round(avg_loss, 2),
+        "expectancy_pct": round(expectancy, 2),
+    }
+
+
+def _calc_apm_position_stats(position_trades):
+    total = len(position_trades)
+    t1 = sum(1 for p in position_trades if p["max_target_hit"] >= 1)
+    t2 = sum(1 for p in position_trades if p["max_target_hit"] >= 2)
+    t3 = sum(1 for p in position_trades if p["max_target_hit"] >= 3)
+    stop_before_t1 = sum(1 for p in position_trades if p["final_reason"] == "STOP_LOSS")
+    stop_after_t1 = sum(1 for p in position_trades if p["final_reason"] == "BREAK_EVEN_SL" and p["max_target_hit"] == 1)
+    stop_after_t2 = sum(1 for p in position_trades if p["final_reason"] == "BREAK_EVEN_SL" and p["max_target_hit"] == 2)
+    stop_after_t3 = sum(1 for p in position_trades if p["final_reason"] == "BREAK_EVEN_SL" and p["max_target_hit"] >= 3)
+    end_runner = sum(1 for p in position_trades if p["final_reason"] == "END_OF_BACKTEST")
+    return {
+        "positions_total": total,
+        "t1_reached": t1,
+        "t2_reached": t2,
+        "t3_reached": t3,
+        "t1_reached_pct": round(t1 / total * 100, 1) if total else 0,
+        "t2_reached_pct": round(t2 / total * 100, 1) if total else 0,
+        "t3_reached_pct": round(t3 / total * 100, 1) if total else 0,
+        "stopped_before_t1": stop_before_t1,
+        "stopped_after_t1": stop_after_t1,
+        "stopped_after_t2": stop_after_t2,
+        "stopped_after_t3": stop_after_t3,
+        "runners_closed_at_end": end_runner,
+        "avg_exit_records_per_position": round(sum(p["tranches"] for p in position_trades) / total, 2) if total else 0,
     }
 
 
@@ -726,7 +833,14 @@ async def run_backtest(
             spy_deploy_value = spy_position["shares"] * spy_closes_ordered[spy_close_by_date[date] - 1]
 
         total_equity = cash + positions_value + crash_reserve + spy_deploy_value
-        equity_curve.append({"date": date, "equity": round(total_equity, 2)})
+        invested_value = positions_value + spy_deploy_value
+        equity_curve.append({
+            "date": date,
+            "equity": round(total_equity, 2),
+            "cash": round(cash + crash_reserve, 2),
+            "invested_value": round(invested_value, 2),
+            "invested_pct": round(invested_value / total_equity * 100, 2) if total_equity > 0 else 0,
+        })
 
     # Chiudi posizioni residue
     last_date = backtest_dates[-1]
@@ -763,12 +877,27 @@ async def run_backtest(
                 for tk, p in positions.items()
             ), 2) if positions else round(cash, 2)
 
-    metrics = _calc_metrics(equity_curve, trades)
+    exit_record_metrics = _calc_metrics(equity_curve, trades)
+    position_trades = _aggregate_positions(trades)
+    position_metrics = _calc_position_metrics(position_trades)
+    apm_position_stats = _calc_apm_position_stats(position_trades)
+    metrics = {
+        **exit_record_metrics,
+        "win_rate": position_metrics["win_rate"],
+        "profit_factor": position_metrics["profit_factor"],
+        "avg_win_pct": position_metrics["avg_win_pct"],
+        "avg_loss_pct": position_metrics["avg_loss_pct"],
+        "expectancy_pct": position_metrics["expectancy_pct"],
+        "total_trades": position_metrics["total_positions"],
+        "wins": position_metrics["wins"],
+        "losses": position_metrics["losses"],
+    }
 
     # SPY benchmark + curva allineata all'equity + correlazione
     spy_return = 0
     beta = 0
     correlation = 0
+    aligned_days = 0
     spy_doc = await db.stock_bars.find_one({"ticker": "SPY"})
     if spy_doc:
         spy_bars = spy_doc.get("bars", [])
@@ -794,6 +923,7 @@ async def run_backtest(
                 eq_map = {e["date"]: e["equity"] for e in equity_curve}
                 common_dates = sorted(set(eq_map.keys()) & set(spy_by_date.keys()))
                 _ = common_dates  # (nomi invariati sotto)
+                aligned_days = len(common_dates)
                 if len(common_dates) >= 5:
                     eq_rets = []
                     spy_rets = []
@@ -810,7 +940,7 @@ async def run_backtest(
                         spy_arr = np.array(spy_rets, dtype=float)
                         spy_var = float(np.var(spy_arr))
                         if spy_var > 1e-12:
-                            cov = float(np.cov(eq_arr, spy_arr)[0][1])
+                            cov = float(np.cov(eq_arr, spy_arr, ddof=0)[0][1])
                             beta = round(cov / spy_var, 2)
                         std_prod = float(np.std(eq_arr) * np.std(spy_arr))
                         if std_prod > 1e-12:
@@ -820,6 +950,11 @@ async def run_backtest(
                 print(f"  Beta/correlation calc error: {e}")
                 beta = 0
                 correlation = 0
+
+    average_invested_pct = round(float(np.mean([
+        point.get("invested_pct", 0) for point in equity_curve
+    ])), 2) if equity_curve else 0
+    average_cash_pct = round(100 - average_invested_pct, 2)
 
     return {
         "config": {
@@ -846,6 +981,12 @@ async def run_backtest(
             "starting_capital": starting_capital,
         },
         "metrics": metrics,
+        "position_metrics": position_metrics,
+        "exit_record_metrics": {
+            "exit_records": len(trades),
+            "win_rate": exit_record_metrics.get("win_rate", 0),
+            "profit_factor": exit_record_metrics.get("profit_factor", 0),
+        },
         "validation_notes": [
             "La rotazione settoriale e' disattivata di default: resta un test informativo.",
             "APM_EXIT non e' simulato: mancano snapshot storici point-in-time di ML, trend e confluence.",
@@ -856,10 +997,14 @@ async def run_backtest(
             "alpha": round(metrics.get("total_return_pct", 0) - spy_return, 2),
             "beta": beta,
             "correlation": correlation,
+            "aligned_days": aligned_days,
+            "average_invested_pct": average_invested_pct,
+            "average_cash_pct": average_cash_pct,
         },
         "apm_stats": {
             "scale_out_events": scale_out_events,
             "apm_enabled": use_apm,
+            **apm_position_stats,
         },
         "mtf_debug": mtf_debug,
         "config_use_mtf": use_mtf,
