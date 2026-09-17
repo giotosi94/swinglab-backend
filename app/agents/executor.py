@@ -199,12 +199,28 @@ class Executor(BaseAgent):
             # ============================================
             if stop_loss > 0:
                 tolerance = entry_price * 0.001  # 0.1% tolerance
+                # 🔧 v4.3 — Il floor post scale-out sta LEGITTIMAMENTE sopra l'entry
+                # (break-even a T1, +3% a T2, +8% a T3): è profit-lock, non un bug.
+                is_profit_lock = bool(trailing) and (
+                    trailing.get("apm_managed")
+                    or float(trailing.get("floor_price", 0) or 0) > 0
+                    or buy_trade.get("partial_scaled_out")
+                )
                 if stop_loss > entry_price + tolerance:
-                    # SL sopra entry di più dello 0.1% = bug reale
-                    print(f"  ⚠️ INVALID SL for {symbol}: stop_loss ${stop_loss:.2f} > entry ${entry_price:.2f} (skipping SL check)")
-                    stop_loss = 0
+                    if is_profit_lock:
+                        lock_pct = (stop_loss / entry_price - 1) * 100
+                        print(f"  🔒 PROFIT-LOCK SL {symbol}: ${stop_loss:.2f} (+{lock_pct:.1f}% sopra entry, post scale-out)")
+                    else:
+                        # Bug reale (stop calcolato su prezzo stale): NON lasciare la
+                        # posizione scoperta — ricalcola uno stop sicuro e persistilo.
+                        safe_stop = round(entry_price * 0.96, 2)
+                        print(f"  🔧 FIXED INVALID SL {symbol}: ${stop_loss:.2f} > entry ${entry_price:.2f} → ${safe_stop:.2f}")
+                        stop_loss = safe_stop
+                        await db.trade_history.update_one(
+                            {"_id": buy_trade["_id"]},
+                            {"$set": {"stop_loss": safe_stop}},
+                        )
                 elif abs(stop_loss - entry_price) <= tolerance:
-                    # SL ~= entry = break-even valido (post APM scale-out)
                     print(f"  🛡️ BREAK-EVEN SL for {symbol}: ${stop_loss:.2f} (post scale-out)")
             
             # Se target <= entry_price → è un bug upstream (Alpha/Risk)
