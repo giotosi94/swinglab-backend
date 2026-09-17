@@ -616,11 +616,26 @@ class AlphaStrategist(BaseAgent):
     async def _enrich_with_sentiment(self, candidates: list) -> list:
         """
         🆕 SentimentAgent — arricchisce i top candidati con news sentiment.
-        Solo sui top (efficiente). Aggiusta confluence + flag earnings.
+        🔧 Cache 4h per ticker: se già analizzato di recente riusa il risultato
+        senza chiamare l'LLM (le news non cambiano ogni 15 minuti).
         """
         from app.services.news_service import get_stock_news_with_sentiment
+        from datetime import timedelta
+        db = get_db()
         for c in candidates:
             try:
+                # 🔧 CACHE: riusa il sentiment salvato se recente (<4h)
+                cached = await db.sentiment_cache.find_one({"_id": c["ticker"]})
+                if cached and cached.get("ts"):
+                    age_h = (datetime.utcnow() - cached["ts"]).total_seconds() / 3600
+                    if age_h < 4:
+                        c["sentiment"] = cached.get("sentiment", "N/A")
+                        c["earnings_soon"] = cached.get("earnings_soon", False)
+                        c["sentiment_adj"] = cached.get("adj", 0)
+                        c["confluence"] = round(max(0, c["confluence"] + cached.get("adj", 0)), 1)
+                        c["sentiment_cached"] = True
+                        continue
+
                 data = await get_stock_news_with_sentiment(c["ticker"])
                 raw = (data.get("sentiment") or "").upper()
                 c["news_count"] = data.get("news_count", 0)
@@ -647,6 +662,14 @@ class AlphaStrategist(BaseAgent):
                 c["earnings_soon"] = earnings_soon
                 c["sentiment_adj"] = adj
                 c["confluence"] = round(max(0, c["confluence"] + adj), 1)
+
+                # 🔧 Salva in cache (valida 4h)
+                await db.sentiment_cache.update_one(
+                    {"_id": c["ticker"]},
+                    {"$set": {"sentiment": sent, "earnings_soon": earnings_soon,
+                              "adj": adj, "ts": datetime.utcnow()}},
+                    upsert=True,
+                )
             except Exception as e:
                 c["sentiment"] = "N/A"
                 c["sentiment_adj"] = 0
@@ -822,8 +845,24 @@ class AlphaStrategist(BaseAgent):
         # 🆕 Ricalcola target/stop ATR-based (R/R realistici, come backtest)
         top_candidates = await self._recalc_targets_atr(db, top_candidates)
 
-        # 🆕 SentimentAgent — arricchisce i top con news sentiment + earnings
-        top_candidates = await self._enrich_with_sentiment(top_candidates)
+        # 🆕 SentimentAgent — solo TOP 3 e max 1 volta ogni 2h (risparmio quota LLM)
+        try:
+            from datetime import timedelta
+            sstate = await db.agent_state.find_one({"_id": "sentiment_last_run"})
+            last_ts = sstate.get("ts") if sstate else None
+            hours_since = (datetime.utcnow() - last_ts).total_seconds() / 3600 if last_ts else 999
+            if hours_since >= 2 and top_candidates:
+                enriched = await self._enrich_with_sentiment(top_candidates[:3])
+                top_candidates[:3] = enriched
+                await db.agent_state.update_one(
+                    {"_id": "sentiment_last_run"},
+                    {"$set": {"ts": datetime.utcnow()}}, upsert=True)
+                top_candidates.sort(key=lambda x: x["confluence"], reverse=True)
+                print(f"  📰 Sentiment: analizzati {len(enriched)} candidati")
+            else:
+                print(f"  📰 Sentiment: skip (ultimo run {hours_since:.1f}h fa)")
+        except Exception as e:
+            print(f"  Sentiment skip: {e}")
 
         # ============================================
         # LLM REASONING per top candidates
