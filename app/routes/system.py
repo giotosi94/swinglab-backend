@@ -244,3 +244,56 @@ async def system_health_report():
         report = f"Errore generazione report: {e}"
 
     return {**health, "llm_report": report, "llm_used": True}
+
+# ============================================
+# LLM DIAGNOSTICS
+# ============================================
+
+@router.get("/llm/status")
+async def llm_status():
+    """
+    Stato dei provider LLM: client inizializzati, budget, modello attivo.
+    NON consuma token.
+    """
+    from app.services.llm_service import get_llm_stats, llm_available
+    stats = get_llm_stats()
+    stats["any_available"] = llm_available()
+    return stats
+
+
+@router.post("/llm/reset-budget")
+async def llm_reset_budget(provider: str = None):
+    """
+    Sblocca il budget tracker (in memoria).
+    Serve quando un 429 temporaneo marca un provider come esaurito
+    per il resto della giornata.
+    """
+    from app.services.llm_service import reset_budget
+    return reset_budget(provider)
+
+
+@router.post("/llm/test")
+async def llm_test():
+    """
+    Test reale: una chiamata minima per verificare quale provider risponde.
+    ⚠️ Consuma pochi token.
+    """
+    from app.services.llm_service import llm_ask, get_llm_stats
+    result = llm_ask(
+        system_prompt="Rispondi con una sola parola.",
+        user_prompt="Scrivi: OK",
+        max_tokens=10,
+        temperature=0,
+    )
+    stats = get_llm_stats()
+    active = {
+        p: v.get("active_model")
+        for p, v in stats["providers"].items()
+        if v.get("active_model")
+    }
+    return {
+        "success": result is not None,
+        "response": result,
+        "active_models": active,
+    }
+
