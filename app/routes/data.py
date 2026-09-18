@@ -568,6 +568,8 @@ async def backtest_run(
     floor_t2_pct: float = 3.0,
     floor_t3_pct: float = 8.0,
     min_holding_days: int = 1,
+    use_dynamic_sizing: bool = False,
+    use_apm_exit_proxy: bool = False,
 ):
     from app.services.backtesting import run_backtest
 
@@ -577,6 +579,7 @@ async def backtest_run(
     if use_preset:
         app_settings = await db.app_settings.find_one({"_id": "risk_params"}) or {}
         alpha_params = await db.agent_memory_alpha_strategist.find_one({"_id": "params"}) or {}
+        risk_params = await db.agent_memory_risk_manager.find_one({"_id": "params"}) or {}
         preset_name = app_settings.get("active_preset")
 
         if max_positions is None:
@@ -586,6 +589,8 @@ async def backtest_run(
         if min_confluence is None:
             min_confluence = alpha_params.get("min_confluence", 48)
 
+    if not use_preset:
+        risk_params = {}
     max_positions = max_positions if max_positions is not None else 12
     position_size_pct = position_size_pct if position_size_pct is not None else 18.0
     min_confluence = min_confluence if min_confluence is not None else 48
@@ -611,6 +616,12 @@ async def backtest_run(
         floor_t2_pct=floor_t2_pct,
         floor_t3_pct=floor_t3_pct,
         min_holding_days=min_holding_days,
+        use_dynamic_sizing=use_dynamic_sizing,
+        use_apm_exit_proxy=use_apm_exit_proxy,
+        risk_pct_per_trade=risk_params.get("risk_pct_per_trade", app_settings.get("risk_pct_per_trade", 3.0) if use_preset else 3.0),
+        max_position_pct=risk_params.get("max_position_pct", app_settings.get("max_position_pct", 25.0) if use_preset else 25.0),
+        min_cash_reserve_pct=risk_params.get("min_cash_reserve_pct", app_settings.get("min_cash_reserve_pct", 5.0) if use_preset else 5.0),
+        risk_params=risk_params,
     )
     result["active_preset"] = preset_name
     return result
