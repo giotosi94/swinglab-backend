@@ -295,6 +295,88 @@ def _confluence_and_target(bars_slice, use_mtf=True, use_momentum=True):
     return score, target_price, stop_price, setup
 
 
+def _historical_regime_multiplier(spy_closes):
+    if len(spy_closes) < 50:
+        return 0.60, "NEUTRAL"
+    price = spy_closes[-1]
+    ema20 = _calc_ema(spy_closes, 20)
+    ema50 = _calc_ema(spy_closes, 50)
+    drawdown = _spy_drawdown_at(spy_closes)
+    if drawdown <= -20 or price < ema50 * 0.92:
+        return 0.20, "CRASH"
+    if drawdown <= -8 or price < ema50:
+        return 0.30, "BEAR"
+    if price > ema20 > ema50:
+        return 1.00, "BULL"
+    return 0.60, "NEUTRAL"
+
+
+def _dps_multiplier_bt(risk_reward, confluence, params):
+    rr_ideal = params.get("dps_rr_ideal", 2.5)
+    conf_ideal = params.get("dps_conf_ideal", 55.0)
+    ml_ideal = params.get("dps_ml_ideal", 75.0)
+    max_mult = params.get("dps_max_multiplier", 1.6)
+    min_mult = params.get("dps_min_multiplier", 0.5)
+    aggressiveness = params.get("dps_aggressiveness", 1.3)
+    rr_ratio = risk_reward / rr_ideal if rr_ideal > 0 else 1.0
+    rr_mult = max(0.5, min(1.4, 0.4 + rr_ratio * 0.6))
+    ml_score = 50.0
+    ml_ratio = ml_score / ml_ideal if ml_ideal > 0 else 1.0
+    ml_mult = max(0.7, min(1.3, 0.5 + ml_ratio * 0.5))
+    conf_ratio = confluence / conf_ideal if conf_ideal > 0 else 1.0
+    conf_mult = max(0.7, min(1.3, 0.5 + conf_ratio * 0.5))
+    combined = rr_mult * ml_mult * conf_mult
+    combined = 1.0 + (combined - 1.0) * aggressiveness
+    return round(max(min_mult, min(max_mult, combined)), 3)
+
+
+def _kelly_multiplier_bt(closed_positions, params):
+    min_trades = int(params.get("kelly_min_trades", 20))
+    history = closed_positions[-100:]
+    if len(history) < min_trades:
+        return 1.0
+    wins = [p for p in history if p > 0]
+    losses = [p for p in history if p <= 0]
+    if not wins or not losses:
+        return 1.0
+    win_rate = len(wins) / len(history)
+    loss_rate = 1 - win_rate
+    avg_win = sum(wins) / len(wins)
+    avg_loss = abs(sum(losses) / len(losses))
+    if avg_win <= 0 or avg_loss <= 0:
+        return 1.0
+    kelly_pct = (win_rate * avg_win - loss_rate * avg_loss) / avg_win
+    fractional = max(0, kelly_pct * params.get("kelly_fractional_factor", 0.25))
+    if fractional <= 0:
+        return 0.5
+    if fractional < 0.05:
+        return round(0.5 + fractional / 0.05 * 0.5, 3)
+    if fractional < 0.15:
+        return round(1.0 + (fractional - 0.05) / 0.10 * 0.5, 3)
+    return 1.5
+
+
+def _apm_exit_proxy(bars_slice, entry_price):
+    if len(bars_slice) < 50:
+        return False, 0
+    closes = [b["c"] for b in bars_slice]
+    price = closes[-1]
+    ema20 = _calc_ema(closes, 20)
+    ema50 = _calc_ema(closes, 50)
+    rsi = _calc_rsi(closes)
+    ret20 = (price / closes[-21] - 1) * 100 if len(closes) >= 21 else 0
+    weekly, slope = _weekly_trend_bt(bars_slice)
+    negative = 0
+    negative += price < ema20
+    negative += price < ema50
+    negative += rsi < 38
+    negative += ret20 < -5
+    negative += weekly == "BEAR"
+    negative += slope == "falling"
+    pnl_pct = (price - entry_price) / entry_price * 100 if entry_price > 0 else 0
+    return negative >= 3 and pnl_pct < 3, int(negative)
+
+
 def _calc_metrics(equity_curve, trades):
     if len(equity_curve) < 2:
         return {}
@@ -474,6 +556,12 @@ async def run_backtest(
     floor_t2_pct: float = 3.0,
     floor_t3_pct: float = 8.0,
     min_holding_days: int = 1,
+    use_dynamic_sizing: bool = False,
+    use_apm_exit_proxy: bool = False,
+    risk_pct_per_trade: float = 3.0,
+    max_position_pct: float = 25.0,
+    min_cash_reserve_pct: float = 5.0,
+    risk_params: dict = None,
 ):
     """
     Backtest v2.0 con APM COMPLETO:
@@ -543,6 +631,16 @@ async def run_backtest(
     equity_curve = []
     scale_out_events = 0
     mtf_debug = {}
+    risk_params = risk_params or {}
+    closed_position_returns = []
+    realized_by_position = {}
+    sizing_samples = []
+    regime_samples = []
+    dps_samples = []
+    kelly_samples = []
+    sizing_blocked_cash = 0
+    sizing_blocked_risk = 0
+    apm_exit_proxy_events = 0
 
     for date in backtest_dates:
         # ===== 0. CRASH DEPLOY a FETTE progressive (Progetto Alpha) =====
@@ -642,6 +740,7 @@ async def run_backtest(
                     qty_close = pos["shares"] * (t1_size_pct / 100)
                     pnl_d = (exit_price - entry) * qty_close
                     cash += exit_price * qty_close
+                    realized_by_position[(ticker, pos["entry_date"])] = realized_by_position.get((ticker, pos["entry_date"]), 0) + pnl_d
                     pos["shares"] -= qty_close
                     pos["last_target_hit"] = 1
                     pos["sl"] = max(pos["sl"], entry * (1 + floor_t1_pct / 100))
@@ -658,6 +757,7 @@ async def run_backtest(
                     qty_close = pos["shares"] * (t2_size_pct / 100)
                     pnl_d = (exit_price - entry) * qty_close
                     cash += exit_price * qty_close
+                    realized_by_position[(ticker, pos["entry_date"])] = realized_by_position.get((ticker, pos["entry_date"]), 0) + pnl_d
                     pos["shares"] -= qty_close
                     pos["last_target_hit"] = 2
                     pos["sl"] = max(pos["sl"], entry * (1 + floor_t2_pct / 100))
@@ -674,6 +774,7 @@ async def run_backtest(
                     qty_close = pos["shares"] * (t3_size_pct / 100)
                     pnl_d = (exit_price - entry) * qty_close
                     cash += exit_price * qty_close
+                    realized_by_position[(ticker, pos["entry_date"])] = realized_by_position.get((ticker, pos["entry_date"]), 0) + pnl_d
                     pos["shares"] -= qty_close
                     pos["last_target_hit"] = 3
                     pos["sl"] = max(pos["sl"], entry * (1 + floor_t3_pct / 100))
@@ -685,12 +786,38 @@ async def run_backtest(
                         "pnl_pct": round(pos["t3_pct"], 2), "pnl_dollar": round(pnl_d, 2),
                         "reason": "APM_SCALE_T3",
                     })
+                if use_apm_exit_proxy and holding_days >= min_holding_days:
+                    idx_now = date_idx_map.get(ticker, {}).get(date)
+                    bars_now = bars[:idx_now + 1] if idx_now is not None else []
+                    should_exit, negative_factors = _apm_exit_proxy(bars_now, entry)
+                    if should_exit:
+                        exit_price = close
+                        pnl_pct = (exit_price - entry) / entry * 100
+                        pnl_d = (exit_price - entry) * pos["shares"]
+                        cash += exit_price * pos["shares"]
+                        total_realized = realized_by_position.get((ticker, pos["entry_date"]), 0) + pnl_d
+                        initial_cost = entry * pos["initial_shares"]
+                        closed_position_returns.append(total_realized / initial_cost * 100 if initial_cost > 0 else 0)
+                        trades.append({
+                            "ticker": ticker, "entry_date": pos["entry_date"], "exit_date": date,
+                            "entry_price": round(entry, 2), "exit_price": round(exit_price, 2),
+                            "shares": pos["shares"], "initial_shares": pos["initial_shares"],
+                            "pnl_pct": round(pnl_pct, 2), "pnl_dollar": round(pnl_d, 2),
+                            "reason": "APM_EXIT_PROXY", "negative_factors": negative_factors,
+                        })
+                        apm_exit_proxy_events += 1
+                        del positions[ticker]
+                        continue
+
                 # SL hit (su qualsiasi residuo)
                 if low <= pos["sl"]:
                     exit_price = pos["sl"]
                     pnl_pct = (exit_price - entry) / entry * 100
                     pnl_d = (exit_price - entry) * pos["shares"]
                     cash += exit_price * pos["shares"]
+                    total_realized = realized_by_position.get((ticker, pos["entry_date"]), 0) + pnl_d
+                    initial_cost = entry * pos["initial_shares"]
+                    closed_position_returns.append(total_realized / initial_cost * 100 if initial_cost > 0 else 0)
                     reason = "BREAK_EVEN_SL" if pos["last_target_hit"] >= 1 else "STOP_LOSS"
                     trades.append({
                         "ticker": ticker, "entry_date": pos["entry_date"], "exit_date": date,
@@ -785,11 +912,42 @@ async def run_backtest(
             slots = max_positions - len(positions)
 
             for ticker, conf, entry_price, target_price, stop_price, setup, sec_weight in candidates[:slots]:
-                # 🆕 SIZE BOOST: i settori in bottom ricevono più capitale (doppio peso)
                 size_mult = 1.0 + min(0.5, sec_weight / 46) if sec_weight > 0 else 1.0
-                notional = cash * (position_size_pct / 100) * size_mult
-                if notional < 100 or notional > cash:
-                    notional = min(cash * (position_size_pct / 100), cash)
+                regime_multiplier = 1.0
+                regime_name = "FIXED"
+                dps_multiplier = 1.0
+                kelly_multiplier = 1.0
+                equity_now = equity_curve[-1]["equity"] if equity_curve else starting_capital
+                stop_distance_pct = abs(entry_price - stop_price) / entry_price * 100 if entry_price > 0 else 0
+                target_distance_pct = (target_price - entry_price) / entry_price * 100 if entry_price > 0 else 0
+                risk_reward = target_distance_pct / stop_distance_pct if stop_distance_pct > 0 else 0
+
+                if use_dynamic_sizing:
+                    n_spy = spy_close_by_date.get(date, 0)
+                    spy_upto = spy_closes_ordered[:n_spy] if n_spy else []
+                    regime_multiplier, regime_name = _historical_regime_multiplier(spy_upto)
+                    dps_multiplier = _dps_multiplier_bt(risk_reward, conf, risk_params)
+                    kelly_multiplier = _kelly_multiplier_bt(closed_position_returns, risk_params)
+                    dynamic_pct = position_size_pct * regime_multiplier * dps_multiplier * kelly_multiplier
+                    pct_cap = equity_now * min(dynamic_pct / 100, max_position_pct / 100)
+                    risk_cap = equity_now * (risk_pct_per_trade / 100) * regime_multiplier
+                    by_risk = risk_cap / (stop_distance_pct / 100) if stop_distance_pct > 0 else 0
+                    cash_reserve = equity_now * (min_cash_reserve_pct / 100)
+                    available_cash = max(0, cash - cash_reserve)
+                    notional = min(pct_cap, by_risk, available_cash)
+                    if by_risk <= 0 or pct_cap <= 0:
+                        sizing_blocked_risk += 1
+                    if available_cash < 100:
+                        sizing_blocked_cash += 1
+                    sizing_samples.append(notional / equity_now * 100 if equity_now > 0 else 0)
+                    regime_samples.append(regime_multiplier)
+                    dps_samples.append(dps_multiplier)
+                    kelly_samples.append(kelly_multiplier)
+                else:
+                    notional = cash * (position_size_pct / 100) * size_mult
+                    if notional < 100 or notional > cash:
+                        notional = min(cash * (position_size_pct / 100), cash)
+
                 if notional < 100 or notional > cash:
                     continue
                 shares = notional / entry_price
@@ -813,6 +971,11 @@ async def run_backtest(
                     "confluence": conf,
                     "setup": setup,
                     "last_price": entry_price,
+                    "regime": regime_name,
+                    "regime_multiplier": regime_multiplier,
+                    "dps_multiplier": dps_multiplier,
+                    "kelly_multiplier": kelly_multiplier,
+                    "risk_reward": risk_reward,
                 }
 
         # ===== 3. EQUITY =====
@@ -976,6 +1139,11 @@ async def run_backtest(
             "use_sector_bottom": use_sector_bottom,
             "use_crash_deploy": use_crash_deploy,
             "use_rotation": use_rotation,
+            "use_dynamic_sizing": use_dynamic_sizing,
+            "use_apm_exit_proxy": use_apm_exit_proxy,
+            "risk_pct_per_trade": risk_pct_per_trade,
+            "max_position_pct": max_position_pct,
+            "min_cash_reserve_pct": min_cash_reserve_pct,
             "starting_capital": starting_capital,
         },
         "metrics": metrics,
@@ -987,7 +1155,8 @@ async def run_backtest(
         },
         "validation_notes": [
             "La rotazione settoriale e' disattivata di default: resta un test informativo.",
-            "APM_EXIT non e' simulato: mancano snapshot storici point-in-time di ML, trend e confluence.",
+            "APM_EXIT_PROXY usa solo indicatori point-in-time; non usa ML storico per evitare look-ahead bias.",
+            "DPS usa ML neutrale 50 finche' non saranno disponibili snapshot ML storici.",
             "Il backtest usa barre daily: il minimum holding di 24 ore equivale a 1 giorno di borsa.",
         ],
         "benchmark": {
@@ -1002,7 +1171,19 @@ async def run_backtest(
         "apm_stats": {
             "scale_out_events": scale_out_events,
             "apm_enabled": use_apm,
+            "apm_exit_proxy_events": apm_exit_proxy_events,
             **apm_position_stats,
+        },
+        "sizing_stats": {
+            "enabled": use_dynamic_sizing,
+            "avg_effective_size_pct": round(float(np.mean(sizing_samples)), 2) if sizing_samples else position_size_pct,
+            "avg_regime_multiplier": round(float(np.mean(regime_samples)), 3) if regime_samples else 1.0,
+            "avg_dps_multiplier": round(float(np.mean(dps_samples)), 3) if dps_samples else 1.0,
+            "avg_kelly_multiplier": round(float(np.mean(kelly_samples)), 3) if kelly_samples else 1.0,
+            "blocked_cash": sizing_blocked_cash,
+            "blocked_risk": sizing_blocked_risk,
+            "kelly_closed_positions": len(closed_position_returns),
+            "ml_proxy_score": 50,
         },
         "mtf_debug": mtf_debug,
         "config_use_mtf": use_mtf,
