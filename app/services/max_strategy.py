@@ -620,13 +620,142 @@ def _bottom_state(df, profiles, compression, atr):
     }
 
 
-def _market_phase_gates(df, profiles, bottom, structural_profiles, active_base, structural_base, atr):
+def _detect_speculative_volume_pocket(df, profiles, structural_profiles, active_base, atr):
+    price = _safe_float(df["Close"].iloc[-1])
+    if len(df) < 90 or atr <= 0:
+        return None
+    best = None
+    for length in (40, 60, 90, 120):
+        if len(df) < length + 20:
+            continue
+        window = df.tail(length).reset_index(drop=True)
+        lows = window["Low"].to_numpy(dtype=float)
+        highs = window["High"].to_numpy(dtype=float)
+        closes = window["Close"].to_numpy(dtype=float)
+        swing_lows = _swing_points(lows, 2, 2, "low")
+        swing_highs = _swing_points(highs, 2, 2, "high")
+        if len(swing_lows) < 2 or len(swing_highs) < 2:
+            continue
+        base_low = float(np.min(lows))
+        recent_high = float(np.max(highs))
+        profile = _volume_profile(window, bins=56)
+        if not profile:
+            continue
+        high_prices = np.array([highs[index] for index in swing_highs[-6:]], dtype=float)
+        tolerance = max(atr * 0.45, float(np.median(high_prices)) * 0.008)
+        clusters = []
+        for value in sorted(high_prices):
+            matched = False
+            for cluster in clusters:
+                if abs(value - np.median(cluster)) <= tolerance:
+                    cluster.append(float(value))
+                    matched = True
+                    break
+            if not matched:
+                clusters.append([float(value)])
+        tested = [cluster for cluster in clusters if len(cluster) >= 2]
+        if not tested:
+            continue
+        neck_candidates = [cluster for cluster in tested if float(np.median(cluster)) >= profile["poc"] - atr * 0.35]
+        if not neck_candidates:
+            continue
+        neck_cluster = max(neck_candidates, key=lambda cluster: float(np.median(cluster)))
+        neck = float(np.median(neck_cluster))
+        neck_low = neck - tolerance * 0.5
+        neck_high = neck + tolerance * 0.5
+        breakout_indices = [
+            index for index in range(1, len(window))
+            if closes[index] > neck_high + atr * 0.15 and closes[index - 1] <= neck_high
+        ]
+        if not breakout_indices:
+            continue
+        breakout_index = breakout_indices[-1]
+        breakout_age = len(window) - 1 - breakout_index
+        if breakout_age > 45:
+            continue
+        post_high_index = int(breakout_index + np.argmax(highs[breakout_index:]))
+        post_high = float(highs[post_high_index])
+        expansion_atr = (post_high - neck) / atr
+        if expansion_atr < 1.0:
+            continue
+        upper_nodes = []
+        for structural in structural_profiles:
+            for key in ("poc", "vah"):
+                level = _safe_float(structural.get(key))
+                if level > neck + atr * 0.50:
+                    upper_nodes.append(level)
+        rolling120 = profiles.get("poc120") or {}
+        for key in ("poc", "vah"):
+            level = _safe_float(rolling120.get(key))
+            if level > neck + atr * 0.50:
+                upper_nodes.append(level)
+        pre_breakout_highs = [float(highs[index]) for index in swing_highs if index < breakout_index and highs[index] > neck + atr * 0.50]
+        upper_nodes.extend(pre_breakout_highs)
+        first_target = min(upper_nodes) if upper_nodes else neck + max(atr * 2.0, (neck - base_low) * 0.50)
+        target_reached = post_high >= first_target - atr * 0.20
+        target_rejected = target_reached and price <= first_target - atr * 0.50
+        returned_below_neck = price < neck_low - atr * 0.20
+        near_neck = abs(price - neck) <= atr * 0.75
+        round_trip = target_reached and price <= neck + atr * 0.25
+        pocket_open = first_target > neck and (first_target - neck) / atr >= 1.0
+        if returned_below_neck:
+            state = "SPECULATION_FAILED"
+        elif round_trip:
+            state = "SPECULATIVE_ROUND_TRIP"
+        elif target_rejected and near_neck:
+            state = "SPECULATIVE_RETEST"
+        elif target_rejected:
+            state = "FIRST_HVN_REJECTION"
+        elif target_reached:
+            state = "FIRST_HVN_TARGET_REACHED"
+        else:
+            state = "VOLUME_POCKET_EXPANSION"
+        quality = 0
+        quality += 25 if len(neck_cluster) >= 3 else 15
+        quality += 20 if pocket_open else 0
+        quality += 20 if profile["poc"] <= neck + atr * 0.50 else 10
+        quality += 20 if expansion_atr >= 2.0 else 10
+        quality += 15 if length <= 90 else 8
+        result = {
+            "type": "SPECULATIVE_VOLUME_POCKET",
+            "state": state,
+            "window_days": length,
+            "base_low": round(base_low, 2),
+            "base_poc": profile["poc"],
+            "neck_center": round(neck, 2),
+            "neck_low": round(neck_low, 2),
+            "neck_high": round(neck_high, 2),
+            "neck_tests": len(neck_cluster),
+            "breakout_date": window["datetime"].iloc[breakout_index].strftime("%Y-%m-%d"),
+            "breakout_age_days": breakout_age,
+            "post_breakout_high": round(post_high, 2),
+            "expansion_atr": round(expansion_atr, 2),
+            "first_hvn_target": round(first_target, 2),
+            "target_reached": target_reached,
+            "target_rejected": target_rejected,
+            "near_neck": near_neck,
+            "returned_below_neck": returned_below_neck,
+            "round_trip": round_trip,
+            "pocket_open": pocket_open,
+            "quality_score": min(100, quality),
+            "partial_profit_required": target_reached,
+            "runner_allowed": target_reached and not returned_below_neck,
+            "runner_exit_required": returned_below_neck,
+            "invalidation_price": round(neck_low - atr * 0.25, 2),
+        }
+        if best is None or result["quality_score"] > best["quality_score"]:
+            best = result
+    return best
+
+
+def _market_phase_gates_v141(df, profiles, bottom, structural_profiles, active_base, structural_base, speculative_setup, atr):
     weekly = _weekly_frame(df.tail(min(1000, len(df))))
     price = _safe_float(df["Close"].iloc[-1])
     annual = df.tail(252)
     high252 = _safe_float(annual["High"].max())
     low252 = _safe_float(annual["Low"].min())
     range_position = (price - low252) / (high252 - low252) * 100 if high252 > low252 else 50.0
+    drawdown = (price - high252) / high252 * 100 if high252 > 0 else 0.0
     weekly_close = weekly["Close"] if len(weekly) else pd.Series(dtype=float)
     weekly_rsi = 50.0
     if len(weekly_close) >= 15:
@@ -638,66 +767,60 @@ def _market_phase_gates(df, profiles, bottom, structural_profiles, active_base, 
     recent_low = _safe_float(weekly["Low"].tail(4).min()) if len(weekly) >= 4 else _safe_float(df["Low"].tail(20).min())
     prior_low = _safe_float(weekly["Low"].iloc[-12:-4].min()) if len(weekly) >= 12 else recent_low
     new_weekly_low = recent_low < prior_low - max(atr * 0.25, prior_low * 0.005)
-    weekly_ema10 = _safe_float(weekly_close.ewm(span=10).mean().iloc[-1], price) if len(weekly_close) else price
     weekly_ema20_series = weekly_close.ewm(span=20).mean() if len(weekly_close) else pd.Series([price])
     weekly_ema20 = _safe_float(weekly_ema20_series.iloc[-1], price)
     weekly_ema20_prev = _safe_float(weekly_ema20_series.iloc[-4], weekly_ema20) if len(weekly_ema20_series) >= 4 else weekly_ema20
     weekly_ema20_falling = weekly_ema20 < weekly_ema20_prev * 0.995
     poc20 = profiles.get("poc20") or {}
     poc60 = profiles.get("poc60") or {}
-    poc20_supportive = poc20.get("migration") in ("UP", "STABLE")
-    poc60_supportive = poc60.get("migration") in ("UP", "STABLE")
     local_high = _safe_float(df["High"].iloc[-20:-5].max()) if len(df) >= 25 else _safe_float(df["High"].tail(20).max())
     local_break = price > local_high + atr * 0.10
-    higher_low = _safe_float(df["Low"].tail(10).min()) >= _safe_float(df["Low"].iloc[-30:-10].min()) * 0.98 if len(df) >= 30 else False
-    weekly_rsi_turn = weekly_rsi >= 35 and len(weekly_close) >= 3 and weekly_close.iloc[-1] >= weekly_close.iloc[-2]
+    higher_low = bool(_safe_float(df["Low"].tail(10).min()) >= _safe_float(df["Low"].iloc[-30:-10].min()) * 0.98) if len(df) >= 30 else False
+    weekly_rsi_turn = bool(weekly_rsi >= 35 and len(weekly_close) >= 3 and weekly_close.iloc[-1] >= weekly_close.iloc[-2])
     base_trigger = bool(active_base and active_base.get("state") in ("NECK_BREAKOUT", "NECK_RETEST"))
-    structural_trigger = bool(structural_base and structural_base.get("state") in (
-        "ROUNDING_NECK_BREAKOUT", "POC_NECK_RETEST_CONFIRMED", "SECOND_LEG_REENTRY"
-    ))
+    rounding_state = structural_base.get("state") if structural_base else None
+    structural_trigger = rounding_state in ("ROUNDING_NECK_BREAKOUT", "POC_NECK_RETEST_CONFIRMED", "SECOND_LEG_REENTRY")
+    retest_in_progress = rounding_state == "POC_NECK_RETEST_IN_PROGRESS"
     master_reaction = any(
         profile.get("distance_atr", 99) <= 0.75 and profile.get("status") in ("FIRST_TEST", "RECLAIMED")
         for profile in structural_profiles
     )
+    reaction_candle = bool(df["Close"].iloc[-1] > df["Open"].iloc[-1] and df["Close"].iloc[-1] >= df["High"].iloc[-1] - (df["High"].iloc[-1] - df["Low"].iloc[-1]) * 0.35)
+    selling_recent = _safe_float(df.loc[df["Close"] < df["Open"], "Volume"].tail(5).mean())
+    selling_prior = _safe_float(df.iloc[-20:-5].loc[df.iloc[-20:-5]["Close"] < df.iloc[-20:-5]["Open"], "Volume"].mean()) if len(df) >= 20 else 0.0
+    selling_volume_contracting = selling_prior <= 0 or selling_recent <= selling_prior * 0.95
     momentum_signals = {
         "no_new_weekly_low": not new_weekly_low,
-        "poc20_supportive": poc20_supportive,
-        "poc60_supportive": poc60_supportive,
-        "higher_low": bool(higher_low),
+        "poc20_supportive": poc20.get("migration") in ("UP", "STABLE"),
+        "poc60_supportive": poc60.get("migration") in ("UP", "STABLE"),
+        "higher_low": higher_low,
         "local_high_break": bool(local_break),
-        "weekly_rsi_turn": bool(weekly_rsi_turn),
+        "weekly_rsi_turn": weekly_rsi_turn,
         "base_trigger": base_trigger,
-        "structural_trigger": structural_trigger,
+        "structural_trigger": bool(structural_trigger),
         "master_poc_reaction": master_reaction,
+        "reaction_candle": reaction_candle,
+        "selling_volume_contracting": selling_volume_contracting,
     }
     momentum_count = sum(1 for value in momentum_signals.values() if value)
-    momentum_change = momentum_count >= 4 and (local_break or base_trigger or structural_trigger or master_reaction)
-    falling_knife = bool(
-        bottom.get("drawdown_52w_pct", 0) <= -25
-        and new_weekly_low
-        and weekly_ema20_falling
-        and not momentum_change
-    )
+    momentum_change = bool(not new_weekly_low and momentum_count >= 5 and (local_break or base_trigger or structural_trigger or master_reaction))
+    falling_knife = bool(drawdown <= -25 and new_weekly_low and weekly_ema20_falling and not momentum_change)
     nearest_master_below = None
     below = [profile for profile in structural_profiles if profile.get("poc", 0) < price]
     if below:
         nearest_master_below = max(below, key=lambda profile: profile.get("poc", 0))
-    waiting_master_poc = bool(falling_knife and nearest_master_below)
-    mature_markup = bool(
-        range_position >= 80
-        and price > weekly_ema20
-        and (
-            (active_base and price > active_base.get("neck_center", price) + atr * 2.0)
-            or (structural_base and price > structural_base.get("neck_center", price) + atr * 2.0)
-            or price > (poc60.get("poc") or price) + atr * 3.0
-        )
-    )
-    range_bottom = bool(bottom.get("range_position_52w", 50) <= 20 and bottom.get("drawdown_52w_pct", 0) > -25)
-    deep_drawdown = bool(bottom.get("drawdown_52w_pct", 0) <= -25)
+    mature_markup = bool(range_position >= 80 and drawdown > -15 and price > weekly_ema20 and not retest_in_progress)
+    range_bottom = bool(bottom.get("range_position_52w", 50) <= 20 and drawdown > -25)
+    deep_drawdown = bool(drawdown <= -25)
+    speculative_failed = bool(speculative_setup and speculative_setup.get("state") in ("SPECULATION_FAILED", "SPECULATIVE_ROUND_TRIP"))
     if mature_markup:
         phase = "MATURE_MARKUP_BLOCK"
     elif falling_knife:
         phase = "FALLING_KNIFE_WAIT"
+    elif retest_in_progress:
+        phase = "RETEST_WAITING_CONFIRMATION"
+    elif speculative_failed:
+        phase = "SPECULATION_COMPLETED"
     elif deep_drawdown and momentum_change:
         phase = "DEEP_REVERSAL"
     elif deep_drawdown:
@@ -716,6 +839,8 @@ def _market_phase_gates(df, profiles, bottom, structural_profiles, active_base, 
         "range_bottom": range_bottom,
         "falling_knife_block": falling_knife,
         "mature_markup_block": mature_markup,
+        "retest_in_progress_block": retest_in_progress,
+        "speculation_completed": speculative_failed,
         "momentum_change": momentum_change,
         "momentum_score": momentum_count,
         "momentum_signals": momentum_signals,
@@ -724,9 +849,11 @@ def _market_phase_gates(df, profiles, bottom, structural_profiles, active_base, 
         "weekly_ema20_falling": weekly_ema20_falling,
         "new_weekly_low": new_weekly_low,
         "range_position_52w": round(range_position, 1),
-        "waiting_master_poc": waiting_master_poc,
+        "waiting_master_poc": bool(falling_knife and nearest_master_below),
         "next_master_poc": round(nearest_master_below.get("poc"), 2) if nearest_master_below else None,
         "next_master_poc_status": nearest_master_below.get("status") if nearest_master_below else None,
+        "reaction_candle": reaction_candle,
+        "selling_volume_contracting": selling_volume_contracting,
     }
 
 def analyze_max_strategy(df):
@@ -737,11 +864,7 @@ def analyze_max_strategy(df):
     price = _safe_float(data["Close"].iloc[-1])
     atr_series = _atr_series(data, 14)
     atr = _safe_float(atr_series.iloc[-1], price * 0.02)
-    profiles = {
-        "poc20": _rolling_profile(data, 20),
-        "poc60": _rolling_profile(data, 60),
-        "poc120": _rolling_profile(data, 120),
-    }
+    profiles = {"poc20": _rolling_profile(data, 20), "poc60": _rolling_profile(data, 60), "poc120": _rolling_profile(data, 120)}
     for profile in profiles.values():
         if profile and profile.get("poc", 0) > 0:
             signed = (price - profile["poc"]) / profile["poc"] * 100
@@ -753,27 +876,15 @@ def analyze_max_strategy(df):
     structural = _structural_profiles(data, atr)
     active_base = _detect_active_base(data, atr)
     structural_base = _detect_weekly_rounding_base_v131(data, atr)
-    phase = _market_phase_gates(data, profiles, bottom, structural, active_base, structural_base, atr)
-    qualified_profiles = [
-        profile for profile in structural
-        if profile.get("distance_atr", 99) <= 0.75
-        and profile.get("status") in ("VIRGIN", "FIRST_TEST", "RECLAIMED")
-        and profile.get("impulse_move_pct", 0) >= 20
-        and profile.get("bars", 0) >= 20
-    ]
+    speculative_setup = _detect_speculative_volume_pocket(data, profiles, structural, active_base, atr)
+    phase = _market_phase_gates_v141(data, profiles, bottom, structural, active_base, structural_base, speculative_setup, atr)
+    qualified_profiles = [profile for profile in structural if profile.get("distance_atr", 99) <= 0.75 and profile.get("status") in ("VIRGIN", "FIRST_TEST", "RECLAIMED") and profile.get("impulse_move_pct", 0) >= 20 and profile.get("bars", 0) >= 20]
     active_structural_profile = min(qualified_profiles, key=lambda profile: profile.get("distance_atr", 99)) if qualified_profiles else None
     structural_event = None
     if active_structural_profile:
         status = active_structural_profile.get("status")
         structural_event = "MASTER_POC_RECLAIM" if status == "RECLAIMED" else "MASTER_POC_FIRST_TEST" if status == "FIRST_TEST" else "MASTER_POC_CONTACT"
-    if phase["phase"] == "DEEP_REVERSAL":
-        strategy_type = "MAX_DEEP_REVERSAL"
-    elif phase["phase"] == "RANGE_BOTTOM_REVERSAL":
-        strategy_type = "RANGE_BOTTOM_REVERSAL"
-    elif phase["phase"] == "MASTER_POC_REVERSAL" or active_structural_profile and phase["momentum_change"]:
-        strategy_type = "MASTER_POC_RETURN"
-    else:
-        strategy_type = None
+    strategy_type = "MAX_DEEP_REVERSAL" if phase["phase"] == "DEEP_REVERSAL" else "RANGE_BOTTOM_REVERSAL" if phase["phase"] == "RANGE_BOTTOM_REVERSAL" else "MASTER_POC_RETURN" if phase["phase"] == "MASTER_POC_REVERSAL" else None
     triggers = []
     if structural_event:
         triggers.append(structural_event)
@@ -781,52 +892,39 @@ def analyze_max_strategy(df):
         triggers.append(active_base["state"])
     elif active_base and active_base.get("state") == "NECK_TEST":
         triggers.append("ACCUMULATION_NECK_TEST")
-    if structural_base:
-        structural_state = structural_base.get("state")
-        if structural_state in (
-            "ROUNDING_NECK_BREAKOUT", "POC_NECK_RETEST_IN_PROGRESS",
-            "POC_NECK_RETEST_CONFIRMED", "SECOND_LEG_REENTRY",
-            "CORRECTION_ORIGIN_REACHED", "CORRECTION_ORIGIN_REJECTION",
-            "FAILED_ROUNDING_BREAKOUT",
-        ):
-            triggers.append(structural_state)
+    if structural_base and structural_base.get("state") in ("ROUNDING_NECK_BREAKOUT", "POC_NECK_RETEST_IN_PROGRESS", "POC_NECK_RETEST_CONFIRMED", "SECOND_LEG_REENTRY", "CORRECTION_ORIGIN_REACHED", "CORRECTION_ORIGIN_REJECTION", "FAILED_ROUNDING_BREAKOUT"):
+        triggers.append(structural_base["state"])
+    if speculative_setup:
+        triggers.append(speculative_setup["state"])
     if compression.get("state") == "COMPRESSED":
         triggers.append("COMPRESSION_READY")
     if profiles.get("poc20") and profiles["poc20"].get("migration") == "UP":
         triggers.append("POC20_MIGRATION_UP")
     data_rejections = []
-    if quality["status"] != "OK":
-        data_rejections.append("DATA_QUALITY_FAILED")
-    if price < 2:
-        data_rejections.append("PRICE_BELOW_2")
+    if quality["status"] != "OK": data_rejections.append("DATA_QUALITY_FAILED")
+    if price < 2: data_rejections.append("PRICE_BELOW_2")
     strategy_rejections = []
-    if phase["falling_knife_block"]:
-        strategy_rejections.append("FALLING_KNIFE_BLOCK")
-    if phase["mature_markup_block"]:
-        strategy_rejections.append("MATURE_MARKUP_BLOCK")
-    if not phase["momentum_change"]:
-        strategy_rejections.append("MOMENTUM_CHANGE_REQUIRED")
-    if not strategy_type:
-        strategy_rejections.append("NO_QUALIFIED_REVERSAL")
-    structural_trigger = any(trigger in triggers for trigger in (
-        "MASTER_POC_RECLAIM", "MASTER_POC_FIRST_TEST", "NECK_BREAKOUT", "NECK_RETEST",
-        "ROUNDING_NECK_BREAKOUT", "POC_NECK_RETEST_CONFIRMED", "SECOND_LEG_REENTRY",
-    ))
-    if not structural_trigger:
-        strategy_rejections.append("NO_EXECUTABLE_STRUCTURAL_TRIGGER")
+    if phase["falling_knife_block"]: strategy_rejections.append("FALLING_KNIFE_BLOCK")
+    if phase["mature_markup_block"]: strategy_rejections.append("MATURE_MARKUP_BLOCK")
+    if phase["new_weekly_low"]: strategy_rejections.append("NEW_WEEKLY_LOW_BLOCK")
+    if phase["retest_in_progress_block"]: strategy_rejections.append("WAITING_REACTION_SWING")
+    if not phase["momentum_change"]: strategy_rejections.append("MOMENTUM_CHANGE_REQUIRED")
+    if not strategy_type: strategy_rejections.append("NO_QUALIFIED_REVERSAL")
+    executable_trigger = any(trigger in triggers for trigger in ("MASTER_POC_RECLAIM", "MASTER_POC_FIRST_TEST", "NECK_BREAKOUT", "NECK_RETEST", "ROUNDING_NECK_BREAKOUT", "POC_NECK_RETEST_CONFIRMED", "SECOND_LEG_REENTRY"))
+    if not executable_trigger: strategy_rejections.append("NO_EXECUTABLE_STRUCTURAL_TRIGGER")
     score = 0
     score += 25 if bottom["depth"] == "CAPITULATION" else 18 if bottom["depth"] == "DEEP" else 10 if bottom["depth"] == "DEPRESSED" else 0
     score += 25 if bottom["state"] == "ACCUMULATING" else 15 if bottom["state"] == "BOTTOM_BUILDING" else 0
     score += compression["score"] * 0.15
     score += 20 if structural_event in ("MASTER_POC_FIRST_TEST", "MASTER_POC_RECLAIM") else 0
     score += 15 if active_base and active_base.get("state") == "NECK_RETEST" else 12 if active_base and active_base.get("state") == "NECK_BREAKOUT" else 5 if active_base and active_base.get("state") == "NECK_TEST" else 0
-    score += 5 if active_base and active_base.get("quality_score", 0) >= 60 else 0
     score += 15 if structural_base and structural_base.get("state") == "SECOND_LEG_REENTRY" else 12 if structural_base and structural_base.get("state") == "POC_NECK_RETEST_CONFIRMED" else 8 if structural_base and structural_base.get("state") == "ROUNDING_NECK_BREAKOUT" else 0
     score += min(10, phase["momentum_score"] * 2)
     data_eligible = not data_rejections
     strategy_eligible = data_eligible and not strategy_rejections
-    watch_ready = data_eligible and phase["phase"] in ("DEEP_REVERSAL", "DEEP_DRAWDOWN_WAIT", "RANGE_BOTTOM_REVERSAL", "MASTER_POC_REVERSAL") and score >= 35 and not phase["mature_markup_block"]
-    tranche_1_trigger = structural_event in ("MASTER_POC_FIRST_TEST", "MASTER_POC_RECLAIM") and phase["momentum_change"]
+    watch_ready = data_eligible and phase["phase"] in ("DEEP_REVERSAL", "DEEP_DRAWDOWN_WAIT", "RANGE_BOTTOM_REVERSAL", "MASTER_POC_REVERSAL", "RETEST_WAITING_CONFIRMATION") and score >= 35 and not phase["mature_markup_block"]
+    advanced_retest = structural_base and structural_base.get("state") in ("POC_NECK_RETEST_IN_PROGRESS", "POC_NECK_RETEST_CONFIRMED", "SECOND_LEG_REENTRY")
+    tranche_1_trigger = structural_event in ("MASTER_POC_FIRST_TEST", "MASTER_POC_RECLAIM") and phase["momentum_change"] and phase["reaction_candle"] and phase["selling_volume_contracting"] and not advanced_retest and phase["range_position_52w"] < 70
     tranche_2_trigger = any(trigger in triggers for trigger in ("NECK_BREAKOUT", "ROUNDING_NECK_BREAKOUT")) and phase["momentum_change"]
     tranche_3_trigger = any(trigger in triggers for trigger in ("NECK_RETEST", "POC_NECK_RETEST_CONFIRMED", "SECOND_LEG_REENTRY")) and phase["momentum_change"]
     tranche_1_ready = strategy_eligible and tranche_1_trigger
@@ -835,48 +933,28 @@ def analyze_max_strategy(df):
     planned_tranche_pct = 40 if tranche_3_ready else 35 if tranche_2_ready else 25 if tranche_1_ready else 0
     entry_trigger = "RETEST" if tranche_3_ready else "BREAKOUT" if tranche_2_ready else "MASTER_POC_REACTION" if tranche_1_ready else None
     trade_ready = bool(tranche_1_ready or tranche_2_ready or tranche_3_ready)
-    waiting_state = None
-    if phase["falling_knife_block"]:
-        waiting_state = "WAITING_MASTER_POC" if phase["waiting_master_poc"] else "FALLING_KNIFE_WAIT"
-    elif phase["deep_drawdown"] and not phase["momentum_change"]:
-        waiting_state = "DEEP_REVERSAL_WAITING_TRIGGER"
-    elif structural_base and structural_base.get("state") == "POC_NECK_RETEST_IN_PROGRESS":
-        waiting_state = "WAITING_REACTION_SWING"
+    waiting_state = "WAITING_MASTER_POC" if phase["falling_knife_block"] and phase["waiting_master_poc"] else "FALLING_KNIFE_WAIT" if phase["falling_knife_block"] else "WAITING_REACTION_SWING" if phase["retest_in_progress_block"] else "DEEP_REVERSAL_WAITING_TRIGGER" if phase["deep_drawdown"] and not trade_ready else None
     rejection_reasons = list(dict.fromkeys(data_rejections + strategy_rejections))
+    management = None
+    if speculative_setup:
+        management = {
+            "setup_type": "SPECULATIVE_VOLUME_POCKET",
+            "first_target": speculative_setup.get("first_hvn_target"),
+            "partial_profit_required": speculative_setup.get("partial_profit_required", False),
+            "suggested_partial_pct": 30 if speculative_setup.get("partial_profit_required") else 0,
+            "runner_allowed": speculative_setup.get("runner_allowed", False),
+            "runner_exit_required": speculative_setup.get("runner_exit_required", False),
+            "stop_reference": speculative_setup.get("neck_low"),
+        }
     return _native({
-        "status": "OK",
-        "version": "max_structure_v1_4",
-        "bars_analyzed": len(data),
-        "price": round(price, 2),
-        "atr14": round(atr, 4),
-        "atr14_pct": round(atr / price * 100, 2) if price > 0 else 0,
-        "data_quality": quality,
-        "profiles": profiles,
-        "structural_profiles": structural,
-        "master_poc": structural[0] if structural else None,
-        "active_structural_profile": active_structural_profile,
-        "active_structural_event": structural_event,
-        "strategy_type": strategy_type,
-        "market_phase": phase,
-        "waiting_state": waiting_state,
-        "active_base": active_base,
-        "structural_base": structural_base,
-        "compression": compression,
-        "bottom": bottom,
-        "triggers": triggers,
-        "data_rejection_reasons": data_rejections,
-        "strategy_rejection_reasons": strategy_rejections,
-        "rejection_reasons": rejection_reasons,
-        "max_score": round(min(100, score), 1),
-        "data_eligible": data_eligible,
-        "strategy_eligible": strategy_eligible,
-        "watch_ready": watch_ready,
-        "tranche_1_ready": tranche_1_ready,
-        "tranche_2_ready": tranche_2_ready,
-        "tranche_3_ready": tranche_3_ready,
-        "planned_tranche_pct": planned_tranche_pct,
-        "entry_trigger": entry_trigger,
-        "trade_ready": trade_ready,
-        "live_eligible": strategy_eligible,
-        "live_entry_enabled": False,
+        "status": "OK", "version": "max_structure_v1_4_1", "bars_analyzed": len(data), "price": round(price, 2), "atr14": round(atr, 4), "atr14_pct": round(atr / price * 100, 2) if price > 0 else 0,
+        "data_quality": quality, "profiles": profiles, "structural_profiles": structural, "master_poc": structural[0] if structural else None,
+        "active_structural_profile": active_structural_profile, "active_structural_event": structural_event, "strategy_type": strategy_type,
+        "market_phase": phase, "waiting_state": waiting_state, "active_base": active_base, "structural_base": structural_base,
+        "speculative_setup": speculative_setup, "position_management": management, "compression": compression, "bottom": bottom, "triggers": triggers,
+        "data_rejection_reasons": data_rejections, "strategy_rejection_reasons": strategy_rejections, "rejection_reasons": rejection_reasons,
+        "max_score": round(min(100, score), 1), "data_eligible": data_eligible, "strategy_eligible": strategy_eligible, "watch_ready": watch_ready,
+        "tranche_1_ready": tranche_1_ready, "tranche_2_ready": tranche_2_ready, "tranche_3_ready": tranche_3_ready,
+        "planned_tranche_pct": planned_tranche_pct, "entry_trigger": entry_trigger, "trade_ready": trade_ready,
+        "live_eligible": strategy_eligible, "live_entry_enabled": False,
     })
