@@ -62,6 +62,14 @@ class AlphaStrategist(BaseAgent):
                             "oversold_reversal"],
             "worst_setups": [],
             "weak_sectors": [],
+            "sector_intelligence_enabled": True,
+            "sector_intelligence_days": 63,
+            "sector_top3_bonus": 5.0,
+            "sector_acceleration_bonus": 2.0,
+            "sector_bottom_penalty": -3.0,
+            "sector_deceleration_penalty": -2.0,
+            "sector_adjustment_max": 7.0,
+            "sector_adjustment_min": -5.0,
             # Sell thresholds
             "sell_rsi_extreme": 78,
             "sell_score_collapsed": 20,
@@ -75,6 +83,79 @@ class AlphaStrategist(BaseAgent):
             # 🆕 v2.0 — Sell signal ML
             "sell_ml_loss_threshold": 0.30,  # se ML dice WIN score <30% + in perdita → sell
         }
+
+    async def _load_sector_intelligence(self, db, params: dict) -> dict:
+        if not params.get("sector_intelligence_enabled", True):
+            return {}
+        days = int(params.get("sector_intelligence_days", 63))
+        sector_codes = ["XLK", "XLF", "XLV", "XLI", "XLY", "XLP", "XLE", "XLU", "XLB", "XLRE", "XLC"]
+        docs = await db.stock_bars.find(
+            {"ticker": {"$in": ["SPY"] + sector_codes}},
+            {"ticker": 1, "bars": 1},
+        ).to_list(20)
+        bars_by_ticker = {doc.get("ticker"): doc.get("bars", []) for doc in docs}
+        spy = {
+            bar.get("date"): float(bar.get("c", 0) or 0)
+            for bar in bars_by_ticker.get("SPY", [])
+            if bar.get("date") and bar.get("c")
+        }
+        common_dates = sorted(spy.keys())[-days:]
+        rows = []
+        for code in sector_codes:
+            sector = {
+                bar.get("date"): float(bar.get("c", 0) or 0)
+                for bar in bars_by_ticker.get(code, [])
+                if bar.get("date") and bar.get("c")
+            }
+            dates = [date for date in common_dates if date in sector and spy.get(date, 0) > 0]
+            if len(dates) < 2:
+                continue
+            first_ratio = sector[dates[0]] / spy[dates[0]]
+            if first_ratio <= 0:
+                continue
+            values = [(sector[date] / spy[date]) / first_ratio * 100 for date in dates]
+            relative_return = values[-1] - 100
+            acceleration = values[-1] - values[max(0, len(values) - 21)]
+            rows.append({
+                "code": code,
+                "relative_return_pct": round(relative_return, 2),
+                "acceleration_20d": round(acceleration, 2),
+            })
+        rows.sort(key=lambda item: item["relative_return_pct"], reverse=True)
+        total = len(rows)
+        result = {}
+        for index, row in enumerate(rows):
+            rank = index + 1
+            adjustment = 0.0
+            reasons = []
+            if rank <= 3 and row["relative_return_pct"] > 0:
+                value = float(params.get("sector_top3_bonus", 5.0))
+                adjustment += value
+                reasons.append(f"Top 3 RS +{value:.0f}")
+            elif rank >= max(7, total - 4) and row["relative_return_pct"] < 0:
+                value = float(params.get("sector_bottom_penalty", -3.0))
+                adjustment += value
+                reasons.append(f"Bottom RS {value:.0f}")
+            if row["acceleration_20d"] > 0:
+                value = float(params.get("sector_acceleration_bonus", 2.0))
+                adjustment += value
+                reasons.append(f"Accelerazione +{value:.0f}")
+            elif row["acceleration_20d"] <= -3:
+                value = float(params.get("sector_deceleration_penalty", -2.0))
+                adjustment += value
+                reasons.append(f"Decelerazione {value:.0f}")
+            adjustment = max(
+                float(params.get("sector_adjustment_min", -5.0)),
+                min(float(params.get("sector_adjustment_max", 7.0)), adjustment),
+            )
+            result[row["code"]] = {
+                **row,
+                "rank": rank,
+                "adjustment": round(adjustment, 1),
+                "reason": " | ".join(reasons) if reasons else "Neutrale",
+                "classification": "LEADING" if rank <= 3 and row["relative_return_pct"] > 0 else "LAGGING" if rank >= max(7, total - 4) and row["relative_return_pct"] < 0 else "NEUTRAL",
+            }
+        return result
 
     async def _load_ml_predictions(self, db, assets: list, market_context: dict) -> dict:
         """
@@ -703,6 +784,8 @@ class AlphaStrategist(BaseAgent):
         
         ml_map = await self._load_ml_predictions(db, assets_for_ml, market_ctx)
         print(f"  📊 ML data loaded: {len(ml_map)} tickers with predictions")
+        sector_intelligence = await self._load_sector_intelligence(db, params)
+        print(f"  📈 Sector Intelligence: {len(sector_intelligence)} sectors ranked")
 
         # Riutilizza assets già caricati per ML (ottimizzazione)
         assets = assets_for_ml
@@ -796,7 +879,10 @@ class AlphaStrategist(BaseAgent):
 
             ml_data = ml_map.get(ticker)
             conf = self._calc_confluence(a, market_ctx, params, ml_data)
-            conf_score = round(max(0, min(100, conf["score"] + setup_adjustment)), 1)
+            sector_signal = sector_intelligence.get(sector, {})
+            sector_adjustment = float(sector_signal.get("adjustment", 0) or 0)
+            confluence_before_sector = round(max(0, min(100, conf["score"] + setup_adjustment)), 1)
+            conf_score = round(max(0, min(100, confluence_before_sector + sector_adjustment)), 1)
 
             if conf_score < min_conf:
                 skipped_reasons["low_confluence"] += 1
@@ -812,6 +898,12 @@ class AlphaStrategist(BaseAgent):
                     "setup_adjustment": setup_adjustment,
                     "sector": sector,
                     "sector_is_weak": sector_is_weak,
+                    "confluence_before_sector": confluence_before_sector,
+                    "sector_adjustment": sector_adjustment,
+                    "sector_rank": sector_signal.get("rank"),
+                    "sector_relative_return_pct": sector_signal.get("relative_return_pct", 0),
+                    "sector_acceleration_20d": sector_signal.get("acceleration_20d", 0),
+                    "sector_intelligence_reason": sector_signal.get("reason", "N/A"),
                     "rsi": round(rsi, 1),
                     "relative_volume": round(rel_vol, 2),
                     "ml_prediction": ml_data.get("ml_prediction", "N/A") if ml_data else "N/A",
@@ -867,6 +959,13 @@ class AlphaStrategist(BaseAgent):
                 "weekly_trend": a.get("mtf", {}).get("weekly_trend", "UNKNOWN"),
                 "setup_adjustment": setup_adjustment,
                 "sector_is_weak": sector_is_weak,
+                "confluence_before_sector": confluence_before_sector,
+                "sector_adjustment": sector_adjustment,
+                "sector_rank": sector_signal.get("rank"),
+                "sector_relative_return_pct": sector_signal.get("relative_return_pct", 0),
+                "sector_acceleration_20d": sector_signal.get("acceleration_20d", 0),
+                "sector_intelligence_reason": sector_signal.get("reason", "N/A"),
+                "sector_classification": sector_signal.get("classification", "NEUTRAL"),
             })
 
         candidates.sort(key=lambda x: x["confluence"], reverse=True)
@@ -895,6 +994,37 @@ class AlphaStrategist(BaseAgent):
                 print(f"  📰 Sentiment: skip (ultimo run {hours_since:.1f}h fa)")
         except Exception as e:
             print(f"  Sentiment skip: {e}")
+
+        alpha_snapshot_at = datetime.utcnow()
+        candidate_map = {candidate["ticker"]: candidate for candidate in top_candidates}
+        rejected_map = {candidate["ticker"]: candidate for candidate in top_rejected}
+        for asset in assets:
+            ticker = asset.get("ticker")
+            snapshot = candidate_map.get(ticker) or rejected_map.get(ticker)
+            if not ticker or not snapshot:
+                continue
+            status = "CANDIDATE" if ticker in candidate_map else "REJECTED_CONFLUENCE"
+            await db.assets.update_one(
+                {"ticker": ticker},
+                {"$set": {
+                    "alpha_snapshot": {
+                        "status": status,
+                        "confluence": snapshot.get("confluence", 0),
+                        "confluence_before_sector": snapshot.get("confluence_before_sector", snapshot.get("confluence", 0)),
+                        "sector_adjustment": snapshot.get("sector_adjustment", 0),
+                        "sector_rank": snapshot.get("sector_rank"),
+                        "sector_relative_return_pct": snapshot.get("sector_relative_return_pct", 0),
+                        "sector_acceleration_20d": snapshot.get("sector_acceleration_20d", 0),
+                        "sector_intelligence_reason": snapshot.get("sector_intelligence_reason", "N/A"),
+                        "setup_type": snapshot.get("setup_type", "neutral"),
+                        "rsi": snapshot.get("rsi", 50),
+                        "weekly_trend": snapshot.get("weekly_trend", "UNKNOWN"),
+                        "risk_reward": snapshot.get("risk_reward", 0),
+                        "min_confluence": min_conf,
+                        "updated_at": alpha_snapshot_at,
+                    }
+                }},
+            )
 
         # ============================================
         # LLM REASONING per top candidates
