@@ -545,6 +545,35 @@ async def backfill_adaptive_targets():
         "skipped": skipped,
     }
 
+@router.post("/backfill-bars-history")
+async def start_bars_history_backfill(target_bars: int = 750, max_concurrent: int = 4):
+    import asyncio
+    from app.services.data_fetcher import backfill_long_history
+    target_bars = max(300, min(target_bars, 1000))
+    db = get_db()
+    job_id = f"stock_bars_{target_bars}"
+    existing = await db.backfill_jobs.find_one({"_id": job_id})
+    if existing and existing.get("status") == "running":
+        existing["_id"] = str(existing["_id"])
+        return existing
+    asyncio.create_task(backfill_long_history(target_bars, max_concurrent))
+    return {"job_id": job_id, "status": "started", "target_bars": target_bars}
+
+
+@router.get("/backfill-bars-history/status")
+async def bars_history_backfill_status(target_bars: int = 750):
+    from app.services.data_fetcher import get_bars_coverage
+    db = get_db()
+    job_id = f"stock_bars_{target_bars}"
+    job = await db.backfill_jobs.find_one({"_id": job_id}) or {"_id": job_id, "status": "not_started", "target_bars": target_bars}
+    job["_id"] = str(job["_id"])
+    job["coverage"] = await get_bars_coverage(target_bars)
+    for key in ("started_at", "updated_at", "finished_at"):
+        if job.get(key) and hasattr(job[key], "isoformat"):
+            job[key] = job[key].isoformat()
+    return job
+
+
 @router.post("/backtest/run")
 async def backtest_run(
     days: int = 180,
