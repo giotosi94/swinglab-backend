@@ -256,14 +256,22 @@ def _detect_active_base(df, atr):
         tested = [cluster for cluster in clusters if len(cluster) >= 2]
         if not tested:
             continue
-        neck_cluster = max(tested, key=lambda cluster: (len(cluster), np.median(cluster)))
-        neck = float(np.median(neck_cluster))
         base_low = float(np.min(lows))
         base_high = float(np.max(highs))
         width_pct = (base_high - base_low) / base_low * 100 if base_low > 0 else 999
         profile = _volume_profile(window, bins=48)
         if not profile:
             continue
+        base_midpoint = base_low + (base_high - base_low) * 0.50
+        qualified = [
+            cluster for cluster in tested
+            if float(np.median(cluster)) > profile["poc"]
+            and float(np.median(cluster)) >= base_midpoint
+        ]
+        if not qualified:
+            continue
+        neck_cluster = max(qualified, key=lambda cluster: (float(np.median(cluster)), len(cluster)))
+        neck = float(np.median(neck_cluster))
         low_sequence = [lows[index] for index in swing_lows[-4:]]
         higher_lows = bool(len(low_sequence) >= 2 and low_sequence[-1] >= low_sequence[0] * 0.98)
         current = float(window["Close"].iloc[-1])
@@ -276,16 +284,28 @@ def _detect_active_base(df, atr):
                 breakout_index = index
                 break
         breakout = breakout_index is not None
+        breakout_date = window["datetime"].iloc[breakout_index].strftime("%Y-%m-%d") if breakout else None
+        breakout_age_days = len(window) - 1 - breakout_index if breakout else None
         retest = False
+        retest_index = None
         if breakout and breakout_index < len(window) - 1:
             post = window.iloc[breakout_index + 1:]
-            retest = bool(((post["Low"] <= neck_high + atr * 0.25) & (post["Close"] >= neck_low - atr * 0.25)).any())
+            mask = (post["Low"] <= neck_high + atr * 0.25) & (post["Close"] >= neck_low - atr * 0.25)
+            if bool(mask.any()):
+                retest = True
+                retest_index = int(mask[mask].index[0])
+        retest_date = window["datetime"].iloc[retest_index].strftime("%Y-%m-%d") if retest_index is not None else None
+        retest_age_days = len(window) - 1 - retest_index if retest_index is not None else None
+        breakout_fresh = breakout and breakout_age_days is not None and breakout_age_days <= 12
+        retest_fresh = retest and retest_age_days is not None and retest_age_days <= 8
         if current < base_low - atr * 0.25:
             state = "BASE_INVALIDATED"
-        elif breakout and retest:
+        elif breakout and retest and retest_fresh:
             state = "NECK_RETEST"
-        elif breakout:
+        elif breakout and breakout_fresh:
             state = "NECK_BREAKOUT"
+        elif breakout:
+            state = "POST_BREAKOUT"
         elif abs(current - neck) <= atr * 0.6:
             state = "NECK_TEST"
         else:
@@ -317,7 +337,13 @@ def _detect_active_base(df, atr):
             "volume_contracting": volume_contracting,
             "quality_score": min(100, quality),
             "breakout": breakout,
+            "breakout_date": breakout_date,
+            "breakout_age_days": breakout_age_days,
+            "breakout_fresh": breakout_fresh,
             "retest": retest,
+            "retest_date": retest_date,
+            "retest_age_days": retest_age_days,
+            "retest_fresh": retest_fresh,
             "invalidation_price": round(base_low - atr * 0.25, 2),
         }
         if best is None or result["quality_score"] > best["quality_score"]:
@@ -404,7 +430,7 @@ def _bottom_state(df, profiles, compression, atr):
 
 def analyze_max_strategy(df):
     if df is None or len(df) < 140:
-        return {"status": "INSUFFICIENT_DATA", "bars": 0 if df is None else len(df), "live_eligible": False}
+        return {"status": "INSUFFICIENT_DATA", "bars": 0 if df is None else len(df), "data_eligible": False, "strategy_eligible": False, "trade_ready": False}
     data = df.copy().sort_values("datetime").reset_index(drop=True)
     quality = _data_quality(data)
     price = _safe_float(data["Close"].iloc[-1])
@@ -425,11 +451,21 @@ def analyze_max_strategy(df):
     bottom = _bottom_state(data, profiles, compression, atr)
     structural = _structural_profiles(data, atr)
     active_base = _detect_active_base(data, atr)
-    actionable_profiles = [profile for profile in structural if profile.get("actionable")]
+    qualified_profiles = [
+        profile for profile in structural
+        if profile.get("distance_atr", 99) <= 0.75
+        and profile.get("status") in ("VIRGIN", "FIRST_TEST", "RECLAIMED")
+        and profile.get("impulse_move_pct", 0) >= 20
+        and profile.get("bars", 0) >= 20
+    ]
+    active_structural_profile = min(qualified_profiles, key=lambda profile: profile.get("distance_atr", 99)) if qualified_profiles else None
     structural_event = None
-    if actionable_profiles:
-        selected = min(actionable_profiles, key=lambda profile: profile.get("distance_atr", 99))
-        structural_event = "MASTER_POC_RECLAIM" if selected["status"] == "RECLAIMED" else "MASTER_POC_FIRST_TEST" if selected["status"] == "FIRST_TEST" else "MASTER_POC_CONTACT"
+    if active_structural_profile:
+        status = active_structural_profile.get("status")
+        structural_event = "MASTER_POC_RECLAIM" if status == "RECLAIMED" else "MASTER_POC_FIRST_TEST" if status == "FIRST_TEST" else "MASTER_POC_CONTACT"
+    deep_reversal = bool(bottom.get("factors", {}).get("max_location_valid"))
+    master_return = active_structural_profile is not None
+    strategy_type = "MAX_DEEP_REVERSAL" if deep_reversal else "MASTER_POC_RETURN" if master_return else None
     triggers = []
     if structural_event:
         triggers.append(structural_event)
@@ -441,15 +477,17 @@ def analyze_max_strategy(df):
         triggers.append("COMPRESSION_READY")
     if profiles.get("poc20") and profiles["poc20"].get("migration") == "UP":
         triggers.append("POC20_MIGRATION_UP")
-    rejection_reasons = []
+    data_rejections = []
     if quality["status"] != "OK":
-        rejection_reasons.append("DATA_QUALITY_FAILED")
+        data_rejections.append("DATA_QUALITY_FAILED")
     if price < 2:
-        rejection_reasons.append("PRICE_BELOW_2")
-    if not bottom["factors"]["max_location_valid"] and not actionable_profiles:
-        rejection_reasons.append("MAX_LOCATION_NOT_VALID")
-    if not any(trigger in triggers for trigger in ("MASTER_POC_RECLAIM", "MASTER_POC_FIRST_TEST", "MASTER_POC_CONTACT", "NECK_BREAKOUT", "NECK_RETEST")):
-        rejection_reasons.append("NO_STRUCTURAL_TRIGGER")
+        data_rejections.append("PRICE_BELOW_2")
+    strategy_rejections = []
+    if not strategy_type:
+        strategy_rejections.append("NO_QUALIFIED_LOCATION")
+    structural_trigger = any(trigger in triggers for trigger in ("MASTER_POC_RECLAIM", "MASTER_POC_FIRST_TEST", "MASTER_POC_CONTACT", "NECK_BREAKOUT", "NECK_RETEST"))
+    if not structural_trigger:
+        strategy_rejections.append("NO_STRUCTURAL_TRIGGER")
     score = 0
     score += 25 if bottom["depth"] == "CAPITULATION" else 18 if bottom["depth"] == "DEEP" else 10 if bottom["depth"] == "DEPRESSED" else 0
     score += 25 if bottom["state"] == "ACCUMULATING" else 15 if bottom["state"] == "BOTTOM_BUILDING" else 0
@@ -457,10 +495,16 @@ def analyze_max_strategy(df):
     score += 20 if structural_event else 0
     score += 15 if active_base and active_base.get("state") == "NECK_RETEST" else 12 if active_base and active_base.get("state") == "NECK_BREAKOUT" else 5 if active_base and active_base.get("state") == "NECK_TEST" else 0
     score += 5 if active_base and active_base.get("quality_score", 0) >= 60 else 0
-    live_eligible = not rejection_reasons
+    data_eligible = not data_rejections
+    strategy_eligible = data_eligible and not strategy_rejections
+    watch_ready = strategy_eligible and score >= 45
+    trade_trigger = any(trigger in triggers for trigger in ("MASTER_POC_FIRST_TEST", "MASTER_POC_RECLAIM", "NECK_BREAKOUT", "NECK_RETEST"))
+    base_valid = active_base is None or active_base.get("state") != "BASE_INVALIDATED"
+    trade_ready = watch_ready and trade_trigger and base_valid
+    rejection_reasons = data_rejections + strategy_rejections
     return _native({
         "status": "OK",
-        "version": "max_structure_v1_1",
+        "version": "max_structure_v1_2",
         "bars_analyzed": len(data),
         "price": round(price, 2),
         "atr14": round(atr, 4),
@@ -469,13 +513,21 @@ def analyze_max_strategy(df):
         "profiles": profiles,
         "structural_profiles": structural,
         "master_poc": structural[0] if structural else None,
+        "active_structural_profile": active_structural_profile,
+        "active_structural_event": structural_event,
+        "strategy_type": strategy_type,
         "active_base": active_base,
         "compression": compression,
         "bottom": bottom,
         "triggers": triggers,
+        "data_rejection_reasons": data_rejections,
+        "strategy_rejection_reasons": strategy_rejections,
         "rejection_reasons": rejection_reasons,
         "max_score": round(min(100, score), 1),
-        "watch_ready": live_eligible and score >= 45,
-        "live_eligible": live_eligible,
+        "data_eligible": data_eligible,
+        "strategy_eligible": strategy_eligible,
+        "watch_ready": watch_ready,
+        "trade_ready": trade_ready,
+        "live_eligible": strategy_eligible,
         "live_entry_enabled": False,
     })
