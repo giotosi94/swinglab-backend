@@ -291,6 +291,10 @@ class Orchestrator:
                 "failed_orders": len(exec_result.get("failed_orders", [])),
                 "cancelled_stale": exec_result.get("cancelled_stale", 0),
                 "market_status": exec_result.get("market_status", {}),
+                "deferred_buys": exec_result.get("deferred_buys", []),
+                "deferred_sells": exec_result.get("deferred_sells", []),
+                "requires_revalidation": exec_result.get("requires_revalidation", False),
+                "message": exec_result.get("message"),
                 "details": exec_result,
             }
 
