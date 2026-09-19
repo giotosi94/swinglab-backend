@@ -592,6 +592,21 @@ async def run_backtest(
 
     sorted_dates = sorted(all_dates)
     backtest_dates = sorted_dates[-days:] if len(sorted_dates) > days else sorted_dates
+    coverage_counts = sorted(len(bars) for bars in ticker_bars.values())
+    executed_days = len(backtest_dates)
+    complete = sum(1 for count in coverage_counts if count >= executed_days)
+    data_coverage = {
+        "requested_days": days,
+        "executed_days": executed_days,
+        "available_market_days": len(sorted_dates),
+        "tickers_total": len(coverage_counts),
+        "tickers_complete": complete,
+        "coverage_pct": round(complete / len(coverage_counts) * 100, 1) if coverage_counts else 0,
+        "bars_min": min(coverage_counts) if coverage_counts else 0,
+        "bars_median": int(np.median(coverage_counts)) if coverage_counts else 0,
+        "bars_max": max(coverage_counts) if coverage_counts else 0,
+        "is_full_period": executed_days >= days,
+    }
 
     # 🆕 Mappe per Sector Bottom Detector
     from app.services.data_fetcher import SECTOR_STOCKS
@@ -1118,6 +1133,7 @@ async def run_backtest(
     average_cash_pct = round(100 - average_invested_pct, 2)
 
     return {
+        "data_coverage": data_coverage,
         "config": {
             "days": days,
             "min_confluence": min_confluence,
