@@ -46,7 +46,96 @@ ALPACA_HEADERS = {
 }
 
 ALPACA_DATA_URL = "https://data.alpaca.markets"
-MAX_STORED_BARS = 300
+MAX_STORED_BARS = 1000
+
+
+async def fetch_long_history_symbol(client, symbol, target_bars=750):
+    target_bars = max(300, min(int(target_bars), MAX_STORED_BARS))
+    end = datetime.utcnow() - timedelta(minutes=20)
+    start = end - timedelta(days=int(target_bars * 1.75) + 120)
+    url = f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/bars"
+    page_token = None
+    raw_bars = []
+    while True:
+        params = {
+            "timeframe": "1Day",
+            "start": start.strftime("%Y-%m-%dT00:00:00Z"),
+            "end": end.strftime("%Y-%m-%dT23:59:59Z"),
+            "limit": min(10000, target_bars + 100),
+            "feed": "iex",
+            "adjustment": "split",
+            "sort": "asc",
+        }
+        if page_token:
+            params["page_token"] = page_token
+        response = await client.get(url, headers=ALPACA_HEADERS, params=params)
+        if response.status_code != 200:
+            raise RuntimeError(f"Alpaca {response.status_code}: {response.text[:200]}")
+        payload = response.json()
+        raw_bars.extend(payload.get("bars", []))
+        page_token = payload.get("next_page_token")
+        if not page_token or len(raw_bars) >= target_bars:
+            break
+    normalized = {}
+    for bar in raw_bars:
+        date = str(bar.get("t", ""))[:10]
+        if date:
+            normalized[date] = {"date": date, "o": bar.get("o"), "h": bar.get("h"), "l": bar.get("l"), "c": bar.get("c"), "v": bar.get("v", 0)}
+    return sorted(normalized.values(), key=lambda item: item["date"])[-target_bars:]
+
+
+async def get_bars_coverage(target_bars=750):
+    db = get_db()
+    docs = await db.stock_bars.find({}, {"ticker": 1, "bars": 1}).to_list(400)
+    counts = sorted(len(doc.get("bars", [])) for doc in docs if doc.get("ticker"))
+    complete = sum(1 for count in counts if count >= target_bars)
+    return {
+        "target_bars": target_bars,
+        "tickers_total": len(counts),
+        "tickers_complete": complete,
+        "coverage_pct": round(complete / len(counts) * 100, 1) if counts else 0,
+        "bars_min": min(counts) if counts else 0,
+        "bars_median": int(np.median(counts)) if counts else 0,
+        "bars_max": max(counts) if counts else 0,
+    }
+
+
+async def backfill_long_history(target_bars=750, max_concurrent=4):
+    target_bars = max(300, min(int(target_bars), MAX_STORED_BARS))
+    db = get_db()
+    job_id = f"stock_bars_{target_bars}"
+    symbols = sorted(set([ticker for tickers in SECTOR_STOCKS.values() for ticker in tickers] + list(SECTOR_MAP.keys()) + ["SPY", "QQQ", "IWM", "DIA"]))
+    await db.backfill_jobs.update_one({"_id": job_id}, {"$set": {"status": "running", "target_bars": target_bars, "total": len(symbols), "processed": 0, "completed": 0, "skipped": 0, "failed": 0, "started_at": datetime.utcnow(), "updated_at": datetime.utcnow(), "errors": []}}, upsert=True)
+    semaphore = asyncio.Semaphore(max(1, min(int(max_concurrent), 8)))
+    async with httpx.AsyncClient(timeout=45) as client:
+        async def process(symbol):
+            async with semaphore:
+                current = await db.stock_bars.find_one({"ticker": symbol}, {"bars": 1})
+                current_bars = current.get("bars", []) if current else []
+                if len(current_bars) >= target_bars:
+                    return "skipped", symbol, len(current_bars), None
+                try:
+                    fetched = await fetch_long_history_symbol(client, symbol, target_bars)
+                    merged = {bar["date"]: bar for bar in current_bars if bar.get("date")}
+                    merged.update({bar["date"]: bar for bar in fetched if bar.get("date")})
+                    bars = sorted(merged.values(), key=lambda item: item["date"])[-MAX_STORED_BARS:]
+                    await db.stock_bars.update_one({"ticker": symbol}, {"$set": {"ticker": symbol, "bars": bars, "last_bar_date": bars[-1]["date"] if bars else "", "history_target": target_bars, "history_backfilled_at": datetime.utcnow(), "updated_at": datetime.utcnow()}}, upsert=True)
+                    return "completed", symbol, len(bars), None
+                except Exception as error:
+                    return "failed", symbol, len(current_bars), str(error)
+        tasks = [asyncio.create_task(process(symbol)) for symbol in symbols]
+        counters = {"completed": 0, "skipped": 0, "failed": 0}
+        errors = []
+        for future in asyncio.as_completed(tasks):
+            status, symbol, count, error = await future
+            counters[status] += 1
+            if error:
+                errors.append({"ticker": symbol, "error": error})
+            await db.backfill_jobs.update_one({"_id": job_id}, {"$set": {**counters, "processed": sum(counters.values()), "last_ticker": symbol, "last_bar_count": count, "errors": errors[-30:], "updated_at": datetime.utcnow()}})
+    coverage = await get_bars_coverage(target_bars)
+    status = "completed" if counters["failed"] == 0 else "completed_with_errors"
+    await db.backfill_jobs.update_one({"_id": job_id}, {"$set": {"status": status, "coverage": coverage, "finished_at": datetime.utcnow()}})
+    return {"job_id": job_id, "status": status, "coverage": coverage, **counters}
 
 
 # ============================================
