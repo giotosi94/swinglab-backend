@@ -351,6 +351,155 @@ def _detect_active_base(df, atr):
     return best
 
 
+def _detect_weekly_rounding_base(df, daily_atr):
+    weekly = _weekly_frame(df.tail(min(1000, len(df))))
+    if len(weekly) < 30:
+        return None
+    weekly_atr_series = _atr_series(weekly, 14)
+    weekly_atr = _safe_float(weekly_atr_series.iloc[-1], daily_atr * 2.2)
+    current_price = _safe_float(weekly["Close"].iloc[-1])
+    best = None
+    for length in (16, 20, 26, 32, 40, 52):
+        if len(weekly) < length + 4:
+            continue
+        window = weekly.tail(length).reset_index(drop=True)
+        lows = window["Low"].to_numpy(dtype=float)
+        highs = window["High"].to_numpy(dtype=float)
+        closes = window["Close"].to_numpy(dtype=float)
+        swing_lows = _swing_points(lows, 2, 2, "low")
+        swing_highs = _swing_points(highs, 2, 2, "high")
+        if len(swing_lows) < 2 or len(swing_highs) < 2:
+            continue
+        bottom_index = int(np.argmin(lows))
+        if bottom_index < 2 or bottom_index > len(window) - 5:
+            continue
+        left_lows = [index for index in swing_lows if index <= bottom_index]
+        right_lows = [index for index in swing_lows if index > bottom_index]
+        if not left_lows or not right_lows:
+            continue
+        right_sequence = [lows[index] for index in right_lows[-3:]]
+        right_side_rising = len(right_sequence) >= 1 and right_sequence[-1] >= lows[bottom_index] * 1.03
+        post_bottom_highs = [index for index in swing_highs if index > bottom_index]
+        if len(post_bottom_highs) < 2:
+            continue
+        candidate_prices = np.array([highs[index] for index in post_bottom_highs[-6:]], dtype=float)
+        tolerance = max(weekly_atr * 0.35, float(np.median(candidate_prices)) * 0.01)
+        clusters = []
+        for value in sorted(candidate_prices):
+            matched = False
+            for cluster in clusters:
+                if abs(value - np.median(cluster)) <= tolerance:
+                    cluster.append(float(value))
+                    matched = True
+                    break
+            if not matched:
+                clusters.append([float(value)])
+        tested = [cluster for cluster in clusters if len(cluster) >= 2]
+        if not tested:
+            continue
+        profile = _volume_profile(window, bins=56)
+        if not profile:
+            continue
+        qualified = [cluster for cluster in tested if float(np.median(cluster)) >= profile["poc"]]
+        if not qualified:
+            continue
+        neck_cluster = max(qualified, key=lambda cluster: (float(np.median(cluster)), len(cluster)))
+        neck = float(np.median(neck_cluster))
+        neck_low = neck - tolerance * 0.5
+        neck_high = neck + tolerance * 0.5
+        breakout_indices = [
+            index for index in range(max(1, bottom_index + 1), len(window))
+            if closes[index] > neck_high + weekly_atr * 0.10 and closes[index - 1] <= neck_high
+        ]
+        breakout_index = breakout_indices[0] if breakout_indices else None
+        breakout = breakout_index is not None
+        breakout_age_weeks = len(window) - 1 - breakout_index if breakout else None
+        post_breakout_high = float(np.max(highs[breakout_index:])) if breakout else 0.0
+        correction_origin = None
+        target_reached = False
+        target_rejected = False
+        if breakout:
+            pre_base = weekly.iloc[max(0, len(weekly) - length - 26):len(weekly) - length + bottom_index + 1]
+            bearish_origins = []
+            if len(pre_base) >= 3:
+                for index in range(2, len(pre_base)):
+                    if pre_base["High"].iloc[index] < pre_base["Low"].iloc[index - 2]:
+                        bearish_origins.append(float(pre_base["Low"].iloc[index - 2]))
+            overhead = [level for level in bearish_origins if level > neck]
+            if overhead:
+                correction_origin = min(overhead)
+            else:
+                prior_highs = pre_base["High"].to_numpy(dtype=float) if len(pre_base) else np.array([])
+                overhead_highs = [float(level) for level in prior_highs if level > neck]
+                correction_origin = min(overhead_highs) if overhead_highs else None
+            if correction_origin:
+                target_reached = post_breakout_high >= correction_origin - weekly_atr * 0.20
+                target_rejected = target_reached and current_price <= correction_origin - weekly_atr * 0.50
+        near_neck = abs(current_price - neck) <= weekly_atr * 0.65
+        closes_above_neck = int((window["Close"].tail(3) >= neck_low).sum())
+        retest_in_progress = breakout and near_neck and current_price >= neck_low - weekly_atr * 0.25
+        retest_confirmed = retest_in_progress and closes_above_neck >= 2 and window["Close"].iloc[-1] >= window["Open"].iloc[-1]
+        failed_breakout = breakout and current_price < neck_low - weekly_atr * 0.35
+        second_leg_ready = retest_confirmed and target_rejected
+        rounding_score = 0
+        rounding_score += 25 if right_side_rising else 0
+        rounding_score += 20 if len(neck_cluster) >= 3 else 12
+        rounding_score += 20 if profile["poc"] >= lows[bottom_index] + (neck - lows[bottom_index]) * 0.45 else 0
+        left_duration = max(1, bottom_index)
+        right_duration = max(1, len(window) - 1 - bottom_index)
+        symmetry = min(left_duration, right_duration) / max(left_duration, right_duration)
+        rounding_score += 20 if symmetry >= 0.45 else 10 if symmetry >= 0.25 else 0
+        rounding_score += 15 if breakout else 0
+        if failed_breakout:
+            state = "FAILED_ROUNDING_BREAKOUT"
+        elif second_leg_ready:
+            state = "SECOND_LEG_REENTRY"
+        elif retest_confirmed:
+            state = "POC_NECK_RETEST_CONFIRMED"
+        elif retest_in_progress:
+            state = "POC_NECK_RETEST_IN_PROGRESS"
+        elif target_rejected:
+            state = "CORRECTION_ORIGIN_REJECTION"
+        elif target_reached:
+            state = "CORRECTION_ORIGIN_REACHED"
+        elif breakout:
+            state = "ROUNDING_NECK_BREAKOUT"
+        else:
+            state = "ROUNDING_ACCUMULATION"
+        result = {
+            "type": "ROUNDING_ACCUMULATION",
+            "state": state,
+            "start": window["datetime"].iloc[0].strftime("%Y-%m-%d"),
+            "weeks": length,
+            "bottom_date": window["datetime"].iloc[bottom_index].strftime("%Y-%m-%d"),
+            "base_low": round(float(lows[bottom_index]), 2),
+            "base_poc": profile["poc"],
+            "base_vah": profile["vah"],
+            "base_val": profile["val"],
+            "neck_center": round(neck, 2),
+            "neck_low": round(neck_low, 2),
+            "neck_high": round(neck_high, 2),
+            "neck_tests": len(neck_cluster),
+            "right_side_rising": right_side_rising,
+            "symmetry_score": round(symmetry * 100, 1),
+            "quality_score": min(100, rounding_score),
+            "breakout": breakout,
+            "breakout_date": window["datetime"].iloc[breakout_index].strftime("%Y-%m-%d") if breakout else None,
+            "breakout_age_weeks": breakout_age_weeks,
+            "post_breakout_high": round(post_breakout_high, 2) if breakout else None,
+            "correction_origin": round(correction_origin, 2) if correction_origin else None,
+            "target_reached": target_reached,
+            "target_rejected": target_rejected,
+            "retest_in_progress": retest_in_progress,
+            "retest_confirmed": retest_confirmed,
+            "second_leg_ready": second_leg_ready,
+            "failed_breakout": failed_breakout,
+            "invalidation_price": round(neck_low - weekly_atr * 0.35, 2),
+        }
+        if best is None or result["quality_score"] > best["quality_score"]:
+            best = result
+    return best
+
 def _compression(df, atr_series, poc60):
     price = _safe_float(df["Close"].iloc[-1])
     atr20 = _safe_float(atr_series.tail(20).mean())
@@ -451,6 +600,7 @@ def analyze_max_strategy(df):
     bottom = _bottom_state(data, profiles, compression, atr)
     structural = _structural_profiles(data, atr)
     active_base = _detect_active_base(data, atr)
+    structural_base = _detect_weekly_rounding_base(data, atr)
     qualified_profiles = [
         profile for profile in structural
         if profile.get("distance_atr", 99) <= 0.75
@@ -473,6 +623,18 @@ def analyze_max_strategy(df):
         triggers.append(active_base["state"])
     elif active_base and active_base.get("state") == "NECK_TEST":
         triggers.append("ACCUMULATION_NECK_TEST")
+    if structural_base:
+        structural_state = structural_base.get("state")
+        if structural_state in (
+            "ROUNDING_NECK_BREAKOUT",
+            "POC_NECK_RETEST_IN_PROGRESS",
+            "POC_NECK_RETEST_CONFIRMED",
+            "SECOND_LEG_REENTRY",
+            "CORRECTION_ORIGIN_REACHED",
+            "CORRECTION_ORIGIN_REJECTION",
+            "FAILED_ROUNDING_BREAKOUT",
+        ):
+            triggers.append(structural_state)
     if compression.get("state") == "COMPRESSED":
         triggers.append("COMPRESSION_READY")
     if profiles.get("poc20") and profiles["poc20"].get("migration") == "UP":
@@ -485,7 +647,11 @@ def analyze_max_strategy(df):
     strategy_rejections = []
     if not strategy_type:
         strategy_rejections.append("NO_QUALIFIED_LOCATION")
-    structural_trigger = any(trigger in triggers for trigger in ("MASTER_POC_RECLAIM", "MASTER_POC_FIRST_TEST", "MASTER_POC_CONTACT", "NECK_BREAKOUT", "NECK_RETEST"))
+    structural_trigger = any(trigger in triggers for trigger in (
+        "MASTER_POC_RECLAIM", "MASTER_POC_FIRST_TEST", "MASTER_POC_CONTACT",
+        "NECK_BREAKOUT", "NECK_RETEST", "ROUNDING_NECK_BREAKOUT",
+        "POC_NECK_RETEST_IN_PROGRESS", "POC_NECK_RETEST_CONFIRMED", "SECOND_LEG_REENTRY",
+    ))
     if not structural_trigger:
         strategy_rejections.append("NO_STRUCTURAL_TRIGGER")
     score = 0
@@ -495,16 +661,20 @@ def analyze_max_strategy(df):
     score += 20 if structural_event else 0
     score += 15 if active_base and active_base.get("state") == "NECK_RETEST" else 12 if active_base and active_base.get("state") == "NECK_BREAKOUT" else 5 if active_base and active_base.get("state") == "NECK_TEST" else 0
     score += 5 if active_base and active_base.get("quality_score", 0) >= 60 else 0
+    score += 15 if structural_base and structural_base.get("state") == "SECOND_LEG_REENTRY" else 12 if structural_base and structural_base.get("state") == "POC_NECK_RETEST_CONFIRMED" else 8 if structural_base and structural_base.get("state") in ("ROUNDING_NECK_BREAKOUT", "POC_NECK_RETEST_IN_PROGRESS") else 0
     data_eligible = not data_rejections
     strategy_eligible = data_eligible and not strategy_rejections
     watch_ready = strategy_eligible and score >= 45
-    trade_trigger = any(trigger in triggers for trigger in ("MASTER_POC_FIRST_TEST", "MASTER_POC_RECLAIM", "NECK_BREAKOUT", "NECK_RETEST"))
+    trade_trigger = any(trigger in triggers for trigger in (
+        "MASTER_POC_FIRST_TEST", "MASTER_POC_RECLAIM", "NECK_BREAKOUT", "NECK_RETEST",
+        "ROUNDING_NECK_BREAKOUT", "POC_NECK_RETEST_CONFIRMED", "SECOND_LEG_REENTRY",
+    ))
     base_valid = active_base is None or active_base.get("state") != "BASE_INVALIDATED"
     trade_ready = watch_ready and trade_trigger and base_valid
     rejection_reasons = data_rejections + strategy_rejections
     return _native({
         "status": "OK",
-        "version": "max_structure_v1_2",
+        "version": "max_structure_v1_3",
         "bars_analyzed": len(data),
         "price": round(price, 2),
         "atr14": round(atr, 4),
@@ -517,6 +687,7 @@ def analyze_max_strategy(df):
         "active_structural_event": structural_event,
         "strategy_type": strategy_type,
         "active_base": active_base,
+        "structural_base": structural_base,
         "compression": compression,
         "bottom": bottom,
         "triggers": triggers,
