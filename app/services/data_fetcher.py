@@ -7,6 +7,7 @@ from app.db.mongodb import get_db
 from app.config import settings
 import traceback
 import time
+from app.services.max_strategy import analyze_max_strategy
 
 SECTOR_MAP = {
     "XLK": "Technology", "XLF": "Financials", "XLV": "Health Care",
@@ -677,6 +678,7 @@ def analyze_stock(ticker, df, sector_code, sector_scores, prev_poc_position=None
 
     # 🆕 POC SHIFT (metodo Rea) — prev_poc_position letto dal DB (persistente)
     poc_shift = _detect_poc_shift(ticker, price, poc, prev_position=prev_poc_position)
+    max_strategy = analyze_max_strategy(df)
 
     patterns = detect_candlestick_patterns(df)
     fvgs = detect_fvg(df); wyckoff = detect_wyckoff_phase(df)
@@ -714,6 +716,7 @@ def analyze_stock(ticker, df, sector_code, sector_scores, prev_poc_position=None
         "candlestick_patterns": patterns_list, "fvg": fvgs, "wyckoff": wyckoff,
         "accumulation": accumulation, "mtf": mtf, "price_history": price_history, "pattern_bonus": pattern_bonus,
         "poc_shift": poc_shift,
+        "max_strategy": max_strategy,
         "high_52w": high_52w, "low_52w": low_52w, "pct_from_high": pct_from_high,
         "pct_from_low": pct_from_low, "range_position": range_position,
         "updated_at": datetime.utcnow(),
