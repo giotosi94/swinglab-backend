@@ -115,6 +115,45 @@ def _sector_rotation_at(ticker_bars, sector_etf_map, date_idx_map, date):
     return signals
 
 
+def _sector_intelligence_at(ticker_bars, sector_etf_map, date_idx_map, date, days=63):
+    spy_bars = ticker_bars.get("SPY", [])
+    spy_idx = date_idx_map.get("SPY", {}).get(date)
+    if spy_idx is None or spy_idx < 1:
+        return {}
+    spy_by_date = {bar["date"]: bar["c"] for bar in spy_bars[:spy_idx + 1] if bar.get("c")}
+    dates_window = sorted(spy_by_date.keys())[-days:]
+    rows = []
+    for sector, etf in sector_etf_map.items():
+        bars = ticker_bars.get(etf, [])
+        idx = date_idx_map.get(etf, {}).get(date)
+        if idx is None or idx < 1:
+            continue
+        sector_by_date = {bar["date"]: bar["c"] for bar in bars[:idx + 1] if bar.get("c")}
+        dates = [item for item in dates_window if item in sector_by_date and spy_by_date.get(item, 0) > 0]
+        if len(dates) < 2:
+            continue
+        first_ratio = sector_by_date[dates[0]] / spy_by_date[dates[0]]
+        if first_ratio <= 0:
+            continue
+        values = [(sector_by_date[item] / spy_by_date[item]) / first_ratio * 100 for item in dates]
+        rows.append({"code": sector, "relative_return_pct": values[-1] - 100, "acceleration_20d": values[-1] - values[max(0, len(values) - 21)]})
+    rows.sort(key=lambda item: item["relative_return_pct"], reverse=True)
+    total = len(rows)
+    result = {}
+    for index, row in enumerate(rows):
+        rank = index + 1
+        adjustment = 0.0
+        if rank <= 3 and row["relative_return_pct"] > 0:
+            adjustment += 5.0
+        elif rank >= max(7, total - 4) and row["relative_return_pct"] < 0:
+            adjustment -= 3.0
+        if row["acceleration_20d"] > 0:
+            adjustment += 2.0
+        elif row["acceleration_20d"] <= -3:
+            adjustment -= 2.0
+        result[row["code"]] = {"rank": rank, "relative_return_pct": round(row["relative_return_pct"], 2), "acceleration_20d": round(row["acceleration_20d"], 2), "adjustment": round(max(-5.0, min(7.0, adjustment)), 1)}
+    return result
+
 def _calc_rsi(prices, period=14):
     if len(prices) < period + 1:
         return 50.0
@@ -549,6 +588,7 @@ async def run_backtest(
     use_sector_bottom: bool = False,
     use_crash_deploy: bool = False,
     use_rotation: bool = False,
+    use_sector_intelligence: bool = False,
     t1_size_pct: float = 30.0,
     t2_size_pct: float = 30.0,
     t3_size_pct: float = 25.0,
@@ -625,6 +665,10 @@ async def run_backtest(
     sector_etf_map = {s: s for s in SECTOR_BOTTOM_CFG if s in ticker_bars}
     rotation_cache = {}
     rotation_hits = {}
+    sector_intelligence_cache = {}
+    sector_intelligence_entries = {}
+    sector_intelligence_promoted = 0
+    sector_intelligence_penalized_out = 0
     backtest_date_index = {date: i for i, date in enumerate(backtest_dates)}
 
     # 🆕 Crash Deploy: SPY closes indicizzate per data
@@ -888,6 +932,11 @@ async def run_backtest(
                 if sig in ("EXPLOSIVE", "ROTATING_IN"):
                     rotation_hits[sec] = rotation_hits.get(sec, 0) + 1
 
+        sector_intelligence = {}
+        if use_sector_intelligence:
+            if date not in sector_intelligence_cache:
+                sector_intelligence_cache[date] = _sector_intelligence_at(ticker_bars, sector_etf_map, date_idx_map, date, 63)
+            sector_intelligence = sector_intelligence_cache[date]
         if len(positions) < max_positions:
             candidates = []
             for ticker, bars in ticker_bars.items():
@@ -919,14 +968,20 @@ async def run_backtest(
                     elif rsig == "ROTATING_IN":
                         conf += 4
 
+                confluence_before_sector = conf
+                sector_signal = sector_intelligence.get(sec, {})
+                sector_adjustment = float(sector_signal.get("adjustment", 0) or 0) if use_sector_intelligence else 0.0
+                conf = max(0, min(100, conf + sector_adjustment))
+                if use_sector_intelligence and confluence_before_sector < min_confluence <= conf:
+                    sector_intelligence_promoted += 1
+                if use_sector_intelligence and confluence_before_sector >= min_confluence > conf:
+                    sector_intelligence_penalized_out += 1
                 if conf >= min_confluence:
                     entry_price = bars_slice[-1]["c"]
-                    candidates.append((ticker, conf, entry_price, target_price, stop_price, setup, sec_weight))
-
+                    candidates.append((ticker, conf, entry_price, target_price, stop_price, setup, sec_weight, confluence_before_sector, sector_adjustment, sector_signal))
             candidates.sort(key=lambda x: x[1], reverse=True)
             slots = max_positions - len(positions)
-
-            for ticker, conf, entry_price, target_price, stop_price, setup, sec_weight in candidates[:slots]:
+            for ticker, conf, entry_price, target_price, stop_price, setup, sec_weight, confluence_before_sector, sector_adjustment, sector_signal in candidates[:slots]:
                 size_mult = 1.0 + min(0.5, sec_weight / 46) if sec_weight > 0 else 1.0
                 regime_multiplier = 1.0
                 regime_name = "FIXED"
@@ -991,6 +1046,19 @@ async def run_backtest(
                     "dps_multiplier": dps_multiplier,
                     "kelly_multiplier": kelly_multiplier,
                     "risk_reward": risk_reward,
+                    "confluence_before_sector": confluence_before_sector,
+                    "sector_adjustment": sector_adjustment,
+                    "sector_rank": sector_signal.get("rank"),
+                    "sector_relative_return_pct": sector_signal.get("relative_return_pct", 0),
+                    "sector_acceleration_20d": sector_signal.get("acceleration_20d", 0),
+                }
+                sector_intelligence_entries[(ticker, date)] = {
+                    "confluence_before_sector": confluence_before_sector,
+                    "sector_adjustment": sector_adjustment,
+                    "sector_rank": sector_signal.get("rank"),
+                    "sector_relative_return_pct": sector_signal.get("relative_return_pct", 0),
+                    "sector_acceleration_20d": sector_signal.get("acceleration_20d", 0),
+                    "promoted": confluence_before_sector < min_confluence <= conf,
                 }
 
         # ===== 3. EQUITY =====
@@ -1055,6 +1123,21 @@ async def run_backtest(
 
     exit_record_metrics = _calc_metrics(equity_curve, trades)
     position_trades = _aggregate_positions(trades)
+    for position in position_trades:
+        position.update(sector_intelligence_entries.get((position.get("ticker"), position.get("entry_date")), {}))
+    promoted_positions = [position for position in position_trades if position.get("promoted")]
+    promoted_wins = [position for position in promoted_positions if position.get("pnl_dollar", 0) > 0]
+    promoted_profit = sum(position.get("pnl_dollar", 0) for position in promoted_wins)
+    promoted_loss = abs(sum(position.get("pnl_dollar", 0) for position in promoted_positions if position.get("pnl_dollar", 0) <= 0))
+    sector_intelligence_stats = {
+        "enabled": use_sector_intelligence,
+        "signals_promoted": sector_intelligence_promoted,
+        "signals_penalized_out": sector_intelligence_penalized_out,
+        "promoted_positions": len(promoted_positions),
+        "promoted_win_rate": round(len(promoted_wins) / len(promoted_positions) * 100, 1) if promoted_positions else 0,
+        "promoted_profit_factor": round(promoted_profit / promoted_loss, 2) if promoted_loss > 0 else (999 if promoted_profit > 0 else 0),
+        "promoted_pnl_dollar": round(sum(position.get("pnl_dollar", 0) for position in promoted_positions), 2),
+    }
     position_metrics = _calc_position_metrics(position_trades)
     apm_position_stats = _calc_apm_position_stats(position_trades)
     metrics = {
@@ -1155,6 +1238,7 @@ async def run_backtest(
             "use_sector_bottom": use_sector_bottom,
             "use_crash_deploy": use_crash_deploy,
             "use_rotation": use_rotation,
+            "use_sector_intelligence": use_sector_intelligence,
             "use_dynamic_sizing": use_dynamic_sizing,
             "use_apm_exit_proxy": use_apm_exit_proxy,
             "risk_pct_per_trade": risk_pct_per_trade,
@@ -1190,6 +1274,7 @@ async def run_backtest(
             "apm_exit_proxy_events": apm_exit_proxy_events,
             **apm_position_stats,
         },
+        "sector_intelligence_stats": sector_intelligence_stats,
         "sizing_stats": {
             "enabled": use_dynamic_sizing,
             "avg_effective_size_pct": round(float(np.mean(sizing_samples)), 2) if sizing_samples else position_size_pct,
