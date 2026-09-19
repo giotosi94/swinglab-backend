@@ -3,6 +3,18 @@ import numpy as np
 import pandas as pd
 
 
+def _native(value):
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {key: _native(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_native(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_native(item) for item in value)
+    return value
+
+
 def _safe_float(value, default=0.0):
     try:
         number = float(value)
@@ -253,7 +265,7 @@ def _detect_active_base(df, atr):
         if not profile:
             continue
         low_sequence = [lows[index] for index in swing_lows[-4:]]
-        higher_lows = len(low_sequence) >= 2 and low_sequence[-1] >= low_sequence[0] * 0.98
+        higher_lows = bool(len(low_sequence) >= 2 and low_sequence[-1] >= low_sequence[0] * 0.98)
         current = float(window["Close"].iloc[-1])
         previous = float(window["Close"].iloc[-2])
         neck_low = neck - tolerance * 0.5
@@ -446,7 +458,7 @@ def analyze_max_strategy(df):
     score += 15 if active_base and active_base.get("state") == "NECK_RETEST" else 12 if active_base and active_base.get("state") == "NECK_BREAKOUT" else 5 if active_base and active_base.get("state") == "NECK_TEST" else 0
     score += 5 if active_base and active_base.get("quality_score", 0) >= 60 else 0
     live_eligible = not rejection_reasons
-    return {
+    return _native({
         "status": "OK",
         "version": "max_structure_v1_1",
         "bars_analyzed": len(data),
@@ -466,4 +478,4 @@ def analyze_max_strategy(df):
         "watch_ready": live_eligible and score >= 45,
         "live_eligible": live_eligible,
         "live_entry_enabled": False,
-    }
+    })
