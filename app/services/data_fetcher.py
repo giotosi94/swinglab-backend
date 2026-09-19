@@ -670,7 +670,7 @@ def analyze_stock(ticker, df, sector_code, sector_scores, prev_poc_position=None
     ema20 = round(float(calc_ema(close, 20)), 2)
     ema50 = round(float(calc_ema(close, 50)), 2)
     poc_result = calc_volume_profile(high, low, volume)
-    high_52w = round(float(high.max()), 2); low_52w = round(float(low.min()), 2)
+    high_52w = round(float(high.tail(252).max()), 2); low_52w = round(float(low.tail(252).min()), 2)
     pct_from_high = round(((price - high_52w) / high_52w) * 100, 2) if high_52w > 0 else 0
     pct_from_low = round(((price - low_52w) / low_52w) * 100, 2) if low_52w > 0 else 0
     range_position = round(((price - low_52w) / (high_52w - low_52w)) * 100, 1) if (high_52w - low_52w) > 0 else 50
