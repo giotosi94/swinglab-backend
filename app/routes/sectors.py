@@ -69,28 +69,40 @@ async def get_sector_relative_strength(days: int = Query(60, ge=5, le=750)):
 
     assets = await db.assets.find(
         {"sector_code": {"$in": SECTOR_CODES}},
-        {"ticker": 1, "sector_code": 1, "setup_score": 1, "setup_type": 1, "confluence": 1, "rsi": 1, "price": 1, "mtf": 1, "poc_shift": 1},
+        {"ticker": 1, "sector_code": 1, "setup_score": 1, "setup_type": 1, "confluence": 1, "rsi": 1, "price": 1, "mtf": 1, "poc_shift": 1, "alpha_snapshot": 1},
     ).to_list(400)
 
     best_stocks = {}
     for code in SECTOR_CODES:
         candidates = [asset for asset in assets if asset.get("sector_code") == code]
         candidates.sort(
-            key=lambda asset: float(asset.get("confluence", asset.get("setup_score", 0)) or 0),
+            key=lambda asset: float((asset.get("alpha_snapshot") or {}).get("confluence", asset.get("confluence", asset.get("setup_score", 0))) or 0),
             reverse=True,
         )
         best_stocks[code] = []
         for asset in candidates[:5]:
+            alpha = asset.get("alpha_snapshot") or {}
+            final_confluence = float(alpha.get("confluence", asset.get("confluence", asset.get("setup_score", 0))) or 0)
+            threshold = float(alpha.get("min_confluence", 48) or 48)
+            status = alpha.get("status") or ("CANDIDATE" if final_confluence >= threshold else "NO_ALPHA_SNAPSHOT")
             best_stocks[code].append({
                 "ticker": asset.get("ticker"),
-                "score": round(float(asset.get("confluence", asset.get("setup_score", 0)) or 0), 1),
-                "setup_type": asset.get("setup_type", "neutral"),
-                "rsi": round(float(asset.get("rsi", 0) or 0), 1),
+                "score": round(float(asset.get("setup_score", 0) or 0), 1),
+                "alpha_confluence": round(final_confluence, 1),
+                "confluence_before_sector": round(float(alpha.get("confluence_before_sector", final_confluence) or 0), 1),
+                "sector_adjustment": round(float(alpha.get("sector_adjustment", 0) or 0), 1),
+                "sector_rank": alpha.get("sector_rank"),
+                "sector_reason": alpha.get("sector_intelligence_reason", "Snapshot Alpha non ancora disponibile"),
+                "risk_reward": round(float(alpha.get("risk_reward", 0) or 0), 2),
+                "status": status,
+                "threshold": threshold,
+                "setup_type": alpha.get("setup_type", asset.get("setup_type", "neutral")),
+                "rsi": round(float(alpha.get("rsi", asset.get("rsi", 0)) or 0), 1),
                 "price": round(float(asset.get("price", 0) or 0), 2),
-                "weekly_trend": (asset.get("mtf") or {}).get("weekly_trend", "UNKNOWN"),
+                "weekly_trend": alpha.get("weekly_trend", (asset.get("mtf") or {}).get("weekly_trend", "UNKNOWN")),
                 "poc_shift": bool((asset.get("poc_shift") or {}).get("shifted_bull", False)),
+                "alpha_updated_at": alpha.get("updated_at"),
             })
-
     return {
         "benchmark": "SPY",
         "requested_days": days,
