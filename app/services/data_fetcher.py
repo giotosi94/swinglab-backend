@@ -786,6 +786,102 @@ def analyze_stock(ticker, df, sector_code, sector_scores, prev_poc_position=None
     }
 
 
+async def save_max_strategy_validation_snapshot(db, asset_doc, df):
+    max_strategy = (asset_doc or {}).get("max_strategy") or {}
+    plan = max_strategy.get("entry_plan") or {}
+    status = plan.get("status")
+    if status not in ("ARMED", "TRIGGERED", "CONFIRMED_4H", "CONFIRMED_DAILY", "WAIT_RETEST"):
+        return None
+    ticker = asset_doc.get("ticker")
+    if not ticker or df is None or len(df) == 0:
+        return None
+    signal_date = df["datetime"].iloc[-1].strftime("%Y-%m-%d")
+    trigger_price = plan.get("trigger_price")
+    setup_key = f"{ticker}:{signal_date}:{status}:{trigger_price}"
+    snapshot = {
+        "setup_key": setup_key,
+        "ticker": ticker,
+        "signal_date": signal_date,
+        "strategy_version": max_strategy.get("version"),
+        "status": status,
+        "order_action": plan.get("order_action"),
+        "execution_mode": plan.get("execution_mode"),
+        "signal_price": asset_doc.get("price"),
+        "trigger_price": trigger_price,
+        "maximum_entry_price": plan.get("maximum_entry_price"),
+        "invalidation_price": plan.get("invalidation_price"),
+        "weekly_plan_qualified": plan.get("weekly_plan_qualified"),
+        "blocking_phase": plan.get("blocking_phase"),
+        "market_phase": (max_strategy.get("market_phase") or {}).get("phase"),
+        "strategy_type": max_strategy.get("strategy_type"),
+        "max_score": max_strategy.get("max_score"),
+        "weekly_context": max_strategy.get("weekly_context"),
+        "daily_confirmation": max_strategy.get("daily_confirmation"),
+        "execution_4h": max_strategy.get("execution_4h"),
+        "structural_base": max_strategy.get("structural_base"),
+        "active_base": max_strategy.get("active_base"),
+        "outcomes": {
+            "bars_observed": 0,
+            "mfe_pct": 0.0,
+            "mae_pct": 0.0,
+            "trigger_reached": False,
+            "maximum_entry_exceeded": False,
+            "invalidation_reached": False,
+            "return_5d_pct": None,
+            "return_10d_pct": None,
+            "return_20d_pct": None,
+        },
+        "created_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow(),
+    }
+    await db.max_strategy_signals.update_one(
+        {"setup_key": setup_key},
+        {"$setOnInsert": snapshot, "$set": {"last_seen_at": datetime.utcnow(), "latest_status": status}},
+        upsert=True,
+    )
+    return setup_key
+
+
+async def update_max_strategy_validation_outcomes(db, ticker, df):
+    if df is None or len(df) == 0:
+        return 0
+    signals = await db.max_strategy_signals.find({"ticker": ticker}).to_list(200)
+    updated = 0
+    for signal in signals:
+        signal_date = signal.get("signal_date")
+        signal_price = signal.get("signal_price")
+        if not signal_date or not signal_price or signal_price <= 0:
+            continue
+        future = df[df["datetime"] > pd.to_datetime(signal_date)].copy()
+        if len(future) == 0:
+            continue
+        bars_observed = len(future)
+        highest = float(future["High"].max())
+        lowest = float(future["Low"].min())
+        mfe_pct = (highest - signal_price) / signal_price * 100
+        mae_pct = (lowest - signal_price) / signal_price * 100
+        trigger = signal.get("trigger_price")
+        maximum_entry = signal.get("maximum_entry_price")
+        invalidation = signal.get("invalidation_price")
+        outcomes = {
+            "bars_observed": bars_observed,
+            "mfe_pct": round(mfe_pct, 2),
+            "mae_pct": round(mae_pct, 2),
+            "trigger_reached": bool(trigger and highest >= trigger),
+            "maximum_entry_exceeded": bool(maximum_entry and highest > maximum_entry),
+            "invalidation_reached": bool(invalidation and lowest <= invalidation),
+            "return_5d_pct": round((float(future["Close"].iloc[4]) - signal_price) / signal_price * 100, 2) if bars_observed >= 5 else None,
+            "return_10d_pct": round((float(future["Close"].iloc[9]) - signal_price) / signal_price * 100, 2) if bars_observed >= 10 else None,
+            "return_20d_pct": round((float(future["Close"].iloc[19]) - signal_price) / signal_price * 100, 2) if bars_observed >= 20 else None,
+        }
+        await db.max_strategy_signals.update_one(
+            {"_id": signal["_id"]},
+            {"$set": {"outcomes": outcomes, "updated_at": datetime.utcnow()}},
+        )
+        updated += 1
+    return updated
+
+
 # ============================================
 # SECTORS
 # ============================================
@@ -1018,6 +1114,8 @@ async def fetch_and_analyze_stocks(force=False):
                 asset_doc = analyze_stock(ticker, df, sector_code, sector_scores, prev_poc_position=prev_pos, df_4h=bars_4h_map.get(ticker))
                 if asset_doc:
                     await db.assets.update_one({"ticker": ticker}, {"$set": asset_doc}, upsert=True)
+                    await save_max_strategy_validation_snapshot(db, asset_doc, df)
+                    await update_max_strategy_validation_outcomes(db, ticker, df)
                     results.append(asset_doc)
                     success += 1
                 else:
