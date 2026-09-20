@@ -636,6 +636,69 @@ def _bars_to_df(bars):
     return df
 
 
+async def fetch_4h_bars_from_api(client, symbol, limit=240):
+    end = datetime.utcnow() - timedelta(minutes=20)
+    start = end - timedelta(days=180)
+    url = f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/bars"
+    params = {
+        "timeframe": "4Hour",
+        "start": start.strftime("%Y-%m-%dT00:00:00Z"),
+        "end": end.strftime("%Y-%m-%dT23:59:59Z"),
+        "limit": min(1000, limit),
+        "feed": "iex",
+        "adjustment": "split",
+        "sort": "desc",
+    }
+    try:
+        response = await client.get(url, headers=ALPACA_HEADERS, params=params)
+        if response.status_code != 200:
+            return []
+        bars = response.json().get("bars", [])
+        bars.reverse()
+        return [{
+            "datetime": bar.get("t"),
+            "o": bar.get("o"), "h": bar.get("h"), "l": bar.get("l"),
+            "c": bar.get("c"), "v": bar.get("v", 0),
+        } for bar in bars][-limit:]
+    except Exception:
+        return []
+
+
+async def get_or_fetch_4h_bars(client, db, symbol, limit=240):
+    doc = await db.stock_bars_4h.find_one({"ticker": symbol})
+    if doc and doc.get("bars"):
+        updated = doc.get("updated_at")
+        if updated and (datetime.utcnow() - updated).total_seconds() < 4 * 3600:
+            return _bars_4h_to_df(doc["bars"])
+    bars = await fetch_4h_bars_from_api(client, symbol, limit)
+    if bars:
+        await db.stock_bars_4h.update_one(
+            {"ticker": symbol},
+            {"$set": {"ticker": symbol, "timeframe": "4H", "bars": bars, "updated_at": datetime.utcnow()}},
+            upsert=True,
+        )
+        return _bars_4h_to_df(bars)
+    return _bars_4h_to_df(doc.get("bars", [])) if doc else None
+
+
+def _bars_4h_to_df(bars):
+    if not bars or len(bars) < 20:
+        return None
+    frame = pd.DataFrame(bars).rename(columns={"datetime": "datetime", "o": "Open", "h": "High", "l": "Low", "c": "Close", "v": "Volume"})
+    frame["datetime"] = pd.to_datetime(frame["datetime"], utc=True).dt.tz_convert(None)
+    return frame.dropna(subset=["Open", "High", "Low", "Close", "Volume"]).sort_values("datetime").reset_index(drop=True)
+
+
+async def get_or_fetch_4h_bars_batch(client, db, symbols, max_concurrent=6):
+    semaphore = asyncio.Semaphore(max_concurrent)
+    results = {}
+    async def fetch_one(symbol):
+        async with semaphore:
+            results[symbol] = await get_or_fetch_4h_bars(client, db, symbol)
+    await asyncio.gather(*[fetch_one(symbol) for symbol in symbols])
+    return results
+
+
 async def get_or_fetch_bars_batch(client, db, symbols, max_concurrent=10):
     semaphore = asyncio.Semaphore(max_concurrent)
     results = {}
@@ -657,7 +720,7 @@ async def fetch_bars(client, symbol):
 # STOCK ANALYSIS
 # ============================================
 
-def analyze_stock(ticker, df, sector_code, sector_scores, prev_poc_position=None):
+def analyze_stock(ticker, df, sector_code, sector_scores, prev_poc_position=None, df_4h=None):
     if df is None or len(df) < 20:
         return None
     close = df["Close"]; volume = df["Volume"]; high = df["High"]; low = df["Low"]
@@ -678,7 +741,7 @@ def analyze_stock(ticker, df, sector_code, sector_scores, prev_poc_position=None
 
     # 🆕 POC SHIFT (metodo Rea) — prev_poc_position letto dal DB (persistente)
     poc_shift = _detect_poc_shift(ticker, price, poc, prev_position=prev_poc_position)
-    max_strategy = analyze_max_strategy(df)
+    max_strategy = analyze_max_strategy(df, bars_4h=df_4h)
 
     patterns = detect_candlestick_patterns(df)
     fvgs = detect_fvg(df); wyckoff = detect_wyckoff_phase(df)
@@ -943,6 +1006,7 @@ async def fetch_and_analyze_stocks(force=False):
             print(f"\n  Batch {batch_idx}/{total_batches} ({len(batch)} stocks)")
 
             bars_map = await get_or_fetch_bars_batch(client, db, batch, max_concurrent=10)
+            bars_4h_map = await get_or_fetch_4h_bars_batch(client, db, batch, max_concurrent=6)
 
             success = 0; skipped = 0
             for ticker in batch:
@@ -951,7 +1015,7 @@ async def fetch_and_analyze_stocks(force=False):
                 # 🆕 Leggi la posizione POC precedente dal DB (per lo shift persistente)
                 prev_doc = await db.assets.find_one({"ticker": ticker}, {"poc_shift": 1})
                 prev_pos = (prev_doc or {}).get("poc_shift", {}).get("poc_position")
-                asset_doc = analyze_stock(ticker, df, sector_code, sector_scores, prev_poc_position=prev_pos)
+                asset_doc = analyze_stock(ticker, df, sector_code, sector_scores, prev_poc_position=prev_pos, df_4h=bars_4h_map.get(ticker))
                 if asset_doc:
                     await db.assets.update_one({"ticker": ticker}, {"$set": asset_doc}, upsert=True)
                     results.append(asset_doc)
