@@ -678,6 +678,73 @@ class AlphaStrategist(BaseAgent):
         candidates.sort(key=lambda x: x["confluence"], reverse=True)
         return candidates
 
+    def _build_max_strategy_shadow(self, assets: list, open_tickers: list, market_ctx: dict) -> dict:
+        shadow_candidates = []
+        status_counts = {}
+        action_counts = {"WOULD_ARM": 0, "WOULD_BUY": 0, "WOULD_WAIT": 0, "WOULD_REJECT": 0}
+        regime = market_ctx.get("market_regime", "NEUTRAL")
+        for asset in assets:
+            ticker = asset.get("ticker", "")
+            max_strategy = asset.get("max_strategy") or {}
+            plan = max_strategy.get("entry_plan") or {}
+            phase = max_strategy.get("market_phase") or {}
+            status = plan.get("status", "DETECTED")
+            status_counts[status] = status_counts.get(status, 0) + 1
+            blocking = bool(plan.get("blocking_phase"))
+            eligible = bool(max_strategy.get("strategy_eligible"))
+            trade_ready = bool(max_strategy.get("trade_ready"))
+            weekly_qualified = bool(plan.get("weekly_plan_qualified"))
+            order_action = plan.get("order_action", "WAIT")
+            reasons = list(max_strategy.get("rejection_reasons") or [])
+            if ticker in open_tickers:
+                shadow_action = "WOULD_REJECT"
+                reasons.append("ALREADY_OPEN")
+            elif blocking or not eligible or not weekly_qualified:
+                shadow_action = "WOULD_REJECT"
+            elif order_action == "BUY_ALLOWED" and trade_ready:
+                shadow_action = "WOULD_BUY"
+            elif order_action == "PLACE_CONDITIONAL_BUY" and status == "ARMED":
+                shadow_action = "WOULD_ARM"
+            else:
+                shadow_action = "WOULD_WAIT"
+            if regime == "CRASH" and shadow_action in ("WOULD_ARM", "WOULD_BUY"):
+                shadow_action = "WOULD_REJECT"
+                reasons.append("CRASH_REGIME_BLOCK")
+            action_counts[shadow_action] += 1
+            if shadow_action == "WOULD_WAIT" and status == "DETECTED":
+                continue
+            shadow_candidates.append({
+                "ticker": ticker,
+                "shadow_action": shadow_action,
+                "plan_status": status,
+                "order_action": order_action,
+                "execution_mode": plan.get("execution_mode"),
+                "market_phase": phase.get("phase"),
+                "strategy_type": max_strategy.get("strategy_type"),
+                "max_score": max_strategy.get("max_score", 0),
+                "signal_price": asset.get("price"),
+                "trigger_price": plan.get("trigger_price"),
+                "maximum_entry_price": plan.get("maximum_entry_price"),
+                "invalidation_price": plan.get("invalidation_price"),
+                "weekly_qualified": weekly_qualified,
+                "strategy_eligible": eligible,
+                "trade_ready": trade_ready,
+                "blocking_phase": blocking,
+                "rejection_reasons": list(dict.fromkeys(reasons)),
+                "live_execution_enabled": False,
+            })
+        priority = {"WOULD_BUY": 0, "WOULD_ARM": 1, "WOULD_WAIT": 2, "WOULD_REJECT": 3}
+        shadow_candidates.sort(key=lambda item: (priority.get(item["shadow_action"], 9), -float(item.get("max_score") or 0)))
+        return {
+            "mode": "SHADOW",
+            "live_execution_enabled": False,
+            "strategy_version": "max_structure_v1_5_2",
+            "regime": regime,
+            "action_counts": action_counts,
+            "status_counts": status_counts,
+            "candidates": shadow_candidates[:100],
+        }
+
     async def analyze(self, context: dict) -> dict:
         db = get_db()
         params = await self.get_params()
@@ -702,6 +769,12 @@ class AlphaStrategist(BaseAgent):
 
         assets_map = {a["ticker"]: a for a in assets}
         open_tickers = [p.get("symbol") for p in positions]
+        max_strategy_shadow = self._build_max_strategy_shadow(assets, open_tickers, market_ctx)
+        await db.agent_state.update_one(
+            {"_id": "max_strategy_shadow"},
+            {"$set": {**max_strategy_shadow, "updated_at": datetime.utcnow()}},
+            upsert=True,
+        )
 
         # Conta settori delle posizioni aperte
         open_sectors = []
@@ -950,6 +1023,13 @@ class AlphaStrategist(BaseAgent):
             # 🆕 v2.0 — ML stats
             "ml_data_loaded": len(ml_map),
             # 🆕 Sentiment stats
+            "max_strategy_shadow": {
+                "mode": max_strategy_shadow["mode"],
+                "live_execution_enabled": False,
+                "action_counts": max_strategy_shadow["action_counts"],
+                "status_counts": max_strategy_shadow["status_counts"],
+                "visible_candidates": len(max_strategy_shadow["candidates"]),
+            },
             "sentiment_summary": {
                 c["ticker"]: {
                     "sentiment": c.get("sentiment", "N/A"),
@@ -982,6 +1062,7 @@ class AlphaStrategist(BaseAgent):
             "buy_candidates": top_candidates,
             "sell_signals": sell_signals,
             "summary": summary,
+            "max_strategy_shadow": max_strategy_shadow,
         }
 
     async def learn(self) -> dict:
