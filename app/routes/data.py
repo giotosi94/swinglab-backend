@@ -181,6 +181,27 @@ async def list_all_tickers():
         "tickers": tickers,
     }
 
+@router.get("/max-strategy-shadow")
+async def get_max_strategy_shadow():
+    db = get_db()
+    shadow = await db.agent_state.find_one({"_id": "max_strategy_shadow"})
+    if not shadow:
+        return {
+            "mode": "SHADOW",
+            "live_execution_enabled": False,
+            "strategy_version": "max_structure_v1_5_2",
+            "action_counts": {},
+            "status_counts": {},
+            "candidates": [],
+            "message": "Shadow state not initialized",
+        }
+    shadow["_id"] = str(shadow["_id"])
+    value = shadow.get("updated_at")
+    if value and hasattr(value, "isoformat"):
+        shadow["updated_at"] = value.isoformat()
+    return shadow
+
+
 @router.get("/max-strategy-validation")
 async def get_max_strategy_validation(limit: int = Query(50, ge=1, le=500), ticker: str = None):
     db = get_db()
