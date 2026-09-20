@@ -856,7 +856,134 @@ def _market_phase_gates_v141(df, profiles, bottom, structural_profiles, active_b
         "selling_volume_contracting": selling_volume_contracting,
     }
 
-def analyze_max_strategy(df):
+def _fit_descending_trendline(df, timeframe, atr, lookback):
+    if df is None or len(df) < 30:
+        return None
+    window = df.tail(min(lookback, len(df))).reset_index(drop=True)
+    highs = window["High"].to_numpy(dtype=float)
+    swing_highs = _swing_points(highs, 2, 2, "high")
+    if len(swing_highs) < 2:
+        return None
+    candidates = swing_highs[-6:]
+    pairs = []
+    for i in range(len(candidates) - 1):
+        for j in range(i + 1, len(candidates)):
+            left, right = candidates[i], candidates[j]
+            if right - left < 3 or highs[right] >= highs[left] * 0.995:
+                continue
+            slope = (highs[right] - highs[left]) / (right - left)
+            intercept = highs[left] - slope * left
+            residuals = []
+            touches = 0
+            for index in candidates:
+                line = intercept + slope * index
+                distance = abs(highs[index] - line)
+                residuals.append(distance)
+                if distance <= atr * 0.50:
+                    touches += 1
+            pairs.append((touches, -float(np.mean(residuals)), slope, intercept, left, right))
+    if not pairs:
+        return None
+    touches, _, slope, intercept, left, right = max(pairs, key=lambda item: (item[0], item[1]))
+    current_index = len(window) - 1
+    current_level = intercept + slope * current_index
+    previous_level = intercept + slope * (current_index - 1)
+    close = _safe_float(window["Close"].iloc[-1])
+    previous_close = _safe_float(window["Close"].iloc[-2])
+    buffer = max(atr * 0.15, current_level * 0.003)
+    breakout = close > current_level + buffer and previous_close <= previous_level + buffer
+    distance_atr = (current_level - close) / atr if atr > 0 else 99.0
+    return {
+        "timeframe": timeframe,
+        "state": "BREAKOUT_CONFIRMED" if breakout else "BREAKOUT_PENDING" if distance_atr <= 0.75 else "ACTIVE",
+        "current_level": round(current_level, 4),
+        "trigger_price": round(current_level + buffer, 4),
+        "slope_per_bar": round(slope, 6),
+        "touches": int(touches),
+        "distance_atr": round(distance_atr, 2),
+        "breakout": bool(breakout),
+        "anchor_1_date": window["datetime"].iloc[left].strftime("%Y-%m-%dT%H:%M:%S"),
+        "anchor_2_date": window["datetime"].iloc[right].strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+
+
+def _multi_timeframe_plan(daily, bars_4h, structural_base, active_base, profiles, bottom, atr):
+    weekly = _weekly_frame(daily.tail(min(1000, len(daily))))
+    weekly_atr = _safe_float(_atr_series(weekly, 14).iloc[-1], atr * 2.2) if len(weekly) >= 15 else atr * 2.2
+    line_weekly = _fit_descending_trendline(weekly, "1W", weekly_atr, 65)
+    line_daily = _fit_descending_trendline(daily, "1D", atr, 160)
+    atr_4h = None
+    line_4h = None
+    if bars_4h is not None and len(bars_4h) >= 40:
+        atr_4h = _safe_float(_atr_series(bars_4h, 14).iloc[-1], atr * 0.45)
+        line_4h = _fit_descending_trendline(bars_4h, "4H", atr_4h, 180)
+    primary = line_weekly if line_weekly and line_weekly.get("state") in ("BREAKOUT_PENDING", "BREAKOUT_CONFIRMED") else line_daily
+    neck_level = None
+    if structural_base:
+        neck_level = structural_base.get("neck_high") or structural_base.get("neck_center")
+    elif active_base:
+        neck_level = active_base.get("neck_high") or active_base.get("neck_center")
+    candidate_levels = [level for level in [neck_level, primary.get("trigger_price") if primary else None] if level]
+    trigger_price = max(candidate_levels) if candidate_levels else None
+    current_price = _safe_float(daily["Close"].iloc[-1])
+    daily_confirmed = bool(trigger_price and current_price > trigger_price)
+    execution_confirmed = bool(line_4h and line_4h.get("breakout")) if line_4h else False
+    execution_retest = False
+    if bars_4h is not None and len(bars_4h) >= 20 and trigger_price:
+        recent = bars_4h.tail(12)
+        touched = bool((recent["Low"] <= trigger_price + (atr_4h or atr) * 0.25).any())
+        held = _safe_float(recent["Close"].iloc[-1]) >= trigger_price - (atr_4h or atr) * 0.15
+        higher_low = _safe_float(recent["Low"].tail(4).min()) > _safe_float(recent["Low"].iloc[:8].min())
+        execution_retest = touched and held and higher_low
+    weekly_setup = bool(structural_base or bottom.get("drawdown_52w_pct", 0) <= -25)
+    state = "DETECTED"
+    if weekly_setup and trigger_price and current_price < trigger_price:
+        state = "ARMED"
+    if daily_confirmed:
+        state = "TRIGGERED"
+    if daily_confirmed and (execution_confirmed or execution_retest):
+        state = "CONFIRMED"
+    max_entry = round(trigger_price + atr * 0.75, 4) if trigger_price else None
+    if state in ("TRIGGERED", "CONFIRMED") and max_entry and current_price > max_entry:
+        state = "WAIT_RETEST"
+    invalidation = None
+    for source in (active_base, structural_base):
+        if source and source.get("invalidation_price"):
+            invalidation = source.get("invalidation_price")
+            break
+    return {
+        "weekly_context": {
+            "setup_valid": weekly_setup,
+            "structural_state": structural_base.get("state") if structural_base else None,
+            "primary_trendline": line_weekly,
+        },
+        "daily_confirmation": {
+            "trendline": line_daily,
+            "trigger_price": round(trigger_price, 4) if trigger_price else None,
+            "confirmed": daily_confirmed,
+            "maximum_entry_price": max_entry,
+        },
+        "execution_4h": {
+            "available": bars_4h is not None and len(bars_4h) >= 40,
+            "bars": len(bars_4h) if bars_4h is not None else 0,
+            "trendline": line_4h,
+            "breakout_confirmed": execution_confirmed,
+            "retest_confirmed": execution_retest,
+        },
+        "entry_plan": {
+            "status": state,
+            "trigger_type": "DESCENDING_TRENDLINE_OR_NECK_BREAKOUT",
+            "trigger_price": round(trigger_price, 4) if trigger_price else None,
+            "maximum_entry_price": max_entry,
+            "invalidation_price": invalidation,
+            "requires_daily_close": True,
+            "requires_4h_execution": True,
+            "expiration_bars": 15,
+            "order_action": "PLACE_CONDITIONAL_BUY" if state == "ARMED" else "BUY_ALLOWED" if state == "CONFIRMED" else "WAIT",
+        },
+    }
+
+def analyze_max_strategy(df, bars_4h=None):
     if df is None or len(df) < 140:
         return {"status": "INSUFFICIENT_DATA", "bars": 0 if df is None else len(df), "data_eligible": False, "strategy_eligible": False, "trade_ready": False}
     data = df.copy().sort_values("datetime").reset_index(drop=True)
@@ -878,6 +1005,7 @@ def analyze_max_strategy(df):
     structural_base = _detect_weekly_rounding_base_v131(data, atr)
     speculative_setup = _detect_speculative_volume_pocket(data, profiles, structural, active_base, atr)
     phase = _market_phase_gates_v141(data, profiles, bottom, structural, active_base, structural_base, speculative_setup, atr)
+    mtf_plan = _multi_timeframe_plan(data, bars_4h, structural_base, active_base, profiles, bottom, atr)
     qualified_profiles = [profile for profile in structural if profile.get("distance_atr", 99) <= 0.75 and profile.get("status") in ("VIRGIN", "FIRST_TEST", "RECLAIMED") and profile.get("impulse_move_pct", 0) >= 20 and profile.get("bars", 0) >= 20]
     active_structural_profile = min(qualified_profiles, key=lambda profile: profile.get("distance_atr", 99)) if qualified_profiles else None
     structural_event = None
@@ -935,23 +1063,36 @@ def analyze_max_strategy(df):
     trade_ready = bool(tranche_1_ready or tranche_2_ready or tranche_3_ready)
     waiting_state = "WAITING_MASTER_POC" if phase["falling_knife_block"] and phase["waiting_master_poc"] else "FALLING_KNIFE_WAIT" if phase["falling_knife_block"] else "WAITING_REACTION_SWING" if phase["retest_in_progress_block"] else "DEEP_REVERSAL_WAITING_TRIGGER" if phase["deep_drawdown"] and not trade_ready else None
     rejection_reasons = list(dict.fromkeys(data_rejections + strategy_rejections))
-    management = None
+    historical_cycle = None
+    current_management_signal = None
     if speculative_setup:
-        management = {
+        historical_cycle = {
             "setup_type": "SPECULATIVE_VOLUME_POCKET",
+            "state": speculative_setup.get("state"),
+            "breakout_date": speculative_setup.get("breakout_date"),
+            "breakout_age_days": speculative_setup.get("breakout_age_days"),
             "first_target": speculative_setup.get("first_hvn_target"),
-            "partial_profit_required": speculative_setup.get("partial_profit_required", False),
-            "suggested_partial_pct": 30 if speculative_setup.get("partial_profit_required") else 0,
-            "runner_allowed": speculative_setup.get("runner_allowed", False),
-            "runner_exit_required": speculative_setup.get("runner_exit_required", False),
-            "stop_reference": speculative_setup.get("neck_low"),
+            "historical_partial_would_have_triggered": speculative_setup.get("target_reached", False),
+            "historical_runner_exit_would_have_triggered": speculative_setup.get("returned_below_neck", False),
         }
+        active_cycle = speculative_setup.get("breakout_age_days", 999) <= 20 and phase.get("deep_drawdown") and not phase.get("new_weekly_low") and not phase.get("mature_markup_block")
+        if active_cycle:
+            current_management_signal = {
+                "signal": "TAKE_PARTIAL" if speculative_setup.get("target_reached") and not speculative_setup.get("returned_below_neck") else "EXIT_RUNNER" if speculative_setup.get("returned_below_neck") else "HOLD",
+                "first_target": speculative_setup.get("first_hvn_target"),
+                "suggested_partial_pct": 30 if speculative_setup.get("target_reached") else 0,
+                "stop_reference": speculative_setup.get("neck_low"),
+                "requires_position_setup_match": True,
+            }
     return _native({
-        "status": "OK", "version": "max_structure_v1_4_1", "bars_analyzed": len(data), "price": round(price, 2), "atr14": round(atr, 4), "atr14_pct": round(atr / price * 100, 2) if price > 0 else 0,
+        "status": "OK", "version": "max_structure_v1_5", "bars_analyzed": len(data), "price": round(price, 2), "atr14": round(atr, 4), "atr14_pct": round(atr / price * 100, 2) if price > 0 else 0,
         "data_quality": quality, "profiles": profiles, "structural_profiles": structural, "master_poc": structural[0] if structural else None,
         "active_structural_profile": active_structural_profile, "active_structural_event": structural_event, "strategy_type": strategy_type,
         "market_phase": phase, "waiting_state": waiting_state, "active_base": active_base, "structural_base": structural_base,
-        "speculative_setup": speculative_setup, "position_management": management, "compression": compression, "bottom": bottom, "triggers": triggers,
+        "speculative_setup": speculative_setup, "historical_cycle": historical_cycle, "current_management_signal": current_management_signal,
+        "weekly_context": mtf_plan["weekly_context"], "daily_confirmation": mtf_plan["daily_confirmation"],
+        "execution_4h": mtf_plan["execution_4h"], "entry_plan": mtf_plan["entry_plan"],
+        "compression": compression, "bottom": bottom, "triggers": triggers,
         "data_rejection_reasons": data_rejections, "strategy_rejection_reasons": strategy_rejections, "rejection_reasons": rejection_reasons,
         "max_score": round(min(100, score), 1), "data_eligible": data_eligible, "strategy_eligible": strategy_eligible, "watch_ready": watch_ready,
         "tranche_1_ready": tranche_1_ready, "tranche_2_ready": tranche_2_ready, "tranche_3_ready": tranche_3_ready,
