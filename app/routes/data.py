@@ -181,6 +181,69 @@ async def list_all_tickers():
         "tickers": tickers,
     }
 
+@router.get("/max-strategy-validation")
+async def get_max_strategy_validation(limit: int = Query(50, ge=1, le=500), ticker: str = None):
+    db = get_db()
+    query = {}
+    if ticker:
+        query["ticker"] = ticker.upper()
+    total = await db.max_strategy_signals.count_documents(query)
+    pipeline = [
+        {"$match": query},
+        {"$group": {"_id": "$status", "count": {"$sum": 1}}},
+        {"$sort": {"count": -1}},
+    ]
+    status_rows = await db.max_strategy_signals.aggregate(pipeline).to_list(50)
+    status_counts = {row["_id"] or "UNKNOWN": row["count"] for row in status_rows}
+    triggered = await db.max_strategy_signals.count_documents({**query, "outcomes.trigger_reached": True})
+    invalidated = await db.max_strategy_signals.count_documents({**query, "outcomes.invalidation_reached": True})
+    exceeded = await db.max_strategy_signals.count_documents({**query, "outcomes.maximum_entry_exceeded": True})
+    completed_5d = await db.max_strategy_signals.count_documents({**query, "outcomes.return_5d_pct": {"$ne": None}})
+    completed_10d = await db.max_strategy_signals.count_documents({**query, "outcomes.return_10d_pct": {"$ne": None}})
+    completed_20d = await db.max_strategy_signals.count_documents({**query, "outcomes.return_20d_pct": {"$ne": None}})
+    averages_pipeline = [
+        {"$match": query},
+        {"$group": {
+            "_id": None,
+            "avg_mfe_pct": {"$avg": "$outcomes.mfe_pct"},
+            "avg_mae_pct": {"$avg": "$outcomes.mae_pct"},
+            "avg_return_5d_pct": {"$avg": "$outcomes.return_5d_pct"},
+            "avg_return_10d_pct": {"$avg": "$outcomes.return_10d_pct"},
+            "avg_return_20d_pct": {"$avg": "$outcomes.return_20d_pct"},
+        }},
+    ]
+    average_rows = await db.max_strategy_signals.aggregate(averages_pipeline).to_list(1)
+    averages_raw = average_rows[0] if average_rows else {}
+    averages = {
+        key: round(value, 2) if isinstance(value, (int, float)) else None
+        for key, value in averages_raw.items()
+        if key != "_id"
+    }
+    cursor = db.max_strategy_signals.find(query).sort("created_at", -1).limit(limit)
+    signals = await cursor.to_list(limit)
+    for signal in signals:
+        signal["_id"] = str(signal["_id"])
+        for key in ("created_at", "updated_at", "last_seen_at"):
+            value = signal.get(key)
+            if value and hasattr(value, "isoformat"):
+                signal[key] = value.isoformat()
+    return {
+        "summary": {
+            "total": total,
+            "ticker_filter": ticker.upper() if ticker else None,
+            "status_counts": status_counts,
+            "trigger_reached": triggered,
+            "invalidation_reached": invalidated,
+            "maximum_entry_exceeded": exceeded,
+            "completed_5d": completed_5d,
+            "completed_10d": completed_10d,
+            "completed_20d": completed_20d,
+            "averages": averages,
+        },
+        "signals": signals,
+    }
+
+
 @router.get("/search/{ticker}")
 async def search_stock(ticker: str):
     result = await search_and_analyze_stock(ticker.upper())
