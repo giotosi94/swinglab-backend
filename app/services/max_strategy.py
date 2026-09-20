@@ -927,6 +927,7 @@ def _multi_timeframe_plan(daily, bars_4h, structural_base, active_base, profiles
     trigger_price = max(candidate_levels) if candidate_levels else None
     current_price = _safe_float(daily["Close"].iloc[-1])
     daily_confirmed = bool(trigger_price and current_price > trigger_price)
+    available_4h = bars_4h is not None and len(bars_4h) >= 40
     execution_confirmed = bool(line_4h and line_4h.get("breakout")) if line_4h else False
     execution_retest = False
     if bars_4h is not None and len(bars_4h) >= 20 and trigger_price:
@@ -935,16 +936,30 @@ def _multi_timeframe_plan(daily, bars_4h, structural_base, active_base, profiles
         held = _safe_float(recent["Close"].iloc[-1]) >= trigger_price - (atr_4h or atr) * 0.15
         higher_low = _safe_float(recent["Low"].tail(4).min()) > _safe_float(recent["Low"].iloc[:8].min())
         execution_retest = touched and held and higher_low
+    latest = daily.iloc[-1]
+    candle_range = max(_safe_float(latest["High"]) - _safe_float(latest["Low"]), atr * 0.10)
+    close_location = (_safe_float(latest["Close"]) - _safe_float(latest["Low"])) / candle_range
+    volume20 = _safe_float(daily["Volume"].tail(20).mean())
+    relative_volume = _safe_float(latest["Volume"]) / volume20 if volume20 > 0 else 1.0
+    daily_fallback_confirmed = bool(
+        daily_confirmed
+        and current_price >= trigger_price + atr * 0.20
+        and close_location >= 0.65
+        and relative_volume >= 1.05
+    ) if trigger_price else False
     weekly_setup = bool(structural_base or bottom.get("drawdown_52w_pct", 0) <= -25)
+    execution_mode = "4H_REFINED" if available_4h else "DAILY_FALLBACK"
     state = "DETECTED"
     if weekly_setup and trigger_price and current_price < trigger_price:
         state = "ARMED"
     if daily_confirmed:
         state = "TRIGGERED"
-    if daily_confirmed and (execution_confirmed or execution_retest):
-        state = "CONFIRMED"
+    if daily_confirmed and available_4h and (execution_confirmed or execution_retest):
+        state = "CONFIRMED_4H"
+    elif daily_fallback_confirmed and not available_4h:
+        state = "CONFIRMED_DAILY"
     max_entry = round(trigger_price + atr * 0.75, 4) if trigger_price else None
-    if state in ("TRIGGERED", "CONFIRMED") and max_entry and current_price > max_entry:
+    if state in ("TRIGGERED", "CONFIRMED_4H", "CONFIRMED_DAILY") and max_entry and current_price > max_entry:
         state = "WAIT_RETEST"
     invalidation = None
     for source in (active_base, structural_base):
@@ -964,7 +979,7 @@ def _multi_timeframe_plan(daily, bars_4h, structural_base, active_base, profiles
             "maximum_entry_price": max_entry,
         },
         "execution_4h": {
-            "available": bars_4h is not None and len(bars_4h) >= 40,
+            "available": available_4h,
             "bars": len(bars_4h) if bars_4h is not None else 0,
             "trendline": line_4h,
             "breakout_confirmed": execution_confirmed,
@@ -977,9 +992,13 @@ def _multi_timeframe_plan(daily, bars_4h, structural_base, active_base, profiles
             "maximum_entry_price": max_entry,
             "invalidation_price": invalidation,
             "requires_daily_close": True,
-            "requires_4h_execution": True,
+            "requires_4h_execution": available_4h,
+            "execution_mode": execution_mode,
+            "daily_fallback_confirmed": daily_fallback_confirmed,
+            "daily_close_location": round(close_location, 3),
+            "daily_relative_volume": round(relative_volume, 2),
             "expiration_bars": 15,
-            "order_action": "PLACE_CONDITIONAL_BUY" if state == "ARMED" else "BUY_ALLOWED" if state == "CONFIRMED" else "WAIT",
+            "order_action": "PLACE_CONDITIONAL_BUY" if state == "ARMED" else "BUY_ALLOWED" if state in ("CONFIRMED_4H", "CONFIRMED_DAILY") else "WAIT",
         },
     }
 
@@ -1085,7 +1104,7 @@ def analyze_max_strategy(df, bars_4h=None):
                 "requires_position_setup_match": True,
             }
     return _native({
-        "status": "OK", "version": "max_structure_v1_5", "bars_analyzed": len(data), "price": round(price, 2), "atr14": round(atr, 4), "atr14_pct": round(atr / price * 100, 2) if price > 0 else 0,
+        "status": "OK", "version": "max_structure_v1_5_1", "bars_analyzed": len(data), "price": round(price, 2), "atr14": round(atr, 4), "atr14_pct": round(atr / price * 100, 2) if price > 0 else 0,
         "data_quality": quality, "profiles": profiles, "structural_profiles": structural, "master_poc": structural[0] if structural else None,
         "active_structural_profile": active_structural_profile, "active_structural_event": structural_event, "strategy_type": strategy_type,
         "market_phase": phase, "waiting_state": waiting_state, "active_base": active_base, "structural_base": structural_base,
