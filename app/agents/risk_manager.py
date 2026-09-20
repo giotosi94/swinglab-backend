@@ -232,6 +232,123 @@ class RiskManager(BaseAgent):
             "pct_of_equity": round((price * shares / equity) * 100, 2) if equity > 0 else 0,
         }
 
+    async def _build_max_risk_shadow(self, context: dict, account: dict, positions: list, market_ctx: dict, params: dict, loss_check: dict) -> dict:
+        db = get_db()
+        alpha_shadow = context.get("max_strategy_shadow")
+        if not alpha_shadow:
+            alpha_shadow = await db.agent_state.find_one({"_id": "max_strategy_shadow"}) or {}
+        candidates = alpha_shadow.get("candidates", [])
+        equity = float(account.get("equity", 0) or 0)
+        cash = float(account.get("cash", 0) or 0)
+        buying_power = float(account.get("buying_power", 0) or 0)
+        regime = market_ctx.get("market_regime", "NEUTRAL")
+        regime_multiplier = market_ctx.get("exposure_multiplier", 0.5)
+        loss_multiplier = loss_check.get("exposure_modifier", 1.0)
+        shadow_multiplier = max(0.0, min(1.0, regime_multiplier * loss_multiplier))
+        risk_pct = params.get("risk_pct_per_trade", 2.0) / 100
+        max_position_pct = params.get("max_position_pct", 20.0) / 100
+        min_notional = params.get("min_notional_per_trade", 100.0)
+        min_cash_reserve_pct = params.get("min_cash_reserve_pct", 10.0) / 100
+        max_positions = params.get("max_positions", 5)
+        max_per_sector = params.get("max_per_sector", 2)
+        assets = await db.assets.find({}, {"ticker": 1, "sector_code": 1}).to_list(1000)
+        ticker_to_sector = {asset.get("ticker"): asset.get("sector_code", "UNKNOWN") for asset in assets}
+        open_tickers = {position.get("symbol") for position in positions}
+        sector_counts = {}
+        for position in positions:
+            sector = ticker_to_sector.get(position.get("symbol"), "UNKNOWN")
+            sector_counts[sector] = sector_counts.get(sector, 0) + 1
+        cash_reserve = equity * min_cash_reserve_pct
+        available_capital = max(0.0, min(buying_power, cash - cash_reserve))
+        results = []
+        decision_counts = {"WOULD_APPROVE": 0, "WOULD_REDUCE": 0, "WOULD_REJECT": 0}
+        for candidate in candidates:
+            alpha_action = candidate.get("shadow_action")
+            if alpha_action not in ("WOULD_ARM", "WOULD_BUY"):
+                continue
+            ticker = candidate.get("ticker")
+            entry_price = float(candidate.get("trigger_price") or candidate.get("signal_price") or 0)
+            invalidation = float(candidate.get("invalidation_price") or 0)
+            maximum_entry = float(candidate.get("maximum_entry_price") or 0)
+            sector = ticker_to_sector.get(ticker, "UNKNOWN")
+            reasons = []
+            if ticker in open_tickers:
+                reasons.append("ALREADY_OPEN")
+            if equity <= 0 or entry_price <= 0 or invalidation <= 0 or invalidation >= entry_price:
+                reasons.append("INVALID_ENTRY_OR_INVALIDATION")
+            if maximum_entry and entry_price > maximum_entry:
+                reasons.append("ENTRY_ABOVE_MAXIMUM")
+            if len(positions) >= max_positions:
+                reasons.append("MAX_POSITIONS_REACHED")
+            if sector_counts.get(sector, 0) >= max_per_sector:
+                reasons.append("SECTOR_LIMIT_REACHED")
+            if loss_check.get("status") == "stopped":
+                reasons.append("LOSS_LIMIT_STOPPED")
+            if regime == "CRASH":
+                reasons.append("CRASH_REGIME_BLOCK")
+            risk_per_share = max(0.0, entry_price - invalidation)
+            risk_budget = equity * risk_pct * shadow_multiplier
+            full_qty_by_risk = risk_budget / risk_per_share if risk_per_share > 0 else 0
+            full_notional_by_risk = full_qty_by_risk * entry_price
+            full_notional_cap = equity * max_position_pct * shadow_multiplier
+            full_notional = min(full_notional_by_risk, full_notional_cap, available_capital) if not reasons else 0
+            tranche_pct = 25.0 if alpha_action == "WOULD_ARM" else 35.0
+            tranche_notional = full_notional * tranche_pct / 100
+            tranche_qty = tranche_notional / entry_price if entry_price > 0 else 0
+            tranche_risk = tranche_qty * risk_per_share
+            portfolio_risk_pct = tranche_risk / equity * 100 if equity > 0 else 0
+            if tranche_notional < min_notional and not reasons:
+                reasons.append("BELOW_MIN_NOTIONAL")
+            if reasons:
+                decision = "WOULD_REJECT"
+            elif shadow_multiplier < 0.75:
+                decision = "WOULD_REDUCE"
+            else:
+                decision = "WOULD_APPROVE"
+            decision_counts[decision] += 1
+            results.append({
+                "ticker": ticker,
+                "alpha_shadow_action": alpha_action,
+                "risk_shadow_decision": decision,
+                "entry_price": round(entry_price, 4),
+                "maximum_entry_price": round(maximum_entry, 4) if maximum_entry else None,
+                "invalidation_price": round(invalidation, 4),
+                "risk_per_share": round(risk_per_share, 4),
+                "risk_budget_usd": round(risk_budget, 2),
+                "full_position_qty": round(full_notional / entry_price, 4) if entry_price > 0 else 0,
+                "full_position_notional": round(full_notional, 2),
+                "tranche_pct": tranche_pct,
+                "shadow_qty": round(tranche_qty, 4),
+                "shadow_notional": round(tranche_notional, 2),
+                "shadow_risk_usd": round(tranche_risk, 2),
+                "portfolio_risk_pct": round(portfolio_risk_pct, 3),
+                "sector": sector,
+                "regime": regime,
+                "regime_multiplier": round(regime_multiplier, 3),
+                "loss_multiplier": round(loss_multiplier, 3),
+                "combined_multiplier": round(shadow_multiplier, 3),
+                "rejection_reasons": reasons,
+                "live_execution_enabled": False,
+            })
+        result = {
+            "mode": "SHADOW_SIZING",
+            "live_execution_enabled": False,
+            "strategy_version": "max_structure_v1_5_2",
+            "regime": regime,
+            "equity": round(equity, 2),
+            "cash": round(cash, 2),
+            "available_capital": round(available_capital, 2),
+            "decision_counts": decision_counts,
+            "candidates": results,
+            "updated_at": datetime.utcnow(),
+        }
+        await db.agent_state.update_one(
+            {"_id": "max_strategy_risk_shadow"},
+            {"$set": result},
+            upsert=True,
+        )
+        return result
+
     # ============================================
     # ANALYZE
     # ============================================
@@ -249,6 +366,9 @@ class RiskManager(BaseAgent):
             return {"error": "No equity data", "approved_trades": [], "rejected_trades": []}
         
         loss_check = await self._check_loss_limits(account, params)
+        max_strategy_risk_shadow = await self._build_max_risk_shadow(
+            context, account, positions, market_ctx, params, loss_check
+        )
         exposure_from_losses = loss_check["exposure_modifier"]
         regime_multiplier = market_ctx.get("exposure_multiplier", 0.5)
         final_multiplier = regime_multiplier * exposure_from_losses
@@ -474,6 +594,12 @@ class RiskManager(BaseAgent):
             "position_size_pct": round(position_size_pct, 2),
             "kelly_multiplier": kelly_multiplier,
             "kelly_pct": kelly_result.get("kelly_pct", 0),
+            "max_strategy_risk_shadow": {
+                "mode": max_strategy_risk_shadow["mode"],
+                "live_execution_enabled": False,
+                "decision_counts": max_strategy_risk_shadow["decision_counts"],
+                "candidates": len(max_strategy_risk_shadow["candidates"]),
+            },
         }
         
         from app.services.llm_service import llm_ask, llm_available
@@ -542,6 +668,7 @@ class RiskManager(BaseAgent):
             "rejected_trades": rejected_trades,
             "approved_sells": approved_sells,
             "risk_report": risk_report,
+            "max_strategy_risk_shadow": max_strategy_risk_shadow,
         }
 
     async def learn(self) -> dict:
