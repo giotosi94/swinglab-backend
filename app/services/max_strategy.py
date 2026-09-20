@@ -1069,6 +1069,30 @@ def analyze_max_strategy(df, bars_4h=None):
     score += min(10, phase["momentum_score"] * 2)
     data_eligible = not data_rejections
     strategy_eligible = data_eligible and not strategy_rejections
+    blocking_phase = bool(
+        phase["falling_knife_block"]
+        or phase["mature_markup_block"]
+        or phase["new_weekly_low"]
+        or phase["retest_in_progress_block"]
+    )
+    weekly_plan_qualified = bool(
+        strategy_eligible
+        and strategy_type
+        and mtf_plan["weekly_context"].get("setup_valid")
+        and mtf_plan["entry_plan"].get("trigger_price")
+        and mtf_plan["entry_plan"].get("invalidation_price")
+        and mtf_plan["entry_plan"]["invalidation_price"] < price
+        and not blocking_phase
+    )
+    raw_plan_status = mtf_plan["entry_plan"].get("status")
+    if raw_plan_status == "ARMED" and not weekly_plan_qualified:
+        mtf_plan["entry_plan"]["status"] = "DETECTED"
+        mtf_plan["entry_plan"]["order_action"] = "WAIT"
+    elif raw_plan_status in ("CONFIRMED_4H", "CONFIRMED_DAILY") and not weekly_plan_qualified:
+        mtf_plan["entry_plan"]["status"] = "BLOCKED"
+        mtf_plan["entry_plan"]["order_action"] = "WAIT"
+    mtf_plan["entry_plan"]["weekly_plan_qualified"] = weekly_plan_qualified
+    mtf_plan["entry_plan"]["blocking_phase"] = blocking_phase
     watch_ready = data_eligible and phase["phase"] in ("DEEP_REVERSAL", "DEEP_DRAWDOWN_WAIT", "RANGE_BOTTOM_REVERSAL", "MASTER_POC_REVERSAL", "RETEST_WAITING_CONFIRMATION") and score >= 35 and not phase["mature_markup_block"]
     advanced_retest = structural_base and structural_base.get("state") in ("POC_NECK_RETEST_IN_PROGRESS", "POC_NECK_RETEST_CONFIRMED", "SECOND_LEG_REENTRY")
     tranche_1_trigger = structural_event in ("MASTER_POC_FIRST_TEST", "MASTER_POC_RECLAIM") and phase["momentum_change"] and phase["reaction_candle"] and phase["selling_volume_contracting"] and not advanced_retest and phase["range_position_52w"] < 70
@@ -1079,7 +1103,15 @@ def analyze_max_strategy(df, bars_4h=None):
     tranche_3_ready = strategy_eligible and tranche_3_trigger
     planned_tranche_pct = 40 if tranche_3_ready else 35 if tranche_2_ready else 25 if tranche_1_ready else 0
     entry_trigger = "RETEST" if tranche_3_ready else "BREAKOUT" if tranche_2_ready else "MASTER_POC_REACTION" if tranche_1_ready else None
-    trade_ready = bool(tranche_1_ready or tranche_2_ready or tranche_3_ready)
+    mtf_buy_allowed = bool(
+        mtf_plan["entry_plan"].get("order_action") == "BUY_ALLOWED"
+        and weekly_plan_qualified
+        and strategy_eligible
+    )
+    trade_ready = bool((tranche_1_ready or tranche_2_ready or tranche_3_ready or mtf_buy_allowed) and strategy_eligible and not blocking_phase)
+    if not trade_ready and mtf_plan["entry_plan"].get("order_action") == "BUY_ALLOWED":
+        mtf_plan["entry_plan"]["order_action"] = "WAIT"
+        mtf_plan["entry_plan"]["status"] = "BLOCKED"
     waiting_state = "WAITING_MASTER_POC" if phase["falling_knife_block"] and phase["waiting_master_poc"] else "FALLING_KNIFE_WAIT" if phase["falling_knife_block"] else "WAITING_REACTION_SWING" if phase["retest_in_progress_block"] else "DEEP_REVERSAL_WAITING_TRIGGER" if phase["deep_drawdown"] and not trade_ready else None
     rejection_reasons = list(dict.fromkeys(data_rejections + strategy_rejections))
     historical_cycle = None
@@ -1104,7 +1136,7 @@ def analyze_max_strategy(df, bars_4h=None):
                 "requires_position_setup_match": True,
             }
     return _native({
-        "status": "OK", "version": "max_structure_v1_5_1", "bars_analyzed": len(data), "price": round(price, 2), "atr14": round(atr, 4), "atr14_pct": round(atr / price * 100, 2) if price > 0 else 0,
+        "status": "OK", "version": "max_structure_v1_5_2", "bars_analyzed": len(data), "price": round(price, 2), "atr14": round(atr, 4), "atr14_pct": round(atr / price * 100, 2) if price > 0 else 0,
         "data_quality": quality, "profiles": profiles, "structural_profiles": structural, "master_poc": structural[0] if structural else None,
         "active_structural_profile": active_structural_profile, "active_structural_event": structural_event, "strategy_type": strategy_type,
         "market_phase": phase, "waiting_state": waiting_state, "active_base": active_base, "structural_base": structural_base,
