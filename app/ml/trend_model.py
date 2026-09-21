@@ -153,6 +153,23 @@ TREND_FEATURE_NAMES = [
 ]
 
 TREND_LABELS = {0: "DOWN", 1: "FLAT", 2: "UP"}
+
+# ==========================================================
+# FINESTRE DI CARICAMENTO — controllo della memoria
+# ==========================================================
+# extract_trend_features guarda al massimo 20 barre indietro, ma calcola
+# anche una EMA a 50 periodi: servono abbastanza dati perche' converga.
+# Con span=50 il peso della barra piu' vecchia dopo 120 periodi scende
+# sotto l'1%, quindi 120 barre danno lo stesso risultato di 883.
+#
+# Prima venivano caricate TUTTE le barre di TUTTI i ticker: oltre 100 MB
+# di dizionari Python a ogni pipeline, per usarne solo le ultime.
+PREDICT_BARS = 120
+
+# Il training campiona range(len(df) - 60, len(df) - 5), quindi gli servono
+# le ultime 60 barre piu' il lookback delle feature e la EMA50.
+# Con 200 barre il numero di campioni per titolo resta identico.
+TRAIN_BARS = 200
 class TrendPredictor:
     """Predicts 5-day price trend for each stock."""
 
@@ -175,12 +192,18 @@ class TrendPredictor:
         print("\nTREND MODEL TRAINING")
         print("=" * 50)
         db = get_db()
-        stocks = await db.stock_bars.find({}).to_list(length=300)
-        print(f"  Found {len(stocks)} stocks with bars")
         all_features = []
         all_labels = []
         stocks_used = 0
-        for stock in stocks:
+        stocks_seen = 0
+        # Cursore in streaming con $slice: MongoDB restituisce solo le barre
+        # necessarie e non costruiamo mai una lista di documenti completi.
+        cursor = db.stock_bars.find(
+            {},
+            {"ticker": 1, "bars": {"$slice": -TRAIN_BARS}},
+        )
+        async for stock in cursor:
+            stocks_seen += 1
             bars = stock.get("bars", [])
             df = self._bars_to_df(bars)
             if df is None or len(df) < 50:
@@ -204,6 +227,10 @@ class TrendPredictor:
                     label = 1
                 all_features.append(features)
                 all_labels.append(label)
+            # Il DataFrame di questo titolo non serve piu': liberarlo qui
+            # evita di tenerne centinaia vivi contemporaneamente.
+            del df
+        print(f"  Found {stocks_seen} stocks with bars")
         print(f"  Stocks used: {stocks_used}")
         print(f"  Total samples: {len(all_features)}")
         if len(all_features) < 100:
@@ -261,7 +288,10 @@ class TrendPredictor:
                 return {"ticker": ticker, "prediction": None, "status": "not_trained"}
         try:
             db = get_db()
-            stock = await db.stock_bars.find_one({"ticker": ticker.upper()})
+            stock = await db.stock_bars.find_one(
+                {"ticker": ticker.upper()},
+                {"ticker": 1, "bars": {"$slice": -PREDICT_BARS}},
+            )
             if not stock or not stock.get("bars"):
                 return {"ticker": ticker, "prediction": None, "status": "no_data"}
             df = self._bars_to_df(stock["bars"])
@@ -292,15 +322,24 @@ class TrendPredictor:
             if not loaded:
                 return []
         db = get_db()
-        stocks = await db.stock_bars.find({}, {"ticker": 1, "bars": 1}).to_list(length=300)
         results = []
-        for stock in stocks:
+        # Questa funzione viene chiamata dall'AlphaStrategist a ogni pipeline.
+        # Caricava tutte le barre di tutti i ticker per usarne solo l'ultima:
+        # ora MongoDB ne manda soltanto la finestra necessaria e il cursore
+        # viene consumato un documento alla volta.
+        cursor = db.stock_bars.find(
+            {},
+            {"ticker": 1, "bars": {"$slice": -PREDICT_BARS}},
+        )
+        async for stock in cursor:
             ticker = stock.get("ticker", "")
             bars = stock.get("bars", [])
             df = self._bars_to_df(bars)
             if df is None or len(df) < 25:
                 continue
             features = extract_trend_features(df, len(df) - 1)
+            # Il DataFrame ha gia' prodotto le feature: liberato subito.
+            del df
             if features is None:
                 continue
             try:
