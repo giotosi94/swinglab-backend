@@ -18,7 +18,7 @@ SECTOR_MAP = {
 
 SECTOR_STOCKS = {
     "XLK": ["AAPL","MSFT","NVDA","AVGO","AMD","CRM","ADBE","INTC","CSCO","ORCL",
-            "PLTR","NOW","SNOW","CRWD","PANW","MNDY","SHOP","SQ","UBER","DDOG"],
+            "PLTR","NOW","SNOW","CRWD","PANW","MNDY","SHOP","XYZ","UBER","DDOG"],
     "XLF": ["JPM","BAC","WFC","GS","MS","BLK","SCHW","AXP","C","USB",
             "V","MA","PYPL","COF","ICE","SPGI","MCO","MMC","AON","TFC"],
     "XLV": ["UNH","JNJ","PFE","ABBV","MRK","TMO","ABT","LLY","BMY","AMGN",
@@ -30,7 +30,7 @@ SECTOR_STOCKS = {
     "XLP": ["PG","KO","PEP","COST","WMT","PM","MO","CL","MDLZ","KHC",
             "STZ","SYY","HSY","GIS","ADM","MNST","KDP","CHD","CLX","SJM"],
     "XLE": ["XOM","CVX","COP","SLB","EOG","MPC","PSX","VLO","OXY","HAL",
-            "DVN","FANG","WMB","KMI","TRGP","BKR","CTRA","MRO","APA","AR"],
+            "DVN","FANG","WMB","KMI","TRGP","BKR","MRO","APA","AR"],
     "XLU": ["NEE","DUK","SO","D","AEP","SRE","EXC","XEL","ED","WEC",
             "AWK","ES","ATO","CMS","PNW","PPL","FE","DTE","AES","ETR"],
     "XLB": ["LIN","APD","SHW","FCX","NEM","ECL","DOW","NUE","VMC","MLM",
@@ -48,6 +48,63 @@ ALPACA_HEADERS = {
 
 ALPACA_DATA_URL = "https://data.alpaca.markets"
 MAX_STORED_BARS = 1000
+MAX_STALE_CALENDAR_DAYS = 7
+LEGACY_TICKERS = ["CTRA", "SQ"]
+
+
+def _data_freshness(df):
+    if df is None or len(df) == 0 or "datetime" not in df.columns:
+        return {"status": "NO_DATA", "eligible": False, "last_bar_date": None, "calendar_days_old": None}
+    last_bar = pd.to_datetime(df["datetime"].iloc[-1]).to_pydatetime()
+    if last_bar.tzinfo is not None:
+        last_bar = last_bar.replace(tzinfo=None)
+    days_old = (datetime.utcnow().date() - last_bar.date()).days
+    stale = days_old > MAX_STALE_CALENDAR_DAYS
+    return {
+        "status": "STALE_OR_DELISTED" if stale else "FRESH",
+        "eligible": not stale,
+        "last_bar_date": last_bar.strftime("%Y-%m-%d"),
+        "calendar_days_old": days_old,
+    }
+
+
+async def cleanup_legacy_max_strategy_data(db):
+    return {
+        "assets": (await db.assets.delete_many({"ticker": {"$in": LEGACY_TICKERS}})).deleted_count,
+        "signals": (await db.max_strategy_signals.delete_many({"ticker": {"$in": LEGACY_TICKERS}})).deleted_count,
+        "daily_bars": (await db.stock_bars.delete_many({"ticker": {"$in": LEGACY_TICKERS}})).deleted_count,
+        "bars_4h": (await db.stock_bars_4h.delete_many({"ticker": {"$in": LEGACY_TICKERS}})).deleted_count,
+    }
+
+
+async def mark_stale_asset(db, ticker, sector_code, freshness):
+    await db.assets.update_one(
+        {"ticker": ticker},
+        {"$set": {
+            "ticker": ticker,
+            "name": ticker,
+            "sector_code": sector_code,
+            "data_status": freshness["status"],
+            "data_eligible": False,
+            "last_bar_date": freshness["last_bar_date"],
+            "calendar_days_old": freshness["calendar_days_old"],
+            "max_strategy": {
+                "status": "STALE_OR_DELISTED",
+                "version": "max_structure_v1_5_2",
+                "data_eligible": False,
+                "strategy_eligible": False,
+                "watch_ready": False,
+                "trade_ready": False,
+                "live_eligible": False,
+                "live_entry_enabled": False,
+                "rejection_reasons": ["STALE_OR_DELISTED"],
+                "entry_plan": {"status": "BLOCKED", "order_action": "WAIT", "blocking_phase": True},
+            },
+            "updated_at": datetime.utcnow(),
+        }},
+        upsert=True,
+    )
+    await db.max_strategy_signals.delete_many({"ticker": ticker, "outcomes.bars_observed": 0})
 
 
 async def fetch_long_history_symbol(client, symbol, target_bars=750):
@@ -782,6 +839,9 @@ def analyze_stock(ticker, df, sector_code, sector_scores, prev_poc_position=None
         "max_strategy": max_strategy,
         "high_52w": high_52w, "low_52w": low_52w, "pct_from_high": pct_from_high,
         "pct_from_low": pct_from_low, "range_position": range_position,
+        "data_status": "FRESH", "data_eligible": True,
+        "last_bar_date": df["datetime"].iloc[-1].strftime("%Y-%m-%d"),
+        "calendar_days_old": (datetime.utcnow().date() - df["datetime"].iloc[-1].date()).days,
         "updated_at": datetime.utcnow(),
     }
 
@@ -1075,6 +1135,9 @@ async def fetch_and_analyze_stocks(force=False):
     print("=" * 50)
     print("STOCKS REFRESH (Incremental + Parallel)")
     print("=" * 50)
+    legacy_cleanup = await cleanup_legacy_max_strategy_data(db)
+    if any(legacy_cleanup.values()):
+        print(f"  Legacy cleanup: {legacy_cleanup}")
 
     sector_scores = {}
     async for s in db.sectors.find():
@@ -1104,10 +1167,17 @@ async def fetch_and_analyze_stocks(force=False):
             bars_map = await get_or_fetch_bars_batch(client, db, batch, max_concurrent=10)
             bars_4h_map = await get_or_fetch_4h_bars_batch(client, db, batch, max_concurrent=6)
 
-            success = 0; skipped = 0
+            success = 0; skipped = 0; stale = 0
             for ticker in batch:
                 df = bars_map.get(ticker)
                 sector_code = ticker_to_sector.get(ticker, "UNKNOWN")
+                freshness = _data_freshness(df)
+                if not freshness["eligible"]:
+                    await mark_stale_asset(db, ticker, sector_code, freshness)
+                    stale += 1
+                    skipped += 1
+                    print(f"      STALE {ticker}: last={freshness['last_bar_date']} age={freshness['calendar_days_old']}d")
+                    continue
                 # 🆕 Leggi la posizione POC precedente dal DB (per lo shift persistente)
                 prev_doc = await db.assets.find_one({"ticker": ticker}, {"poc_shift": 1})
                 prev_pos = (prev_doc or {}).get("poc_shift", {}).get("poc_position")
@@ -1122,7 +1192,7 @@ async def fetch_and_analyze_stocks(force=False):
                     skipped += 1
 
             batch_time = round(time.time() - t_batch, 1)
-            print(f"    -> {success} OK, {skipped} skipped in {batch_time}s")
+            print(f"    -> {success} OK, {skipped} skipped ({stale} stale) in {batch_time}s")
 
     elapsed = round(time.time() - t_start, 1)
     print(f"\n{'=' * 50}")
