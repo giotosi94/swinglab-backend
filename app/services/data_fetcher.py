@@ -17,28 +17,61 @@ SECTOR_MAP = {
 }
 
 SECTOR_STOCKS = {
-    "XLK": ["AAPL","MSFT","NVDA","AVGO","AMD","CRM","ADBE","INTC","CSCO","ORCL",
-            "PLTR","NOW","SNOW","CRWD","PANW","MNDY","SHOP","XYZ","UBER","DDOG"],
-    "XLF": ["JPM","BAC","WFC","GS","MS","BLK","SCHW","AXP","C","USB",
-            "V","MA","PYPL","COF","ICE","SPGI","MCO","MRSH","AON","TFC"],
-    "XLV": ["UNH","JNJ","PFE","ABBV","MRK","TMO","ABT","LLY","BMY","AMGN",
-            "ISRG","DXCM","VRTX","REGN","ZTS","HCA","CI","ELV","HUM","SYK"],
-    "XLI": ["CAT","DE","UNP","HON","BA","RTX","LMT","GE","MMM","FDX",
-            "UPS","WM","ETN","ITW","EMR","NSC","CSX","PCAR","ROK","IR"],
-    "XLY": ["AMZN","TSLA","HD","MCD","NKE","SBUX","LOW","TJX","BKNG","CMG",
-            "LULU","ROST","DHI","LEN","ABNB","DASH","EBAY","MAR","HLT","YUM"],
-    "XLP": ["PG","KO","PEP","COST","WMT","PM","MO","CL","MDLZ","KHC",
-            "STZ","SYY","HSY","GIS","ADM","MNST","KDP","CHD","CLX","SJM"],
-    "XLE": ["XOM","CVX","COP","SLB","EOG","MPC","PSX","VLO","OXY","HAL",
-            "DVN","FANG","WMB","KMI","TRGP","BKR","APA","AR"],
-    "XLU": ["NEE","DUK","SO","D","AEP","SRE","EXC","XEL","ED","WEC",
-            "AWK","ES","ATO","CMS","PNW","PPL","FE","DTE","AES","ETR"],
-    "XLB": ["LIN","APD","SHW","FCX","NEM","ECL","DOW","NUE","VMC","MLM",
-            "CF","MOS","BALL","PKG","IFF","EMN","CE","RPM","AVY"],
-    "XLRE": ["PLD","AMT","CCI","EQIX","SPG","PSA","O","WELL","DLR","VMRK",
-             "VICI","MAA","EXR","ARE","UDR","ESS","REG","HST","KIM","CPT"],
-    "XLC": ["META","GOOGL","GOOG","NFLX","DIS","CMCSA","T","VZ","TMUS",
-            "SPOT","RBLX","TTWO","WBD","PARA","MTCH","ZM","PINS","SNAP","LYV"],
+    "XLK": [
+        "AAPL","MSFT","NVDA","AVGO","AMD","CRM","ADBE","INTC","CSCO","ORCL",
+        "PLTR","NOW","SNOW","CRWD","PANW","MNDY","SHOP","XYZ","UBER","DDOG",
+        "ACN","IBM","QCOM","AMAT","MU","TXN","KLAC","LRCX","DELL","SMCI",
+    ],
+    "XLF": [
+        "JPM","BAC","WFC","GS","MS","BLK","SCHW","AXP","C","USB",
+        "V","MA","PYPL","COF","ICE","SPGI","MCO","MRSH","AON","TFC",
+        "KKR","PGR","CB","CME","AJG","ALL","TRV","AFL",
+    ],
+    "XLV": [
+        "UNH","JNJ","PFE","ABBV","MRK","TMO","ABT","LLY","BMY","AMGN",
+        "ISRG","DXCM","VRTX","REGN","ZTS","HCA","CI","ELV","HUM","SYK",
+        "DHR","MDT","BSX","GILD","MCK","CVS","COR","EW",
+    ],
+    "XLI": [
+        "CAT","DE","UNP","HON","BA","RTX","LMT","GE","MMM","FDX",
+        "UPS","WM","ETN","ITW","EMR","NSC","CSX","PCAR","ROK","IR",
+        "GEV","PH","GD","NOC","TDG","CARR","JCI","FAST","URI",
+    ],
+    "XLY": [
+        "AMZN","TSLA","HD","MCD","NKE","SBUX","LOW","TJX","BKNG","CMG",
+        "LULU","ROST","DHI","LEN","ABNB","DASH","EBAY","MAR","HLT","YUM",
+        "ORLY","AZO","F","GM","TGT","DECK","RCL","CCL",
+    ],
+    "XLP": [
+        "PG","KO","PEP","COST","WMT","PM","MO","CL","MDLZ","KHC",
+        "STZ","SYY","HSY","GIS","ADM","MNST","KDP","CHD","CLX","SJM",
+        "KR","EL","TSN","MKC","CAG","TAP","CPB",
+    ],
+    "XLE": [
+        "XOM","CVX","COP","SLB","EOG","MPC","PSX","VLO","OXY","HAL",
+        "DVN","FANG","WMB","KMI","TRGP","BKR","APA","AR","EQT","LNG",
+        "OKE","TPL","CHRD","RRC",
+    ],
+    "XLU": [
+        "NEE","DUK","SO","D","AEP","SRE","EXC","XEL","ED","WEC",
+        "AWK","ES","ATO","CMS","PNW","PPL","FE","DTE","AES","ETR",
+        "CEG","EVRG","NI","LNT","PEG","NRG",
+    ],
+    "XLB": [
+        "LIN","APD","SHW","FCX","NEM","ECL","DOW","NUE","VMC","MLM",
+        "CF","MOS","BALL","PKG","IFF","EMN","CE","RPM","AVY","DD",
+        "PPG","IP","AMCR","ALB","STLD",
+    ],
+    "XLRE": [
+        "PLD","AMT","CCI","EQIX","SPG","PSA","O","WELL","DLR","VMRK",
+        "VICI","MAA","EXR","ARE","UDR","ESS","REG","HST","KIM","CPT",
+        "DOC","INVH","CBRE","IRM","WY","EQR","SBAC",
+    ],
+    "XLC": [
+        "META","GOOGL","GOOG","NFLX","DIS","CMCSA","T","VZ","TMUS","SPOT",
+        "RBLX","TTWO","WBD","PARA","MTCH","ZM","PINS","SNAP","LYV","NWSA",
+        "NWS","FOXA","FOX","OMC","CHTR","TKO","RDDT","ROKU",
+    ],
 }
 
 ALPACA_HEADERS = {
