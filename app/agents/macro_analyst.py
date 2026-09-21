@@ -17,6 +17,7 @@ SECTOR_ETFS = [
 
 DEFENSIVE_SECTORS = {"XLU", "XLP", "XLV"}
 CYCLICAL_SECTORS = {"XLE", "XLI", "XLB", "XLY", "XLF"}
+GROWTH_SECTORS = {"XLK", "XLC"}
 
 REGIME_LEVELS = ["CRASH", "BEAR", "NEUTRAL", "BULL"]
 
@@ -29,27 +30,37 @@ SECTOR_BOTTOM_BARS = 200
 
 class MacroAnalyst(BaseAgent):
     """
-    AGENTE 1: Macro Analyst v3.1
+    AGENTE 1: Macro Analyst v3.2
 
-    v3.0 -> v3.1: ottimizzazione memoria.
+    v3.1 -> v3.2: LEADERSHIP MULTIFINESTRA.
 
-    Il problema: su Render Starter (512 MB) il processo veniva riciclato
-    piu' volte al giorno. Il MacroAnalyst caricava in RAM le barre COMPLETE
-    di tutti i 300 ticker per il Sector Bottom Detector, usandone poi solo
-    le ultime 200. Con 883 barre per ticker e circa 445 byte per barra
-    decodificata in Python, erano oltre 110 MB per una singola funzione.
+    Il problema risolto: la v3.1 ordinava i settori solo per forza relativa
+    a 63 sedute. Un settore poteva essere primo sul trimestre ma ultimo
+    sull'ultimo mese, e il sistema continuava a considerarlo leader.
+    Viceversa, un settore in forte recupero recente restava invisibile
+    perche' strutturalmente ancora indietro.
 
-    Interventi:
-      1. $slice lato MongoDB: arrivano solo le barre effettivamente usate.
-      2. Streaming nel Sector Bottom: nessun dizionario che accumula tutto.
-      3. Cache delle serie prezzi per singolo run: SPY veniva caricato
-         tre volte (indici, leadership, crash radar).
+    Ora ogni settore viene classificato confrontando il proprio RANK su
+    tre finestre (5, 20 e 63 sedute). La classificazione e' puramente
+    relativa: nessun settore e' privilegiato o penalizzato a priori.
 
-    Logica di analisi invariata rispetto alla v3.0.
+      ESTABLISHED_LEADER  guida sia il trimestre sia il mese
+      EMERGING_LEADER     non guidava il trimestre, guida ora
+      FADING_LEADER       guidava il trimestre, non guida piu'
+      IMPROVING           risale nel ranking senza essere ancora leader
+      DETERIORATING       scende nel ranking
+      NEUTRAL             nessun movimento rilevante
+
+    Dal confronto fra i top strutturali e i top correnti nasce lo stato
+    di rotazione: STABLE_LEADERSHIP, ROTATION_STARTING, ROTATION_IN_PROGRESS.
+
+    Il risultato finisce in market_context["leadership"], che l'Orchestrator
+    passa all'AlphaStrategist. Il MacroAnalyst dice CHI traina, l'Alpha
+    decide DOVE cercare i titoli.
     """
 
     def __init__(self):
-        super().__init__(name="macro_analyst", version="3.1")
+        super().__init__(name="macro_analyst", version="3.2")
         self._series_cache = {}
 
     def default_params(self) -> dict:
@@ -95,6 +106,11 @@ class MacroAnalyst(BaseAgent):
             "early_recovery_short_return": 1.5,
             "intraday_strong_move": 1.0,
 
+            # ---- leadership multifinestra ----
+            "leadership_top_n": 3,
+            "rank_move_threshold": 3,
+            "focus_max_sectors": 4,
+
             # ---- exposure ----
             "bull_exposure": 1.0,
             "narrow_bull_exposure": 0.70,
@@ -132,6 +148,37 @@ class MacroAnalyst(BaseAgent):
             "r_swing": self._pct_return(closes, swing),
             "r_structural": self._pct_return(closes, structural),
         }
+
+    @staticmethod
+    def _assign_ranks(items, value_key, rank_key):
+        """Assegna il rank 1..N ordinando per valore decrescente."""
+        ordered = sorted(items, key=lambda x: x.get(value_key, 0), reverse=True)
+        for position, item in enumerate(ordered, start=1):
+            item[rank_key] = position
+
+    @staticmethod
+    def _group_label(sectors):
+        """
+        Etichetta il gruppo dominante di un insieme di settori.
+        Nessuna preferenza: conta solo quanti appartengono a ciascuna famiglia.
+        """
+        if not sectors:
+            return "UNKNOWN"
+
+        group = set(sectors)
+        defensive = len(DEFENSIVE_SECTORS & group)
+        cyclical = len(CYCLICAL_SECTORS & group)
+        growth = len(GROWTH_SECTORS & group)
+
+        # Serve una maggioranza chiara: in caso di parita' il gruppo resta MIXED,
+        # perche' un top3 con un settore per famiglia non indica una direzione.
+        if defensive >= 2:
+            return "DEFENSIVE_LED"
+        if cyclical >= 2:
+            return "CYCLICAL_LED"
+        if growth >= 2 or (growth >= 1 and growth > max(defensive, cyclical)):
+            return "GROWTH_LED"
+        return "MIXED"
 
     async def _load_price_series(self, db, symbols, bars_needed):
         """
@@ -196,9 +243,54 @@ class MacroAnalyst(BaseAgent):
     # MARKET LEADERSHIP ENGINE
     # ==========================================================
 
+    def _classify_sectors(self, sector_rs, params):
+        """
+        Classifica ogni settore confrontando il suo rank su piu' finestre.
+
+        Tutto e' relativo: un settore diventa EMERGING_LEADER perche' scala
+        la classifica rispetto agli altri, non perche' appartiene a una
+        categoria preferita.
+        """
+        top_n = int(params.get("leadership_top_n", 3))
+        move_threshold = int(params.get("rank_move_threshold", 3))
+
+        self._assign_ranks(sector_rs, "rs_structural", "rank_structural")
+        self._assign_ranks(sector_rs, "rs_swing", "rank_swing")
+        self._assign_ranks(sector_rs, "rs_short", "rank_short")
+
+        for s in sector_rs:
+            # Accelerazione: quanto la forza relativa recente supera quella
+            # strutturale. Positiva = il settore sta guadagnando terreno.
+            s["acceleration"] = round(s["rs_swing"] - s["rs_structural"], 2)
+            s["acceleration_short"] = round(s["rs_short"] - s["rs_swing"], 2)
+
+            # Variazione di rank: positiva = risale la classifica
+            s["rank_delta"] = s["rank_structural"] - s["rank_swing"]
+            s["rank_delta_short"] = s["rank_swing"] - s["rank_short"]
+
+            in_structural_top = s["rank_structural"] <= top_n
+            in_swing_top = s["rank_swing"] <= top_n
+
+            if in_structural_top and in_swing_top:
+                status = "ESTABLISHED_LEADER"
+            elif in_swing_top:
+                status = "EMERGING_LEADER"
+            elif in_structural_top:
+                status = "FADING_LEADER"
+            elif s["rank_delta"] >= move_threshold:
+                status = "IMPROVING"
+            elif s["rank_delta"] <= -move_threshold:
+                status = "DETERIORATING"
+            else:
+                status = "NEUTRAL"
+
+            s["status"] = status
+
+        return sector_rs
+
     async def _calc_market_leadership(self, db, params) -> dict:
         """
-        Chi traina il mercato, ragionando in trend e non sulla singola seduta.
+        Chi traina il mercato, su piu' finestre temporali.
 
         Ratio calcolati contro SPY:
           RSP/SPY  -> partecipazione (equal weight vs cap weight)
@@ -206,7 +298,8 @@ class MacroAnalyst(BaseAgent):
           IWM/SPY  -> partecipazione small cap
           DIA/SPY  -> leadership industriale
 
-        Piu' la forza relativa settoriale a 63 sedute.
+        Piu' la forza relativa settoriale a 5, 20 e 63 sedute, con ranking
+        e rilevamento delle rotazioni.
         """
         result = {
             "available": False,
@@ -218,11 +311,22 @@ class MacroAnalyst(BaseAgent):
             "participation_score": 50.0,
             "sectors": [],
             "sectors_above_spy": 0,
+            "sectors_above_spy_swing": 0,
             "sectors_total": 0,
             "sector_dispersion": 0.0,
             "sector_leadership": "UNKNOWN",
+            "sector_leadership_structural": "UNKNOWN",
+            "rotation_state": "UNKNOWN",
+            "rotation_overlap": 0,
             "top_sectors": [],
+            "top_sectors_structural": [],
             "bottom_sectors": [],
+            "emerging_leaders": [],
+            "fading_leaders": [],
+            "improving_sectors": [],
+            "deteriorating_sectors": [],
+            "focus_sectors": [],
+            "avoid_sectors": [],
         }
 
         bars_needed = params.get("structural_window", 63) + 5
@@ -246,6 +350,7 @@ class MacroAnalyst(BaseAgent):
                 "r_short": w["r_short"],
                 "r_swing": w["r_swing"],
                 "r_structural": w["r_structural"],
+                "rs_short": round(w["r_short"] - spy_w["r_short"], 2),
                 "rs_swing": round(w["r_swing"] - spy_w["r_swing"], 2),
                 "rs_structural": round(w["r_structural"] - spy_w["r_structural"], 2),
             }
@@ -263,7 +368,7 @@ class MacroAnalyst(BaseAgent):
         result["concentration_swing"] = concentration_swing
         result["concentration_structural"] = concentration_structural
 
-        # ---- 2. Forza relativa settoriale a 63 sedute ----
+        # ---- 2. Forza relativa settoriale su tre finestre ----
         sector_rs = []
         for sym in SECTOR_ETFS:
             closes = series.get(sym)
@@ -272,51 +377,116 @@ class MacroAnalyst(BaseAgent):
             w = self._windows(closes, params)
             sector_rs.append({
                 "sector": sym,
+                "rs_short": round(w["r_short"] - spy_w["r_short"], 2),
                 "rs_swing": round(w["r_swing"] - spy_w["r_swing"], 2),
                 "rs_structural": round(w["r_structural"] - spy_w["r_structural"], 2),
                 "r_short": w["r_short"],
+                "r_swing": w["r_swing"],
+                "r_structural": w["r_structural"],
             })
 
-        sector_rs.sort(key=lambda x: x["rs_structural"], reverse=True)
+        if not sector_rs:
+            return result
+
+        sector_rs = self._classify_sectors(sector_rs, params)
+
+        # L'elenco viene ordinato per forza relativa CORRENTE (finestra swing):
+        # e' la risposta a "chi traina adesso".
+        sector_rs.sort(key=lambda x: x["rank_swing"])
+
         result["sectors"] = sector_rs
         result["sectors_total"] = len(sector_rs)
+        result["sectors_above_spy"] = len([s for s in sector_rs if s["rs_structural"] > 0])
+        result["sectors_above_spy_swing"] = len([s for s in sector_rs if s["rs_swing"] > 0])
 
-        if sector_rs:
-            above = [s for s in sector_rs if s["rs_structural"] > 0]
-            result["sectors_above_spy"] = len(above)
-            result["sector_dispersion"] = round(
-                sector_rs[0]["rs_structural"] - sector_rs[-1]["rs_structural"], 2
-            )
-            result["top_sectors"] = [s["sector"] for s in sector_rs[:3]]
-            result["bottom_sectors"] = [s["sector"] for s in sector_rs[-3:]]
+        top_n = int(params.get("leadership_top_n", 3))
 
-            top3 = set(result["top_sectors"])
-            defensive_in_top = len(DEFENSIVE_SECTORS & top3)
-            cyclical_in_top = len(CYCLICAL_SECTORS & top3)
+        by_structural = sorted(sector_rs, key=lambda x: x["rank_structural"])
+        top_structural = [s["sector"] for s in by_structural[:top_n]]
+        top_current = [s["sector"] for s in sector_rs[:top_n]]
 
-            if defensive_in_top >= 2:
-                result["sector_leadership"] = "DEFENSIVE_LED"
-            elif cyclical_in_top >= 2:
-                result["sector_leadership"] = "CYCLICAL_LED"
-            elif "XLK" in top3 or "XLC" in top3:
-                result["sector_leadership"] = "TECH_LED"
-            else:
-                result["sector_leadership"] = "MIXED"
+        result["top_sectors"] = top_current
+        result["top_sectors_structural"] = top_structural
+        result["bottom_sectors"] = [s["sector"] for s in sector_rs[-top_n:]]
 
-        # ---- 3. Participation score ----
+        result["sector_dispersion"] = round(
+            by_structural[0]["rs_structural"] - by_structural[-1]["rs_structural"], 2
+        )
+
+        # ---- 3. Stato di rotazione ----
+        overlap = len(set(top_structural) & set(top_current))
+        result["rotation_overlap"] = overlap
+
+        if overlap <= 1:
+            rotation_state = "ROTATION_IN_PROGRESS"
+        elif overlap == top_n - 1:
+            rotation_state = "ROTATION_STARTING"
+        else:
+            rotation_state = "STABLE_LEADERSHIP"
+
+        result["rotation_state"] = rotation_state
+
+        result["emerging_leaders"] = [
+            s["sector"] for s in sector_rs if s["status"] == "EMERGING_LEADER"
+        ]
+        result["fading_leaders"] = [
+            s["sector"] for s in sector_rs if s["status"] == "FADING_LEADER"
+        ]
+        result["improving_sectors"] = [
+            s["sector"] for s in sector_rs if s["status"] == "IMPROVING"
+        ]
+        result["deteriorating_sectors"] = [
+            s["sector"] for s in sector_rs if s["status"] == "DETERIORATING"
+        ]
+
+        # ---- 4. Settori su cui concentrarsi ----
+        # Priorita' a chi guida ora, poi a chi consolida, poi a chi risale.
+        priority = {
+            "EMERGING_LEADER": 0,
+            "ESTABLISHED_LEADER": 1,
+            "IMPROVING": 2,
+        }
+
+        # I leader entrano sempre. Gli IMPROVING solo se sono gia' risaliti
+        # nella meta' alta della classifica: un settore che migliora ma resta
+        # in fondo non e' un posto dove cercare titoli.
+        improving_rank_limit = top_n * 2
+        focus_candidates = []
+        for s in sector_rs:
+            status = s["status"]
+            if status in ("EMERGING_LEADER", "ESTABLISHED_LEADER"):
+                focus_candidates.append(s)
+            elif status == "IMPROVING" and s["rank_swing"] <= improving_rank_limit:
+                focus_candidates.append(s)
+
+        focus_candidates.sort(
+            key=lambda x: (priority[x["status"]], -x["rs_swing"])
+        )
+        focus_limit = int(params.get("focus_max_sectors", 4))
+        result["focus_sectors"] = [s["sector"] for s in focus_candidates[:focus_limit]]
+
+        result["avoid_sectors"] = [
+            s["sector"] for s in sector_rs
+            if s["status"] in ("FADING_LEADER", "DETERIORATING")
+        ]
+
+        # ---- 5. Etichette di gruppo ----
+        result["sector_leadership"] = self._group_label(top_current)
+        result["sector_leadership_structural"] = self._group_label(top_structural)
+
+        # ---- 6. Participation score ----
         # 50 = partecipazione normale. Sopra = ampia. Sotto = stretta.
         participation = 50.0
         participation -= concentration_swing * 8
         participation += iwm.get("rs_swing", 0.0) * 4
 
-        if result["sectors_total"] > 0:
-            pct_above = result["sectors_above_spy"] / result["sectors_total"] * 100
-            participation += (pct_above - 45) * 0.4
+        pct_above = result["sectors_above_spy_swing"] / result["sectors_total"] * 100
+        participation += (pct_above - 45) * 0.4
 
         participation = round(self._clamp(participation, 5, 95), 1)
         result["participation_score"] = participation
 
-        # ---- 4. Stato di leadership ----
+        # ---- 7. Stato di leadership complessivo ----
         concentration_threshold = params.get("concentration_threshold", 1.5)
         broad_tolerance = params.get("broad_tolerance", 0.5)
 
@@ -328,7 +498,7 @@ class MacroAnalyst(BaseAgent):
             description = "Partecipazione ampia, equal weight in linea con SPY"
         elif concentration_swing > concentration_threshold and qqq.get("rs_swing", 0.0) > 0:
             state = "MEGA_CAP_NARROW"
-            description = "Rialzo stretto guidato dalle mega cap tecnologiche"
+            description = "Rialzo stretto guidato dalle mega cap"
         elif concentration_swing > concentration_threshold:
             state = "NARROW_NON_TECH"
             description = "Rialzo stretto non guidato dalla tecnologia"
@@ -344,6 +514,12 @@ class MacroAnalyst(BaseAgent):
         ):
             state = "DEFENSIVE_LED"
             description = "Partecipazione presente ma guidata dai difensivi"
+
+        # La rotazione arricchisce la descrizione senza sovrascrivere lo stato
+        if rotation_state != "STABLE_LEADERSHIP" and result["emerging_leaders"]:
+            emerging = ", ".join(result["emerging_leaders"])
+            fading = ", ".join(result["fading_leaders"]) or "nessuno"
+            description = f"{description}. Rotazione: {emerging} emergente, {fading} in calo"
 
         result["state"] = state
         result["description"] = description
@@ -419,13 +595,9 @@ class MacroAnalyst(BaseAgent):
         """
         Percentuale di titoli sopra la SMA 200 per ogni settore.
 
-        v3.1 — FIX MEMORIA PRINCIPALE
-        La versione precedente costruiva un dizionario con le barre COMPLETE
-        di tutti i 300 ticker, poi usava solo le ultime 200. Erano oltre
-        110 MB tenuti in RAM contemporaneamente.
-
-        Ora MongoDB restituisce solo le ultime 200 barre ($slice) e il cursore
-        viene consumato in streaming: si accumulano solo i contatori, non i dati.
+        v3.1 — FIX MEMORIA
+        MongoDB restituisce solo le ultime 200 barre ($slice) e il cursore
+        viene consumato in streaming: si accumulano solo i contatori.
         """
         from app.services.data_fetcher import SECTOR_STOCKS
 
@@ -443,7 +615,6 @@ class MacroAnalyst(BaseAgent):
             "XLV":  {"threshold": 11, "weight": 16.27},
         }
 
-        # Mappa ticker -> settore, per classificare in streaming
         ticker_to_sector = {}
         for sec, tickers in SECTOR_STOCKS.items():
             if sec not in SECTOR_CFG:
@@ -472,7 +643,6 @@ class MacroAnalyst(BaseAgent):
             if closes[-1] > sma:
                 counters[sec]["above"] += 1
 
-            # Liberiamo subito: il cursore puo' contenere centinaia di documenti
             del closes
 
         sectors_status = []
@@ -568,8 +738,7 @@ class MacroAnalyst(BaseAgent):
         swing_w = params.get("swing_window", 20)
         structural_w = params.get("structural_window", 63)
 
-        # Pre-carica SPY con la finestra piu' ampia richiesta (Crash Radar):
-        # cosi' tutte le funzioni successive riusano la stessa serie.
+        # Pre-carica SPY con la finestra piu' ampia richiesta (Crash Radar)
         await self._load_price_series(db, ["SPY"], CRASH_RADAR_BARS)
 
         # ============================================
@@ -596,7 +765,6 @@ class MacroAnalyst(BaseAgent):
                 ema_slope = ((spy_ema20 - spy_ema50) / spy_ema50) * 100
                 spy_trend_score += min(15, ema_slope * 3)
 
-            # Multi-timeframe: swing pesa di piu', short segnala le svolte
             spy_trend_score += self._clamp(spy_r_swing * 1.2, -12, 12)
             spy_trend_score += self._clamp(spy_r_short * 1.0, -6, 8)
             spy_trend_score += self._clamp(spy_r_structural * 0.4, -6, 8)
@@ -805,10 +973,12 @@ class MacroAnalyst(BaseAgent):
                 "rsi": s.get("rsi", 50),
             })
 
+        # Il segnale di rotazione usa la leadership CORRENTE, non quella
+        # strutturale: risponde a "dove sta andando il capitale adesso".
         sector_leadership = leadership.get("sector_leadership", "UNKNOWN")
         if sector_leadership == "DEFENSIVE_LED":
             rotation_signal = "defensive"
-        elif sector_leadership in ("CYCLICAL_LED", "TECH_LED"):
+        elif sector_leadership in ("CYCLICAL_LED", "GROWTH_LED"):
             rotation_signal = "offensive"
         else:
             rotation_signal = "mixed"
@@ -831,7 +1001,6 @@ class MacroAnalyst(BaseAgent):
         breadth_pct = round((above_ema50 / total_stocks * 100), 1) if total_stocks > 0 else 50
         breadth_score = self._clamp(breadth_pct * 1.4 - 20, 5, 95)
 
-        # La partecipazione misurata dai ratio corregge il breadth puro
         participation_score = leadership.get("participation_score", 50)
         breadth_score = self._clamp(breadth_score * 0.7 + participation_score * 0.3, 5, 95)
 
@@ -912,13 +1081,15 @@ class MacroAnalyst(BaseAgent):
         # 10. REGIME DETTAGLIATO
         # ============================================
         leadership_state = leadership.get("state", "UNKNOWN")
+        rotation_state = leadership.get("rotation_state", "UNKNOWN")
+        emerging_leaders = leadership.get("emerging_leaders", [])
+
         early_threshold = params.get("early_recovery_short_return", 1.5)
         intraday_threshold = params.get("intraday_strong_move", 1.0)
 
         # I rendimenti multi-timeframe usano barre CHIUSE, quindi durante la
         # seduta non vedono il movimento del giorno. Il change_pct di SPY e'
-        # invece aggiornato live: lo usiamo come condizione alternativa, non
-        # sommandolo, per evitare doppi conteggi.
+        # invece aggiornato live: lo usiamo come condizione alternativa.
         intraday_strong = spy_change >= intraday_threshold
         short_strong = (
             (spy_r_short >= early_threshold and avg_short > 0)
@@ -946,9 +1117,17 @@ class MacroAnalyst(BaseAgent):
             if short_strong and swing_weak:
                 regime_detail = "EARLY_RECOVERY"
                 detail_reason = "Momentum di breve in ripresa su trend ancora debole"
+                if emerging_leaders:
+                    detail_reason += f", guidato da {', '.join(emerging_leaders)}"
             elif leadership_state == "DEFENSIVE_LED" and not swing_strong:
                 regime_detail = "ROTATION"
                 detail_reason = "Rotazione verso i settori difensivi"
+            elif rotation_state == "ROTATION_IN_PROGRESS" and not swing_strong:
+                regime_detail = "ROTATION"
+                detail_reason = (
+                    f"Cambio di leadership in corso: "
+                    f"{', '.join(emerging_leaders) or 'nessun leader chiaro'}"
+                )
             elif market_regime == "NEUTRAL" and narrow:
                 regime_detail = "NARROW_BULL" if spy_r_swing > 0 else "NEUTRAL"
                 detail_reason = "Mercato sostenuto da poche mega cap"
@@ -967,10 +1146,8 @@ class MacroAnalyst(BaseAgent):
         base_exposure = exposure_map.get(market_regime, 0.5)
         exposure_multiplier = exposure_map.get(regime_detail, base_exposure)
 
-        # Regola di prudenza:
-        # EARLY_RECOVERY e' l'unico stato che puo' ALZARE l'esposizione, perche'
+        # EARLY_RECOVERY e' l'unico stato che puo' ALZARE l'esposizione:
         # serve proprio a non perdere la svolta dopo una fase debole.
-        # Tutti gli altri raffinamenti possono solo ridurla.
         if regime_detail == "EARLY_RECOVERY":
             exposure_multiplier = max(exposure_multiplier, base_exposure)
         else:
@@ -987,6 +1164,8 @@ class MacroAnalyst(BaseAgent):
                 "pending_count": pending_count,
                 "raw_confidence": raw_confidence,
                 "smoothed_confidence": smoothed_confidence,
+                "rotation_state": rotation_state,
+                "focus_sectors": leadership.get("focus_sectors", []),
                 "updated_at": datetime.utcnow(),
             }},
             upsert=True,
@@ -1022,6 +1201,11 @@ class MacroAnalyst(BaseAgent):
             "exposure_multiplier": round(exposure_multiplier, 2),
             "volatility_regime": volatility_regime,
             "rotation_signal": rotation_signal,
+            "rotation_state": rotation_state,
+            "focus_sectors": leadership.get("focus_sectors", []),
+            "avoid_sectors": leadership.get("avoid_sectors", []),
+            "emerging_leaders": leadership.get("emerging_leaders", []),
+            "fading_leaders": leadership.get("fading_leaders", []),
             "crypto_sentiment": crypto_sentiment,
             "dollar_strength": dollar_strength,
             "market_breadth": market_breadth,
@@ -1125,8 +1309,9 @@ class MacroAnalyst(BaseAgent):
 
         if llm_available():
             try:
-                sector_line = ", ".join(
-                    f"{s['sector']} {s['rs_structural']:+.1f}%"
+                sector_line = " | ".join(
+                    f"{s['sector']} {swing_w}g {s['rs_swing']:+.1f}% "
+                    f"{structural_w}g {s['rs_structural']:+.1f}% [{s['status']}]"
                     for s in leadership.get("sectors", [])[:5]
                 ) or "n/d"
 
@@ -1141,10 +1326,15 @@ class MacroAnalyst(BaseAgent):
                     f"VIXY: ${vixy_price:.1f}\n"
                     f"Breadth: {breadth_pct:.1f}% sopra EMA50\n"
                     f"Leadership: {leadership_state} ({leadership.get('description', '')})\n"
+                    f"Stato rotazione: {rotation_state}\n"
+                    f"Leader strutturali {structural_w}g: "
+                    f"{', '.join(leadership.get('top_sectors_structural', [])) or 'n/d'}\n"
+                    f"Leader correnti {swing_w}g: "
+                    f"{', '.join(leadership.get('top_sectors', [])) or 'n/d'}\n"
+                    f"Emergenti: {', '.join(leadership.get('emerging_leaders', [])) or 'nessuno'}\n"
+                    f"In calo: {', '.join(leadership.get('fading_leaders', [])) or 'nessuno'}\n"
+                    f"Dettaglio settori: {sector_line}\n"
                     f"Concentrazione mega cap: {leadership.get('concentration_swing', 0):+.2f}%\n"
-                    f"Settori sopra SPY: {leadership.get('sectors_above_spy', 0)}/"
-                    f"{leadership.get('sectors_total', 0)}\n"
-                    f"Forza relativa settori {structural_w}g: {sector_line}\n"
                     f"Credito: HYG-LQD {credit_spread:+.2f}%\n"
                     f"Regime calcolato: {market_regime} / {regime_detail} "
                     f"(confidence {smoothed_confidence}, raw {raw_confidence})\n"
@@ -1161,15 +1351,14 @@ class MacroAnalyst(BaseAgent):
                     system_prompt=(
                         "Sei un analista macro esperto di swing trading. "
                         "Analizza i dati in max 4 frasi in italiano. "
-                        "Indica: 1) Il regime e soprattutto CHI sta trainando il mercato "
-                        "(mega cap, small cap, difensivi o ciclici), "
-                        "2) Se il rialzo e' ampio o stretto e perche' conta, "
-                        "3) La differenza tra momentum di breve e trend swing, "
-                        "4) Il rischio principale. "
+                        "Indica: 1) CHI sta trainando il mercato adesso e se e' "
+                        "cambiato rispetto al trimestre, 2) Se e' in corso una "
+                        "rotazione settoriale e verso cosa, 3) La differenza tra "
+                        "momentum di breve e trend swing, 4) Il rischio principale. "
                         "Sii diretto e concreto, senza disclaimer."
                     ),
                     user_prompt=f"Dati di mercato:\n{data_summary}",
-                    max_tokens=220,
+                    max_tokens=240,
                     temperature=0.3,
                     agent_name="macro_analyst",
                 )
@@ -1191,10 +1380,15 @@ class MacroAnalyst(BaseAgent):
             upsert=True,
         )
 
-        print(f"MacroAnalyst v3.1: {market_regime}/{regime_detail} "
-              f"(conf={smoothed_confidence}, raw={raw_confidence}, "
-              f"exposure={exposure_multiplier}, breadth={breadth_pct}%, "
-              f"leadership={leadership_state})")
+        focus = ", ".join(leadership.get("focus_sectors", [])) or "nessuno"
+        print(f"MacroAnalyst v3.2: {market_regime}/{regime_detail} "
+              f"(conf={smoothed_confidence}, exposure={exposure_multiplier}, "
+              f"breadth={breadth_pct}%)")
+        print(f"  Leadership: {leadership_state} | {rotation_state} | focus: {focus}")
+
+        if leadership.get("emerging_leaders"):
+            print(f"  Emergenti: {', '.join(leadership['emerging_leaders'])} | "
+                  f"In calo: {', '.join(leadership.get('fading_leaders', [])) or 'nessuno'}")
 
         # Libera la cache: le serie prezzi non servono oltre il run
         self._series_cache = {}
@@ -1228,12 +1422,14 @@ class MacroAnalyst(BaseAgent):
         correct = 0
         total = 0
         by_regime = {}
+        by_rotation = {}
 
         for dec in pending:
             data = dec.get("data", {})
             spy_then = data.get("details", {}).get("spy", {}).get("price", 0)
             regime_then = data.get("market_regime", "NEUTRAL")
             detail_then = data.get("regime_detail", regime_then)
+            rotation_then = data.get("rotation_state", "UNKNOWN")
 
             if spy_then <= 0 or spy_price_now <= 0:
                 continue
@@ -1268,6 +1464,11 @@ class MacroAnalyst(BaseAgent):
             if was_correct:
                 bucket["correct"] += 1
 
+            rot_bucket = by_rotation.setdefault(rotation_then, {"total": 0, "correct": 0})
+            rot_bucket["total"] += 1
+            if was_correct:
+                rot_bucket["correct"] += 1
+
             outcome = {
                 "correct": was_correct,
                 "spy_price_then": spy_then,
@@ -1275,21 +1476,24 @@ class MacroAnalyst(BaseAgent):
                 "actual_return_pct": round(actual_return, 2),
                 "regime_predicted": regime_then,
                 "regime_detail_predicted": detail_then,
+                "rotation_state": rotation_then,
             }
             await self.record_outcome(str(dec["_id"]), outcome)
 
         accuracy = (correct / total * 100) if total > 0 else 50
 
-        for name, bucket in by_regime.items():
-            bucket["accuracy"] = round(
-                bucket["correct"] / bucket["total"] * 100, 1
-            ) if bucket["total"] > 0 else 0
+        for buckets in (by_regime, by_rotation):
+            for name, bucket in buckets.items():
+                bucket["accuracy"] = round(
+                    bucket["correct"] / bucket["total"] * 100, 1
+                ) if bucket["total"] > 0 else 0
 
         await self.save_params(params)
         await self.save_performance({
             "accuracy": round(accuracy, 1),
             "total_evaluated": total,
             "by_regime": by_regime,
+            "by_rotation": by_rotation,
         })
 
         return {
@@ -1297,4 +1501,5 @@ class MacroAnalyst(BaseAgent):
             "correct": correct,
             "accuracy": round(accuracy, 1),
             "by_regime": by_regime,
+            "by_rotation": by_rotation,
         }
