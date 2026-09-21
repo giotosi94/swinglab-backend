@@ -20,7 +20,7 @@ SECTOR_STOCKS = {
     "XLK": ["AAPL","MSFT","NVDA","AVGO","AMD","CRM","ADBE","INTC","CSCO","ORCL",
             "PLTR","NOW","SNOW","CRWD","PANW","MNDY","SHOP","XYZ","UBER","DDOG"],
     "XLF": ["JPM","BAC","WFC","GS","MS","BLK","SCHW","AXP","C","USB",
-            "V","MA","PYPL","COF","ICE","SPGI","MCO","MMC","AON","TFC"],
+            "V","MA","PYPL","COF","ICE","SPGI","MCO","MRSH","AON","TFC"],
     "XLV": ["UNH","JNJ","PFE","ABBV","MRK","TMO","ABT","LLY","BMY","AMGN",
             "ISRG","DXCM","VRTX","REGN","ZTS","HCA","CI","ELV","HUM","SYK"],
     "XLI": ["CAT","DE","UNP","HON","BA","RTX","LMT","GE","MMM","FDX",
@@ -30,14 +30,14 @@ SECTOR_STOCKS = {
     "XLP": ["PG","KO","PEP","COST","WMT","PM","MO","CL","MDLZ","KHC",
             "STZ","SYY","HSY","GIS","ADM","MNST","KDP","CHD","CLX","SJM"],
     "XLE": ["XOM","CVX","COP","SLB","EOG","MPC","PSX","VLO","OXY","HAL",
-            "DVN","FANG","WMB","KMI","TRGP","BKR","MRO","APA","AR"],
+            "DVN","FANG","WMB","KMI","TRGP","BKR","APA","AR"],
     "XLU": ["NEE","DUK","SO","D","AEP","SRE","EXC","XEL","ED","WEC",
             "AWK","ES","ATO","CMS","PNW","PPL","FE","DTE","AES","ETR"],
     "XLB": ["LIN","APD","SHW","FCX","NEM","ECL","DOW","NUE","VMC","MLM",
-            "CF","MOS","BALL","PKG","IFF","EMN","CE","RPM","SEE","AVY"],
-    "XLRE": ["PLD","AMT","CCI","EQIX","SPG","PSA","O","WELL","DLR","AVB",
+            "CF","MOS","BALL","PKG","IFF","EMN","CE","RPM","AVY"],
+    "XLRE": ["PLD","AMT","CCI","EQIX","SPG","PSA","O","WELL","DLR","VMRK",
              "VICI","MAA","EXR","ARE","UDR","ESS","REG","HST","KIM","CPT"],
-    "XLC": ["META","GOOGL","GOOG","NFLX","DIS","CMCSA","T","VZ","TMUS","EA",
+    "XLC": ["META","GOOGL","GOOG","NFLX","DIS","CMCSA","T","VZ","TMUS",
             "SPOT","RBLX","TTWO","WBD","PARA","MTCH","ZM","PINS","SNAP","LYV"],
 }
 
@@ -49,7 +49,7 @@ ALPACA_HEADERS = {
 ALPACA_DATA_URL = "https://data.alpaca.markets"
 MAX_STORED_BARS = 1000
 MAX_STALE_CALENDAR_DAYS = 7
-LEGACY_TICKERS = ["CTRA", "SQ"]
+LEGACY_TICKERS = ["CTRA", "SQ", "SEE", "EA", "MRO", "AVB", "MMC"]
 
 
 def _data_freshness(df):
