@@ -3,9 +3,86 @@ from app.agents.base_agent import BaseAgent
 from app.db.mongodb import get_db
 
 
+# ==========================================================
+# PROIEZIONI MONGODB — controllo della memoria
+# ==========================================================
+# Dopo Max Strategy v1.5.2 il campo max_strategy e' diventato il blocco
+# piu' pesante del documento asset: contiene weekly_context,
+# daily_confirmation, execution_4h, structural_base, entry_plan e i
+# profili POC. Su 300 titoli sono circa 13 MB di documenti, che decodificati
+# in dizionari Python occupano molto di piu'.
+#
+# Ne' il calcolo della confluence ne' i modelli ML usano quei dati, quindi
+# vengono esclusi. Lo shadow di Max Strategy li rilegge a parte, ma solo
+# nei singoli campi che gli servono davvero.
+ASSET_PROJECTION = {
+    "price_history": 0,
+    "vp_distribution": 0,
+    "multi_tf_vp": 0,
+    "max_strategy": 0,
+    "alpha_snapshot": 0,
+    "history": 0,
+}
+
+# Solo i campi effettivamente letti da _build_max_strategy_shadow.
+# Una proiezione positiva su sottocampi annidati evita di riportare in
+# memoria l'intero blocco Max Strategy.
+MAX_SHADOW_PROJECTION = {
+    "ticker": 1,
+    "price": 1,
+    "max_strategy.strategy_type": 1,
+    "max_strategy.strategy_eligible": 1,
+    "max_strategy.trade_ready": 1,
+    "max_strategy.max_score": 1,
+    "max_strategy.rejection_reasons": 1,
+    "max_strategy.market_phase.phase": 1,
+    "max_strategy.entry_plan.status": 1,
+    "max_strategy.entry_plan.order_action": 1,
+    "max_strategy.entry_plan.execution_mode": 1,
+    "max_strategy.entry_plan.trigger_price": 1,
+    "max_strategy.entry_plan.maximum_entry_price": 1,
+    "max_strategy.entry_plan.invalidation_price": 1,
+    "max_strategy.entry_plan.blocking_phase": 1,
+    "max_strategy.entry_plan.weekly_plan_qualified": 1,
+}
+
+# Barre necessarie al calcolo ATR: 14 periodi piu' la chiusura precedente.
+ATR_BARS = 20
+
+
 class AlphaStrategist(BaseAgent):
     """
-    🎯 AGENTE 2: Alpha Strategist v2.0 — "Lo Stock Picker with ML"
+    🎯 AGENTE 2: Alpha Strategist v2.2 — "Stock Picker with ML + Leadership"
+
+    v2.2 — DUE INTERVENTI
+
+    1) MEMORIA
+       analyze() caricava 300 asset escludendo solo tre campi, quindi si
+       portava in RAM anche tutto max_strategy. Ora gli asset arrivano
+       senza i blocchi pesanti e lo shadow Max Strategy rilegge a parte
+       soltanto i campi che usa davvero.
+
+    2) LEADERSHIP
+       Il MacroAnalyst v3.3 calcola dove sta andando il capitale e lo
+       scrive in market_context. L'Alpha riceveva quei dati ma non li
+       leggeva mai.
+
+       Il collegamento NON e' un bonus di punti sulla confluence: quella
+       strada era gia' stata bocciata dai backtest, perche' gonfiare lo
+       score corrompe il confronto fra titoli di settori diversi.
+
+       Qui la leadership modula la SOGLIA, non il punteggio:
+
+         settore in focus    -> soglia leggermente piu' bassa
+         settore da evitare  -> soglia piu' alta
+         settore in deflusso -> soglia piu' alta
+
+       Un titolo mantiene quindi la sua confluence reale. Cambia solo
+       quanto dobbiamo essere esigenti per accettarlo.
+
+       La soglia non scende mai sotto min_confluence_floor: la leadership
+       puo' rendere il sistema piu' attento, mai indiscriminato.
+
     Seleziona le migliori opportunita' di acquisto e identifica segnali di vendita.
     Usa il MarketContext prodotto dal MacroAnalyst per contestualizzare le decisioni.
     
@@ -18,7 +95,7 @@ class AlphaStrategist(BaseAgent):
     """
 
     def __init__(self):
-        super().__init__(name="alpha_strategist", version="2.0")
+        super().__init__(name="alpha_strategist", version="2.2")
         # v2.0 — Confluence max score teorico (13 factors + 2 ML)
         # Original: 15.0 (13 factors)
         # + Factor 14 (ML WIN/LOSS): 2.5 max
@@ -72,8 +149,139 @@ class AlphaStrategist(BaseAgent):
             "trend_confidence_threshold_strong": 0.60,  # UP prob >60% = forte
             "trend_confidence_threshold_medium": 0.50,  # UP prob >50% = medio
             # 🆕 v2.0 — Sell signal ML
-            "sell_ml_loss_threshold": 0.30,  # se ML dice WIN score <30% + in perdita → sell
+            "sell_ml_loss_threshold": 0.30,
+
+            # ============================================
+            # 🆕 v2.2 — LEADERSHIP: modula la soglia, non il punteggio
+            # ============================================
+            "leadership_enabled": True,
+
+            # Quanto abbassare la soglia dove il capitale sta arrivando
+            "focus_threshold_discount": 3.0,
+
+            # Quanto alzarla dove la struttura si sta deteriorando
+            "avoid_threshold_premium": 5.0,
+
+            # Quanto alzarla dove oggi esce denaro
+            "outflow_threshold_premium": 3.0,
+
+            # La soglia non scende mai sotto questo valore, qualunque sia
+            # la leadership. Allineato al floor del learning loop.
+            "min_confluence_floor": 42,
+
+            # Peso del riordino: influenza solo CHI entra nei top 10,
+            # non la confluence riportata al RiskManager.
+            "leadership_sort_weight": 2.0,
+
+            # weak_sectors resta salvato e visibile ma non penalizza piu'
+            # gli acquisti: la leadership del MacroAnalyst e' piu' aggiornata
+            # e guarda il mercato, non solo lo storico dei nostri trade.
+            "weak_sector_penalty_enabled": False,  # se ML dice WIN score <30% + in perdita → sell
         }
+
+    def _build_leadership_context(self, market_ctx: dict, params: dict) -> dict:
+        """
+        🆕 v2.2 — Estrae dal MarketContext dove sta andando il capitale.
+
+        Il MacroAnalyst v3.3 distingue gia' fra denaro che conferma un trend
+        e balzo isolato di una giornata: gli ONE_DAY_SPIKE sono esclusi a
+        monte dai focus_sectors. Qui li riceviamo solo per poterli mostrare.
+        """
+        enabled = bool(params.get("leadership_enabled", True))
+
+        ctx = {
+            "enabled": enabled,
+            "available": False,
+            "focus": [],
+            "avoid": [],
+            "inflow": [],
+            "outflow": [],
+            "spike": [],
+            "state": (market_ctx.get("leadership") or {}).get("state", "UNKNOWN"),
+            "rotation_state": market_ctx.get("rotation_state", "UNKNOWN"),
+            "regime_detail": market_ctx.get("regime_detail", "UNKNOWN"),
+            "flow_summary": market_ctx.get("flow_summary", ""),
+            "intraday_available": bool(market_ctx.get("intraday_available", False)),
+        }
+
+        if not enabled:
+            return ctx
+
+        focus = [s for s in (market_ctx.get("focus_sectors") or []) if s]
+        avoid = [s for s in (market_ctx.get("avoid_sectors") or []) if s]
+
+        # Il MacroAnalyst garantisce gia' che le due liste siano disgiunte,
+        # ma non vogliamo dipendere da quella garanzia: se un settore finisse
+        # in entrambe, prudenza prima di tutto e vince avoid.
+        focus = [s for s in focus if s not in avoid]
+
+        ctx["focus"] = focus
+        ctx["avoid"] = avoid
+        ctx["inflow"] = [s for s in (market_ctx.get("inflow_sectors") or []) if s]
+        ctx["outflow"] = [s for s in (market_ctx.get("outflow_sectors") or []) if s]
+        ctx["spike"] = [s for s in (market_ctx.get("spike_sectors") or []) if s]
+        ctx["available"] = bool(focus or avoid or ctx["outflow"])
+
+        return ctx
+
+    def _sector_threshold(self, sector: str, base_threshold: float,
+                          leadership: dict, params: dict) -> tuple:
+        """
+        🆕 v2.2 — Soglia di confluence specifica per il settore.
+
+        Ritorna (soglia, motivo).
+
+        La logica e' deliberatamente asimmetrica: lo sconto dove arriva
+        denaro e' piccolo, il premio dove esce e' piu' grande. Sbagliare
+        entrando dove il capitale sta uscendo costa piu' che perdere
+        un'occasione dove sta arrivando.
+        """
+        if not leadership.get("enabled") or not leadership.get("available"):
+            return float(base_threshold), "no_leadership"
+
+        floor = float(params.get("min_confluence_floor", 42))
+        threshold = float(base_threshold)
+        reason = "neutral"
+
+        if sector in leadership["avoid"]:
+            threshold += float(params.get("avoid_threshold_premium", 5.0))
+            reason = "avoid_sector"
+
+        elif sector in leadership["focus"]:
+            threshold -= float(params.get("focus_threshold_discount", 3.0))
+            reason = "focus_sector"
+
+        elif sector in leadership["outflow"]:
+            threshold += float(params.get("outflow_threshold_premium", 3.0))
+            reason = "outflow_sector"
+
+        # In CRASH la leadership non deve mai allentare nulla.
+        if leadership.get("regime_detail") == "CRASH":
+            threshold = max(threshold, float(base_threshold))
+            reason = "crash_no_discount"
+
+        # Lo sconto non puo' portare sotto il floor: la leadership rende il
+        # sistema piu' selettivo, non piu' permissivo in assoluto.
+        threshold = max(threshold, floor)
+
+        return round(threshold, 1), reason
+
+    async def _load_max_shadow_assets(self, db) -> list:
+        """
+        🆕 v2.2 — Carica SOLO i campi Max Strategy usati dallo shadow.
+
+        Gli asset principali ora escludono max_strategy per non saturare la
+        memoria. Lo shadow ne ha comunque bisogno, ma di pochi campi: li
+        rileggiamo con una proiezione stretta e in streaming, senza mai
+        costruire una lista di documenti completi.
+        """
+        rows = []
+        cursor = db.assets.find({}, MAX_SHADOW_PROJECTION)
+
+        async for doc in cursor:
+            rows.append(doc)
+
+        return rows
 
     async def _load_ml_predictions(self, db, assets: list, market_context: dict) -> dict:
         """
@@ -572,9 +780,15 @@ class AlphaStrategist(BaseAgent):
         """
         for c in candidates:
             try:
-                doc = await db.stock_bars.find_one({"ticker": c["ticker"]}, {"bars": 1})
+                # Il calcolo usa 14 periodi: chiedere a MongoDB solo le
+                # ultime barre evita di caricare in memoria tutto lo storico
+                # di ogni candidato.
+                doc = await db.stock_bars.find_one(
+                    {"ticker": c["ticker"]},
+                    {"bars": {"$slice": -ATR_BARS}},
+                )
                 bars = (doc or {}).get("bars", [])
-                if len(bars) < 20:
+                if len(bars) < 16:
                     continue
                 price = c["price"]
 
@@ -754,22 +968,30 @@ class AlphaStrategist(BaseAgent):
         # 🆕 v2.0 — Load ML predictions (calcolate on-the-fly dai modelli)
         # NOTA: dobbiamo passare gli assets che caricheremo tra poco
         # Per efficienza, carichiamo prima gli assets
-        assets_for_ml = await db.assets.find({}, {
-            "price_history": 0, "vp_distribution": 0, "multi_tf_vp": 0
-        }).to_list(300)
+        # 🆕 v2.2 — FIX MEMORIA
+        # La versione precedente escludeva solo tre campi e quindi caricava
+        # in RAM anche tutto max_strategy per 300 titoli. Ne' il calcolo
+        # della confluence ne' i modelli ML lo usano.
+        assets = await db.assets.find({}, ASSET_PROJECTION).to_list(400)
         
-        ml_map = await self._load_ml_predictions(db, assets_for_ml, market_ctx)
+        ml_map = await self._load_ml_predictions(db, assets, market_ctx)
         print(f"  📊 ML data loaded: {len(ml_map)} tickers with predictions")
 
-        # Riutilizza assets già caricati per ML (ottimizzazione)
-        assets = assets_for_ml
 
         if not assets:
             return {"buy_candidates": [], "sell_signals": [], "error": "No assets data"}
 
         assets_map = {a["ticker"]: a for a in assets}
         open_tickers = [p.get("symbol") for p in positions]
-        max_strategy_shadow = self._build_max_strategy_shadow(assets, open_tickers, market_ctx)
+        # Lo shadow Max Strategy rilegge a parte solo i campi che usa,
+        # poi libera subito la lista: non deve restare in memoria per tutto
+        # il resto della scansione.
+        shadow_assets = await self._load_max_shadow_assets(db)
+        max_strategy_shadow = self._build_max_strategy_shadow(
+            shadow_assets, open_tickers, market_ctx
+        )
+        del shadow_assets
+
         await db.agent_state.update_one(
             {"_id": "max_strategy_shadow"},
             {"$set": {**max_strategy_shadow, "updated_at": datetime.utcnow()}},
@@ -792,6 +1014,10 @@ class AlphaStrategist(BaseAgent):
         # BUY CANDIDATES
         # ============================================
         min_conf = params.get("min_confluence", 35)
+
+        # 🆕 v2.2 — Dove sta andando il capitale, secondo il MacroAnalyst
+        leadership = self._build_leadership_context(market_ctx, params)
+
         max_rsi = params.get("max_rsi_entry", 68)
         min_rsi = params.get("min_rsi_entry", 25)
         min_price_val = params.get("min_price", 2.0)
@@ -805,6 +1031,15 @@ class AlphaStrategist(BaseAgent):
         skipped_reasons = {"low_confluence": 0, "rsi_filter": 0, "setup_filter": 0,
                           "sector_full": 0, "price_filter": 0, "volume_filter": 0,
                           "already_open": 0}
+
+        # 🆕 v2.2 — Quanto ha pesato davvero la leadership su questa scansione
+        leadership_stats = {
+            "focus_passed": 0,
+            "avoid_blocked": 0,
+            "outflow_blocked": 0,
+            "focus_candidates": 0,
+            "avoid_candidates": 0,
+        }
 
         for a in assets:
             ticker = a.get("ticker", "")
@@ -855,16 +1090,42 @@ class AlphaStrategist(BaseAgent):
                 skipped_reasons["sector_full"] += 1
                 continue
 
-            sector_penalty = -5 if sector in weak_sectors else 0
+            # weak_sectors resta un dato osservato, non una penalita': deriva
+            # dallo storico dei nostri trade, mentre la leadership del
+            # MacroAnalyst guarda cosa sta facendo il mercato adesso.
+            if params.get("weak_sector_penalty_enabled", False):
+                sector_penalty = -5 if sector in weak_sectors else 0
+            else:
+                sector_penalty = 0
 
             # 🆕 v2.0 — Passa ml_data al calc_confluence
             ml_data = ml_map.get(ticker)
             conf = self._calc_confluence(a, market_ctx, params, ml_data)
             conf_score = conf["score"] + sector_penalty
 
-            if conf_score < min_conf:
+            # 🆕 v2.2 — La soglia dipende da dove sta andando il capitale.
+            # La confluence resta quella reale: cambia solo quanto siamo
+            # esigenti per accettarla.
+            sector_threshold, threshold_reason = self._sector_threshold(
+                sector, min_conf, leadership, params
+            )
+
+            if conf_score < sector_threshold:
                 skipped_reasons["low_confluence"] += 1
+
+                # Se il titolo sarebbe passato con la soglia base, e' stata
+                # la leadership a fermarlo: va tracciato.
+                if conf_score >= min_conf:
+                    if threshold_reason == "avoid_sector":
+                        leadership_stats["avoid_blocked"] += 1
+                    elif threshold_reason == "outflow_sector":
+                        leadership_stats["outflow_blocked"] += 1
+
                 continue
+
+            # Accettato grazie allo sconto sul settore di focus
+            if threshold_reason == "focus_sector" and conf_score < min_conf:
+                leadership_stats["focus_passed"] += 1
 
             # 🔧 v1.2 — Target e stop loss safety
             if va_low and 0 < va_low < price:
@@ -911,10 +1172,49 @@ class AlphaStrategist(BaseAgent):
                 "trend_prediction": ml_data.get("trend_prediction", "N/A") if ml_data else "N/A",
                 "trend_up_prob": ml_data.get("trend_up_prob", 0) if ml_data else 0,
                 "weekly_trend": a.get("mtf", {}).get("weekly_trend", "UNKNOWN"),
+
+                # 🆕 v2.2 — Contesto leadership del settore
+                "sector_flow": (
+                    "FOCUS" if sector in leadership["focus"]
+                    else "AVOID" if sector in leadership["avoid"]
+                    else "OUTFLOW" if sector in leadership["outflow"]
+                    else "NEUTRAL"
+                ),
+                "sector_threshold": sector_threshold,
+                "threshold_reason": threshold_reason,
             })
 
-        candidates.sort(key=lambda x: x["confluence"], reverse=True)
+        # 🆕 v2.2 — Ordinamento.
+        #
+        # La confluence resta intatta: quella va al RiskManager e viene
+        # mostrata a schermo. Il riordino usa un punteggio separato, che
+        # serve solo a decidere CHI entra nei primi 10 quando i punteggi
+        # sono vicini. A parita' sostanziale preferiamo il titolo che sta
+        # dove il capitale sta arrivando.
+        sort_weight = float(params.get("leadership_sort_weight", 2.0))
+
+        for c in candidates:
+            flow = c.get("sector_flow", "NEUTRAL")
+            if flow == "FOCUS":
+                adjustment = sort_weight
+            elif flow in ("AVOID", "OUTFLOW"):
+                adjustment = -sort_weight
+            else:
+                adjustment = 0.0
+            c["_sort_score"] = c["confluence"] + adjustment
+
+        candidates.sort(key=lambda x: x["_sort_score"], reverse=True)
         top_candidates = candidates[:10]
+
+        for c in candidates:
+            c.pop("_sort_score", None)
+
+        leadership_stats["focus_candidates"] = sum(
+            1 for c in top_candidates if c.get("sector_flow") == "FOCUS"
+        )
+        leadership_stats["avoid_candidates"] = sum(
+            1 for c in top_candidates if c.get("sector_flow") in ("AVOID", "OUTFLOW")
+        )
 
         # 🆕 Ricalcola target/stop ATR-based (R/R realistici, come backtest)
         top_candidates = await self._recalc_targets_atr(db, top_candidates)
@@ -963,6 +1263,19 @@ class AlphaStrategist(BaseAgent):
                         ml_info = f"\nML WIN/LOSS: {candidate['ml_prediction']} ({candidate.get('ml_score', 0):.0f}%)"
                         ml_info += f"\nTrend 5d: {candidate.get('trend_prediction', 'N/A')} (up_prob {candidate.get('trend_up_prob', 0):.0f}%)"
                     
+                    flow_info = ""
+                    sector_flow = candidate.get("sector_flow", "NEUTRAL")
+                    if sector_flow == "FOCUS":
+                        flow_info = (
+                            f"\nFlusso settore: capitale in ingresso su "
+                            f"{candidate.get('sector', '')}"
+                        )
+                    elif sector_flow in ("AVOID", "OUTFLOW"):
+                        flow_info = (
+                            f"\nFlusso settore: ATTENZIONE, capitale in uscita da "
+                            f"{candidate.get('sector', '')}"
+                        )
+
                     stock_data = (
                         f"Ticker: {candidate['ticker']} ({candidate.get('sector', '')})\n"
                         f"Prezzo: ${candidate['price']}\n"
@@ -976,6 +1289,7 @@ class AlphaStrategist(BaseAgent):
                         f"Fattori negativi: {', '.join(factors_fail)}\n"
                         f"Regime mercato: {market_ctx.get('market_regime', 'NEUTRAL')}"
                         f"{ml_info}"
+                        f"{flow_info}"
                     )
 
                     earnings_context = ""
@@ -1022,6 +1336,24 @@ class AlphaStrategist(BaseAgent):
             "top_confluence": top_candidates[0]["confluence"] if top_candidates else 0,
             # 🆕 v2.0 — ML stats
             "ml_data_loaded": len(ml_map),
+
+            # 🆕 v2.2 — Leadership
+            "leadership": {
+                "enabled": leadership["enabled"],
+                "available": leadership["available"],
+                "state": leadership["state"],
+                "rotation_state": leadership["rotation_state"],
+                "regime_detail": leadership["regime_detail"],
+                "intraday_available": leadership["intraday_available"],
+                "flow_summary": leadership["flow_summary"],
+                "focus_sectors": leadership["focus"],
+                "avoid_sectors": leadership["avoid"],
+                "outflow_sectors": leadership["outflow"],
+                "spike_sectors_ignored": leadership["spike"],
+                "base_threshold": min_conf,
+                "stats": leadership_stats,
+            },
+
             # 🆕 Sentiment stats
             "max_strategy_shadow": {
                 "mode": max_strategy_shadow["mode"],
@@ -1048,6 +1380,10 @@ class AlphaStrategist(BaseAgent):
                 "sell_tickers": [s["ticker"] for s in sell_signals],
                 "skipped": skipped_reasons,
                 "ml_data_loaded": len(ml_map),
+                "leadership_state": leadership["state"],
+                "focus_sectors": leadership["focus"],
+                "avoid_sectors": leadership["avoid"],
+                "leadership_stats": leadership_stats,
             },
             reasoning=f"Found {len(top_candidates)} buys, {len(sell_signals)} sells. "
                       f"Regime={market_ctx.get('market_regime')} "
@@ -1055,8 +1391,31 @@ class AlphaStrategist(BaseAgent):
             confidence=min(100, summary["top_confluence"]) if top_candidates else 20,
         )
 
-        print(f"🎯 AlphaStrategist v2.0: {len(top_candidates)} candidates, "
+        print(f"🎯 AlphaStrategist v2.2: {len(top_candidates)} candidates, "
               f"{len(sell_signals)} sell signals (ML: {len(ml_map)} tickers)")
+
+        if leadership["available"]:
+            focus_list = ", ".join(leadership["focus"]) or "nessuno"
+            avoid_list = ", ".join(leadership["avoid"]) or "nessuno"
+            discount = params.get("focus_threshold_discount", 3.0)
+            premium = params.get("avoid_threshold_premium", 5.0)
+
+            print(f"  🧭 Leadership: focus [{focus_list}] soglia {min_conf - discount:.0f} | "
+                  f"evita [{avoid_list}] soglia {min_conf + premium:.0f}")
+
+            if (leadership_stats["focus_passed"]
+                    or leadership_stats["avoid_blocked"]
+                    or leadership_stats["outflow_blocked"]):
+                print(f"     Effetto: +{leadership_stats['focus_passed']} accettati in focus, "
+                      f"-{leadership_stats['avoid_blocked']} bloccati in avoid, "
+                      f"-{leadership_stats['outflow_blocked']} bloccati in deflusso")
+
+            if leadership["spike"]:
+                print(f"     Ignorati (solo balzo di giornata): "
+                      f"{', '.join(leadership['spike'])}")
+        else:
+            print(f"  🧭 Leadership: non disponibile, soglia uniforme {min_conf} "
+                  f"su tutti i settori")
 
         return {
             "buy_candidates": top_candidates,
@@ -1161,6 +1520,10 @@ class AlphaStrategist(BaseAgent):
 
         params["best_setups"] = best_setups if best_setups else self.default_params()["best_setups"]
         params["worst_setups"] = worst_setups
+        # weak_sectors viene ancora calcolato e salvato perche' e' utile
+        # saperlo, ma non penalizza piu' gli acquisti: se ne occupa la
+        # leadership del MacroAnalyst, che guarda il mercato e non solo
+        # lo storico dei nostri trade.
         params["weak_sectors"] = weak_sectors
         params["min_confluence"] = round(min_conf, 1)
         params["max_rsi_entry"] = max_rsi
