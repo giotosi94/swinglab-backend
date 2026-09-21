@@ -181,6 +181,26 @@ async def list_all_tickers():
         "tickers": tickers,
     }
 
+@router.get("/max-strategy-risk-shadow")
+async def get_max_strategy_risk_shadow():
+    db = get_db()
+    shadow = await db.agent_state.find_one({"_id": "max_strategy_risk_shadow"})
+    if not shadow:
+        return {
+            "mode": "SHADOW_SIZING",
+            "live_execution_enabled": False,
+            "strategy_version": "max_structure_v1_5_2",
+            "decision_counts": {},
+            "candidates": [],
+            "message": "Risk shadow state not initialized",
+        }
+    shadow["_id"] = str(shadow["_id"])
+    value = shadow.get("updated_at")
+    if value and hasattr(value, "isoformat"):
+        shadow["updated_at"] = value.isoformat()
+    return shadow
+
+
 @router.get("/max-strategy-shadow")
 async def get_max_strategy_shadow():
     db = get_db()
