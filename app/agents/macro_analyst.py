@@ -20,36 +20,37 @@ CYCLICAL_SECTORS = {"XLE", "XLI", "XLB", "XLY", "XLF"}
 
 REGIME_LEVELS = ["CRASH", "BEAR", "NEUTRAL", "BULL"]
 
+# Barre richieste dal Crash Radar (circa un anno di sedute)
+CRASH_RADAR_BARS = 252
+
+# Barre richieste dal Sector Bottom Detector (SMA 200)
+SECTOR_BOTTOM_BARS = 200
+
 
 class MacroAnalyst(BaseAgent):
     """
-    AGENTE 1: Macro Analyst v3.0
+    AGENTE 1: Macro Analyst v3.1
 
-    Novita' rispetto alla v2.0:
+    v3.0 -> v3.1: ottimizzazione memoria.
 
-    1. MULTI-TIMEFRAME
-       Ogni componente usa rendimenti a 5, 20 e 63 sedute invece del solo
-       change_pct giornaliero. Il regime smette di oscillare per il rumore
-       di una singola seduta.
+    Il problema: su Render Starter (512 MB) il processo veniva riciclato
+    piu' volte al giorno. Il MacroAnalyst caricava in RAM le barre COMPLETE
+    di tutti i 300 ticker per il Sector Bottom Detector, usandone poi solo
+    le ultime 200. Con 883 barre per ticker e circa 445 byte per barra
+    decodificata in Python, erano oltre 110 MB per una singola funzione.
 
-    2. MARKET LEADERSHIP ENGINE
-       Calcola i ratio SPY/RSP, QQQ/SPY, IWM/SPY, DIA/SPY in trend e la
-       forza relativa settoriale a 63 sedute. Risponde alla domanda:
-       "chi sta realmente trainando il mercato?"
+    Interventi:
+      1. $slice lato MongoDB: arrivano solo le barre effettivamente usate.
+      2. Streaming nel Sector Bottom: nessun dizionario che accumula tutto.
+      3. Cache delle serie prezzi per singolo run: SPY veniva caricato
+         tre volte (indici, leadership, crash radar).
 
-    3. ISTERESI + CONFERMA + SMOOTHING
-       Il regime cambia solo se la confidence supera la soglia di un
-       margine e se la lettura viene confermata su piu' cicli.
-
-    4. REGIME DETTAGLIATO
-       Oltre a BULL/NEUTRAL/BEAR/CRASH (mantenuti per compatibilita' con
-       gli altri agenti) produce un regime_detail:
-       NARROW_BULL, PULLBACK_IN_UPTREND, EARLY_RECOVERY, ROTATION.
-       L'exposure_multiplier deriva dal regime dettagliato.
+    Logica di analisi invariata rispetto alla v3.0.
     """
 
     def __init__(self):
-        super().__init__(name="macro_analyst", version="3.0")
+        super().__init__(name="macro_analyst", version="3.1")
+        self._series_cache = {}
 
     def default_params(self) -> dict:
         return {
@@ -132,25 +133,41 @@ class MacroAnalyst(BaseAgent):
             "r_structural": self._pct_return(closes, structural),
         }
 
-    async def _load_price_series(self, db, symbols):
-        """Carica le chiusure daily per una lista di simboli."""
-        series = {}
-        cursor = db.stock_bars.find(
-            {"ticker": {"$in": symbols}},
-            {"ticker": 1, "bars": 1},
-        )
-        async for doc in cursor:
-            closes = [b["c"] for b in doc.get("bars", []) if b.get("c")]
-            if len(closes) >= 25:
-                series[doc["ticker"]] = closes
-        return series
+    async def _load_price_series(self, db, symbols, bars_needed):
+        """
+        Carica SOLO le chiusure necessarie, con $slice lato MongoDB.
+
+        Il risultato viene messo in cache per tutta la durata del run:
+        SPY serviva a tre funzioni diverse e veniva riletto ogni volta.
+        """
+        cache = self._series_cache
+        missing = [
+            sym for sym in symbols
+            if sym not in cache or cache[sym]["loaded"] < bars_needed
+        ]
+
+        if missing:
+            cursor = db.stock_bars.find(
+                {"ticker": {"$in": missing}},
+                {"ticker": 1, "bars": {"$slice": -bars_needed}},
+            )
+            async for doc in cursor:
+                closes = [b["c"] for b in doc.get("bars", []) if b.get("c")]
+                cache[doc["ticker"]] = {"closes": closes, "loaded": bars_needed}
+
+        return {
+            sym: cache[sym]["closes"]
+            for sym in symbols
+            if sym in cache and len(cache[sym]["closes"]) >= 25
+        }
 
     async def _symbol_windows(self, db, symbols, params):
         """
         Finestre multi-timeframe per ogni simbolo.
         Se mancano le barre, ripiega sui campi di market_regime.
         """
-        series = await self._load_price_series(db, symbols)
+        bars_needed = params.get("structural_window", 63) + 5
+        series = await self._load_price_series(db, symbols, bars_needed)
         out = {}
 
         for sym in symbols:
@@ -208,8 +225,9 @@ class MacroAnalyst(BaseAgent):
             "bottom_sectors": [],
         }
 
+        bars_needed = params.get("structural_window", 63) + 5
         symbols = MACRO_INDICES + SECTOR_ETFS
-        series = await self._load_price_series(db, symbols)
+        series = await self._load_price_series(db, symbols, bars_needed)
 
         spy_closes = series.get("SPY")
         if not spy_closes or len(spy_closes) < 25:
@@ -338,13 +356,19 @@ class MacroAnalyst(BaseAgent):
     # ==========================================================
 
     async def _calc_crash_radar(self, db, vixy_price: float) -> dict:
+        """
+        v3.1: usa la cache delle serie invece di rileggere SPY per intero.
+        """
         spy_dd_pct = 0.0
-        spy_bars_doc = await db.stock_bars.find_one({"ticker": "SPY"})
-        if spy_bars_doc and spy_bars_doc.get("bars"):
-            closes = [b["c"] for b in spy_bars_doc["bars"][-252:] if b.get("c")]
-            if len(closes) >= 20:
-                peak = max(closes)
-                current = closes[-1]
+
+        series = await self._load_price_series(db, ["SPY"], CRASH_RADAR_BARS)
+        closes = series.get("SPY", [])
+
+        if len(closes) >= 20:
+            window = closes[-CRASH_RADAR_BARS:]
+            peak = max(window)
+            current = window[-1]
+            if peak > 0:
                 spy_dd_pct = round((current - peak) / peak * 100, 2)
 
         dd_abs = abs(spy_dd_pct)
@@ -392,6 +416,17 @@ class MacroAnalyst(BaseAgent):
     # ==========================================================
 
     async def _calc_sector_bottom_detector(self, db) -> dict:
+        """
+        Percentuale di titoli sopra la SMA 200 per ogni settore.
+
+        v3.1 — FIX MEMORIA PRINCIPALE
+        La versione precedente costruiva un dizionario con le barre COMPLETE
+        di tutti i 300 ticker, poi usava solo le ultime 200. Erano oltre
+        110 MB tenuti in RAM contemporaneamente.
+
+        Ora MongoDB restituisce solo le ultime 200 barre ($slice) e il cursore
+        viene consumato in streaming: si accumulano solo i contatori, non i dati.
+        """
         from app.services.data_fetcher import SECTOR_STOCKS
 
         SECTOR_CFG = {
@@ -408,39 +443,47 @@ class MacroAnalyst(BaseAgent):
             "XLV":  {"threshold": 11, "weight": 16.27},
         }
 
-        all_tickers = [t for lst in SECTOR_STOCKS.values() for t in lst]
-        bars_cursor = db.stock_bars.find(
-            {"ticker": {"$in": all_tickers}}, {"ticker": 1, "bars": 1}
+        # Mappa ticker -> settore, per classificare in streaming
+        ticker_to_sector = {}
+        for sec, tickers in SECTOR_STOCKS.items():
+            if sec not in SECTOR_CFG:
+                continue
+            for tk in tickers:
+                ticker_to_sector[tk] = sec
+
+        counters = {sec: {"counted": 0, "above": 0} for sec in SECTOR_CFG}
+
+        cursor = db.stock_bars.find(
+            {"ticker": {"$in": list(ticker_to_sector.keys())}},
+            {"ticker": 1, "bars": {"$slice": -SECTOR_BOTTOM_BARS}},
         )
 
-        bars_map = {}
-        async for doc in bars_cursor:
-            bars_map[doc["ticker"]] = doc.get("bars", [])
+        async for doc in cursor:
+            sec = ticker_to_sector.get(doc.get("ticker"))
+            if not sec:
+                continue
+
+            closes = [b["c"] for b in doc.get("bars", []) if b.get("c")]
+            if len(closes) < 100:
+                continue
+
+            sma = sum(closes) / len(closes)
+            counters[sec]["counted"] += 1
+            if closes[-1] > sma:
+                counters[sec]["above"] += 1
+
+            # Liberiamo subito: il cursore puo' contenere centinaia di documenti
+            del closes
 
         sectors_status = []
         bottom_sectors = []
 
-        for sec, tickers in SECTOR_STOCKS.items():
-            cfg = SECTOR_CFG.get(sec)
-            if not cfg:
-                continue
-
-            counted = 0
-            above = 0
-
-            for tk in tickers:
-                bars = bars_map.get(tk, [])
-                closes = [b["c"] for b in bars[-200:] if b.get("c")]
-                if len(closes) < 100:
-                    continue
-                sma = sum(closes) / len(closes)
-                counted += 1
-                if closes[-1] > sma:
-                    above += 1
-
+        for sec, cfg in SECTOR_CFG.items():
+            counted = counters[sec]["counted"]
             if counted == 0:
                 continue
 
+            above = counters[sec]["above"]
             pct_above = round(above / counted * 100, 1)
             is_bottom = pct_above < cfg["threshold"]
 
@@ -518,9 +561,16 @@ class MacroAnalyst(BaseAgent):
         db = get_db()
         params = await self.get_params()
 
+        # Cache valida solo per questo run
+        self._series_cache = {}
+
         short_w = params.get("short_window", 5)
         swing_w = params.get("swing_window", 20)
         structural_w = params.get("structural_window", 63)
+
+        # Pre-carica SPY con la finestra piu' ampia richiesta (Crash Radar):
+        # cosi' tutte le funzioni successive riusano la stessa serie.
+        await self._load_price_series(db, ["SPY"], CRASH_RADAR_BARS)
 
         # ============================================
         # 1. SPY multi-timeframe
@@ -650,9 +700,6 @@ class MacroAnalyst(BaseAgent):
         def swing_of(sym):
             return risk_windows.get(sym, {}).get("r_swing", 0)
 
-        def short_of(sym):
-            return risk_windows.get(sym, {}).get("r_short", 0)
-
         # ---- 5A. Dollaro ----
         uup_swing = swing_of("UUP")
         fxe_swing = swing_of("FXE")
@@ -769,11 +816,11 @@ class MacroAnalyst(BaseAgent):
         # ============================================
         # 8. BREADTH
         # ============================================
-        assets = await db.assets.find({}, {"price": 1, "ema50": 1}).to_list(400)
         total_stocks = 0
         above_ema50 = 0
 
-        for a in assets:
+        breadth_cursor = db.assets.find({}, {"price": 1, "ema50": 1})
+        async for a in breadth_cursor:
             price = a.get("price", 0)
             ema50 = a.get("ema50", 0)
             if price > 0 and ema50 > 0:
@@ -916,6 +963,7 @@ class MacroAnalyst(BaseAgent):
             "BEAR": w.get("bear_exposure", 0.35),
             "CRASH": w.get("crash_exposure", 0.0),
         }
+
         base_exposure = exposure_map.get(market_regime, 0.5)
         exposure_multiplier = exposure_map.get(regime_detail, base_exposure)
 
@@ -1143,10 +1191,13 @@ class MacroAnalyst(BaseAgent):
             upsert=True,
         )
 
-        print(f"MacroAnalyst v3.0: {market_regime}/{regime_detail} "
+        print(f"MacroAnalyst v3.1: {market_regime}/{regime_detail} "
               f"(conf={smoothed_confidence}, raw={raw_confidence}, "
               f"exposure={exposure_multiplier}, breadth={breadth_pct}%, "
               f"leadership={leadership_state})")
+
+        # Libera la cache: le serie prezzi non servono oltre il run
+        self._series_cache = {}
 
         return market_context
 
