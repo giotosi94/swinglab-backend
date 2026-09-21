@@ -30,7 +30,34 @@ SECTOR_BOTTOM_BARS = 200
 
 class MacroAnalyst(BaseAgent):
     """
-    AGENTE 1: Macro Analyst v3.2
+    AGENTE 1: Macro Analyst v3.3
+
+    v3.2 -> v3.3: FLUSSO INTRADAY.
+
+    Il problema: stock_bars contiene barre daily CHIUSE, e anche
+    db.sectors.price e' l'ultima chiusura. Durante la seduta la leadership
+    descriveva quindi il mondo di ieri, mentre il capitale si stava gia'
+    muovendo altrove.
+
+    Ora ogni settore ha anche una forza relativa INTRADAY, ricavata dal
+    prezzo live (get_live_prices) confrontato con l'ultima chiusura.
+    A mercato chiuso live e ultima barra coincidono, il valore tende a zero
+    e il comportamento resta identico alla v3.2.
+
+    Il punto delicato e' non confondere un movimento di un giorno con un
+    trend. Per questo il flusso odierno viene classificato incrociandolo
+    con le finestre lunghe:
+
+      TREND_CONFIRMED   forte oggi e gia' forte sulle finestre brevi
+      ROTATION_INFLOW   forte oggi su un settore strutturalmente debole,
+                        ma con conferma sulle ultime sedute
+      ONE_DAY_SPIKE     forte SOLO oggi, nessun supporto di trend
+      TREND_INTACT      debole oggi ma trend ancora positivo
+      OUTFLOW           debole oggi e anche nel trend
+      NEUTRAL_FLOW      nessun segnale rilevante
+
+    Un ONE_DAY_SPIKE non entra mai nei focus_sectors: serve almeno la
+    conferma sulla finestra a 5 sedute.
 
     v3.1 -> v3.2: LEADERSHIP MULTIFINESTRA.
 
@@ -60,7 +87,7 @@ class MacroAnalyst(BaseAgent):
     """
 
     def __init__(self):
-        super().__init__(name="macro_analyst", version="3.2")
+        super().__init__(name="macro_analyst", version="3.3")
         self._series_cache = {}
 
     def default_params(self) -> dict:
@@ -110,6 +137,11 @@ class MacroAnalyst(BaseAgent):
             "leadership_top_n": 3,
             "rank_move_threshold": 3,
             "focus_max_sectors": 4,
+
+            # ---- flusso intraday ----
+            "intraday_flow_enabled": True,
+            "intraday_strong_rs": 0.35,
+            "intraday_weak_rs": -0.35,
 
             # ---- exposure ----
             "bull_exposure": 1.0,
@@ -179,6 +211,50 @@ class MacroAnalyst(BaseAgent):
         if growth >= 2 or (growth >= 1 and growth > max(defensive, cyclical)):
             return "GROWTH_LED"
         return "MIXED"
+
+    async def _load_live_quotes(self, symbols):
+        """
+        Prezzi live dagli ultimi scambi.
+
+        Serve perche' sia stock_bars sia db.sectors.price contengono
+        l'ultima CHIUSURA: durante la seduta non mostrano cosa sta
+        succedendo adesso. Una sola chiamata batch per tutti i simboli.
+        """
+        try:
+            from app.services.alpaca_trader import get_live_prices
+            quotes = await get_live_prices(list(symbols))
+            return quotes or {}
+        except Exception as e:
+            print(f"  Live quotes non disponibili: {e}")
+            return {}
+
+    @staticmethod
+    def _intraday_move(live_quote, last_close):
+        """
+        Movimento della seduta in corso, in percentuale.
+
+        Si preferisce il calcolo diretto live vs ultima chiusura: resta
+        coerente anche se change_pct del provider si riferisce a un
+        momento diverso. Se il prezzo live manca si usa il change_pct
+        dichiarato. A mercato chiuso i due valori coincidono e il
+        risultato tende a zero.
+        """
+        if not live_quote:
+            return 0.0, False
+
+        price = live_quote.get("price")
+
+        if price and last_close and last_close > 0:
+            return round((float(price) - last_close) / last_close * 100, 2), True
+
+        declared = live_quote.get("change_pct")
+        if declared is not None:
+            try:
+                return round(float(declared), 2), True
+            except (TypeError, ValueError):
+                return 0.0, False
+
+        return 0.0, False
 
     async def _load_price_series(self, db, symbols, bars_needed):
         """
@@ -288,6 +364,47 @@ class MacroAnalyst(BaseAgent):
 
         return sector_rs
 
+    def _classify_flow(self, sector_rs, params):
+        """
+        Incrocia il movimento di OGGI con le finestre lunghe.
+
+        La domanda a cui risponde: il denaro che entra oggi conferma un
+        trend, apre una rotazione, oppure e' solo un balzo isolato?
+
+        La conferma arriva dalla finestra breve (5 sedute). Se un settore
+        vola oggi ma nelle ultime sedute era debole, resta un episodio.
+        """
+        strong = float(params.get("intraday_strong_rs", 0.35))
+        weak = float(params.get("intraday_weak_rs", -0.35))
+        top_n = int(params.get("leadership_top_n", 3))
+
+        self._assign_ranks(sector_rs, "rs_intraday", "rank_intraday")
+
+        for s in sector_rs:
+            rs_today = s.get("rs_intraday", 0.0)
+            short_ok = s.get("rs_short", 0.0) > 0
+            swing_ok = s.get("rs_swing", 0.0) > 0
+            leading_now = s.get("rank_swing", 99) <= top_n
+
+            if rs_today >= strong:
+                if short_ok and (swing_ok or leading_now):
+                    flow = "TREND_CONFIRMED"
+                elif short_ok:
+                    flow = "ROTATION_INFLOW"
+                else:
+                    flow = "ONE_DAY_SPIKE"
+            elif rs_today <= weak:
+                flow = "TREND_INTACT" if swing_ok else "OUTFLOW"
+            else:
+                flow = "NEUTRAL_FLOW"
+
+            s["flow"] = flow
+            s["flow_confirmed"] = flow in (
+                "TREND_CONFIRMED", "ROTATION_INFLOW", "TREND_INTACT"
+            )
+
+        return sector_rs
+
     async def _calc_market_leadership(self, db, params) -> dict:
         """
         Chi traina il mercato, su piu' finestre temporali.
@@ -327,6 +444,12 @@ class MacroAnalyst(BaseAgent):
             "deteriorating_sectors": [],
             "focus_sectors": [],
             "avoid_sectors": [],
+            "intraday_available": False,
+            "intraday_spy_move": 0.0,
+            "inflow_sectors": [],
+            "outflow_sectors": [],
+            "spike_sectors": [],
+            "flow_summary": "Flusso intraday non disponibile",
         }
 
         bars_needed = params.get("structural_window", 63) + 5
@@ -368,18 +491,51 @@ class MacroAnalyst(BaseAgent):
         result["concentration_swing"] = concentration_swing
         result["concentration_structural"] = concentration_structural
 
-        # ---- 2. Forza relativa settoriale su tre finestre ----
+        # ---- 2. Flusso intraday: cosa sta succedendo ADESSO ----
+        # Le barre daily sono chiuse, quindi da sole non vedono la seduta
+        # in corso. I prezzi live colmano quel buco.
+        intraday_enabled = bool(params.get("intraday_flow_enabled", True))
+        live_quotes = {}
+        spy_intraday = 0.0
+        intraday_available = False
+
+        if intraday_enabled:
+            live_quotes = await self._load_live_quotes(["SPY"] + SECTOR_ETFS)
+            spy_intraday, spy_live_ok = self._intraday_move(
+                live_quotes.get("SPY"), spy_closes[-1]
+            )
+            intraday_available = spy_live_ok
+
+        result["intraday_available"] = intraday_available
+        result["intraday_spy_move"] = spy_intraday
+
+        # ---- 3. Forza relativa settoriale su quattro finestre ----
         sector_rs = []
         for sym in SECTOR_ETFS:
             closes = series.get(sym)
             if not closes:
                 continue
+
             w = self._windows(closes, params)
+
+            sector_intraday, sector_live_ok = self._intraday_move(
+                live_quotes.get(sym), closes[-1]
+            )
+            # Se il live manca per questo settore la forza relativa resta a
+            # zero: meglio nessun segnale che un segnale inventato.
+            rs_intraday = (
+                round(sector_intraday - spy_intraday, 2)
+                if (intraday_available and sector_live_ok) else 0.0
+            )
+
             sector_rs.append({
                 "sector": sym,
+                "rs_intraday": rs_intraday,
                 "rs_short": round(w["r_short"] - spy_w["r_short"], 2),
                 "rs_swing": round(w["r_swing"] - spy_w["r_swing"], 2),
                 "rs_structural": round(w["r_structural"] - spy_w["r_structural"], 2),
+                "intraday_move": sector_intraday,
+                "intraday_live": sector_live_ok,
                 "r_short": w["r_short"],
                 "r_swing": w["r_swing"],
                 "r_structural": w["r_structural"],
@@ -389,6 +545,7 @@ class MacroAnalyst(BaseAgent):
             return result
 
         sector_rs = self._classify_sectors(sector_rs, params)
+        sector_rs = self._classify_flow(sector_rs, params)
 
         # L'elenco viene ordinato per forza relativa CORRENTE (finestra swing):
         # e' la risposta a "chi traina adesso".
@@ -439,6 +596,35 @@ class MacroAnalyst(BaseAgent):
             s["sector"] for s in sector_rs if s["status"] == "DETERIORATING"
         ]
 
+        result["inflow_sectors"] = [
+            s["sector"] for s in sector_rs
+            if s.get("flow") in ("TREND_CONFIRMED", "ROTATION_INFLOW")
+        ]
+        result["outflow_sectors"] = [
+            s["sector"] for s in sector_rs if s.get("flow") == "OUTFLOW"
+        ]
+        result["spike_sectors"] = [
+            s["sector"] for s in sector_rs if s.get("flow") == "ONE_DAY_SPIKE"
+        ]
+
+        if not intraday_available:
+            result["flow_summary"] = "Flusso intraday non disponibile"
+        elif result["inflow_sectors"]:
+            result["flow_summary"] = (
+                f"Denaro in ingresso su {', '.join(result['inflow_sectors'])}"
+            )
+            if result["spike_sectors"]:
+                result["flow_summary"] += (
+                    f"; solo spike su {', '.join(result['spike_sectors'])}"
+                )
+        elif result["spike_sectors"]:
+            result["flow_summary"] = (
+                f"Solo balzi isolati su {', '.join(result['spike_sectors'])}, "
+                f"nessun flusso confermato"
+            )
+        else:
+            result["flow_summary"] = "Nessun flusso settoriale rilevante oggi"
+
         # ---- 4. Settori su cui concentrarsi ----
         # Priorita' a chi guida ora, poi a chi consolida, poi a chi risale.
         priority = {
@@ -450,24 +636,80 @@ class MacroAnalyst(BaseAgent):
         # I leader entrano sempre. Gli IMPROVING solo se sono gia' risaliti
         # nella meta' alta della classifica: un settore che migliora ma resta
         # in fondo non e' un posto dove cercare titoli.
+        #
+        # Regola aggiunta in v3.3: un ONE_DAY_SPIKE resta fuori, anche se
+        # oggi e' il piu' forte. Senza conferma sulle ultime sedute non e'
+        # capitale che si sposta, e' rumore di una giornata.
         improving_rank_limit = top_n * 2
+        rotation_flow_priority = max(priority.values()) + 1
         focus_candidates = []
+
         for s in sector_rs:
             status = s["status"]
-            if status in ("EMERGING_LEADER", "ESTABLISHED_LEADER"):
-                focus_candidates.append(s)
-            elif status == "IMPROVING" and s["rank_swing"] <= improving_rank_limit:
-                focus_candidates.append(s)
+            flow = s.get("flow", "NEUTRAL_FLOW")
 
+            if flow == "ONE_DAY_SPIKE":
+                continue
+
+            if status in ("EMERGING_LEADER", "ESTABLISHED_LEADER"):
+                s["_focus_priority"] = priority[status]
+            elif status == "IMPROVING" and s["rank_swing"] <= improving_rank_limit:
+                s["_focus_priority"] = priority[status]
+            elif flow == "ROTATION_INFLOW":
+                # Denaro che arriva oggi con conferma sulle ultime sedute:
+                # e' presto, ma e' esattamente dove guardare per primi.
+                s["_focus_priority"] = rotation_flow_priority
+            else:
+                continue
+
+            focus_candidates.append(s)
+
+        # A parita' di priorita' vince chi ha piu' flusso oggi, poi chi ha
+        # piu' forza relativa sulla finestra swing.
         focus_candidates.sort(
-            key=lambda x: (priority[x["status"]], -x["rs_swing"])
+            key=lambda x: (
+                x["_focus_priority"],
+                -x.get("rs_intraday", 0.0),
+                -x["rs_swing"],
+            )
         )
         focus_limit = int(params.get("focus_max_sectors", 4))
         result["focus_sectors"] = [s["sector"] for s in focus_candidates[:focus_limit]]
 
-        result["avoid_sectors"] = [
-            s["sector"] for s in sector_rs
-            if s["status"] in ("FADING_LEADER", "DETERIORATING")
+        for s in sector_rs:
+            s.pop("_focus_priority", None)
+
+        # Un giorno di deflusso non basta a squalificare chi guida davvero:
+        # l'uscita di oggi conta come rischio solo se il settore non e' gia'
+        # fra i leader correnti.
+        #
+        # Allo stesso modo, un settore etichettato DETERIORATING sull'asse
+        # lungo puo' aver gia' girato: se oggi riceve denaro con conferma
+        # sulle ultime sedute E sta risalendo nel ranking breve, non va
+        # evitato. E' proprio il caso della rotazione presa in anticipo.
+        avoid = []
+        for s in sector_rs:
+            flow = s.get("flow", "NEUTRAL_FLOW")
+            turning = (
+                flow == "ROTATION_INFLOW"
+                and s.get("rank_delta_short", 0) > 0
+            )
+
+            weak_structure = (
+                s["status"] in ("FADING_LEADER", "DETERIORATING")
+                and not turning
+            )
+            losing_money = flow == "OUTFLOW" and s["rank_swing"] > top_n
+
+            if weak_structure or losing_money:
+                avoid.append(s["sector"])
+
+        result["avoid_sectors"] = avoid
+
+        # Nessun settore puo' stare in entrambe le liste: se e' da evitare
+        # esce dal focus, altrimenti l'Alpha riceverebbe istruzioni opposte.
+        result["focus_sectors"] = [
+            code for code in result["focus_sectors"] if code not in avoid
         ]
 
         # ---- 5. Etichette di gruppo ----
@@ -1166,6 +1408,7 @@ class MacroAnalyst(BaseAgent):
                 "smoothed_confidence": smoothed_confidence,
                 "rotation_state": rotation_state,
                 "focus_sectors": leadership.get("focus_sectors", []),
+                "inflow_sectors": leadership.get("inflow_sectors", []),
                 "updated_at": datetime.utcnow(),
             }},
             upsert=True,
@@ -1206,6 +1449,11 @@ class MacroAnalyst(BaseAgent):
             "avoid_sectors": leadership.get("avoid_sectors", []),
             "emerging_leaders": leadership.get("emerging_leaders", []),
             "fading_leaders": leadership.get("fading_leaders", []),
+            "inflow_sectors": leadership.get("inflow_sectors", []),
+            "outflow_sectors": leadership.get("outflow_sectors", []),
+            "spike_sectors": leadership.get("spike_sectors", []),
+            "flow_summary": leadership.get("flow_summary", ""),
+            "intraday_available": leadership.get("intraday_available", False),
             "crypto_sentiment": crypto_sentiment,
             "dollar_strength": dollar_strength,
             "market_breadth": market_breadth,
@@ -1310,8 +1558,10 @@ class MacroAnalyst(BaseAgent):
         if llm_available():
             try:
                 sector_line = " | ".join(
-                    f"{s['sector']} {swing_w}g {s['rs_swing']:+.1f}% "
-                    f"{structural_w}g {s['rs_structural']:+.1f}% [{s['status']}]"
+                    f"{s['sector']} oggi {s.get('rs_intraday', 0):+.1f}% "
+                    f"{swing_w}g {s['rs_swing']:+.1f}% "
+                    f"{structural_w}g {s['rs_structural']:+.1f}% "
+                    f"[{s['status']}/{s.get('flow', 'n/d')}]"
                     for s in leadership.get("sectors", [])[:5]
                 ) or "n/d"
 
@@ -1333,6 +1583,15 @@ class MacroAnalyst(BaseAgent):
                     f"{', '.join(leadership.get('top_sectors', [])) or 'n/d'}\n"
                     f"Emergenti: {', '.join(leadership.get('emerging_leaders', [])) or 'nessuno'}\n"
                     f"In calo: {', '.join(leadership.get('fading_leaders', [])) or 'nessuno'}\n"
+                    f"--- FLUSSO DI OGGI ---\n"
+                    f"Dati live: {'si' if leadership.get('intraday_available') else 'no'}, "
+                    f"SPY oggi {leadership.get('intraday_spy_move', 0):+.2f}%\n"
+                    f"Denaro in ingresso: "
+                    f"{', '.join(leadership.get('inflow_sectors', [])) or 'nessuno'}\n"
+                    f"Denaro in uscita: "
+                    f"{', '.join(leadership.get('outflow_sectors', [])) or 'nessuno'}\n"
+                    f"Solo balzi isolati (da ignorare): "
+                    f"{', '.join(leadership.get('spike_sectors', [])) or 'nessuno'}\n"
                     f"Dettaglio settori: {sector_line}\n"
                     f"Concentrazione mega cap: {leadership.get('concentration_swing', 0):+.2f}%\n"
                     f"Credito: HYG-LQD {credit_spread:+.2f}%\n"
@@ -1351,10 +1610,11 @@ class MacroAnalyst(BaseAgent):
                     system_prompt=(
                         "Sei un analista macro esperto di swing trading. "
                         "Analizza i dati in max 4 frasi in italiano. "
-                        "Indica: 1) CHI sta trainando il mercato adesso e se e' "
-                        "cambiato rispetto al trimestre, 2) Se e' in corso una "
-                        "rotazione settoriale e verso cosa, 3) La differenza tra "
-                        "momentum di breve e trend swing, 4) Il rischio principale. "
+                        "Indica: 1) DOVE stanno andando i soldi oggi e se conferma "
+                        "il trend delle ultime settimane o e' solo un balzo isolato, "
+                        "2) CHI traina adesso e se e' cambiato rispetto al trimestre, "
+                        "3) Se e' in corso una rotazione settoriale e verso cosa, "
+                        "4) Il rischio principale. "
                         "Sii diretto e concreto, senza disclaimer."
                     ),
                     user_prompt=f"Dati di mercato:\n{data_summary}",
@@ -1381,7 +1641,7 @@ class MacroAnalyst(BaseAgent):
         )
 
         focus = ", ".join(leadership.get("focus_sectors", [])) or "nessuno"
-        print(f"MacroAnalyst v3.2: {market_regime}/{regime_detail} "
+        print(f"MacroAnalyst v3.3: {market_regime}/{regime_detail} "
               f"(conf={smoothed_confidence}, exposure={exposure_multiplier}, "
               f"breadth={breadth_pct}%)")
         print(f"  Leadership: {leadership_state} | {rotation_state} | focus: {focus}")
@@ -1389,6 +1649,12 @@ class MacroAnalyst(BaseAgent):
         if leadership.get("emerging_leaders"):
             print(f"  Emergenti: {', '.join(leadership['emerging_leaders'])} | "
                   f"In calo: {', '.join(leadership.get('fading_leaders', [])) or 'nessuno'}")
+
+        if leadership.get("intraday_available"):
+            print(f"  Flusso oggi (SPY {leadership.get('intraday_spy_move', 0):+.2f}%): "
+                  f"{leadership.get('flow_summary', '')}")
+        else:
+            print("  Flusso oggi: dati live non disponibili, uso solo barre chiuse")
 
         # Libera la cache: le serie prezzi non servono oltre il run
         self._series_cache = {}
