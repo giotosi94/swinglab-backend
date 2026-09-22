@@ -2,7 +2,8 @@ import httpx
 import asyncio
 from app.config import settings
 from app.db.mongodb import get_db
-from datetime import datetime
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 
 ALPACA_BASE = "https://paper-api.alpaca.markets" if settings.ALPACA_PAPER else "https://api.alpaca.markets"
@@ -576,12 +577,59 @@ async def get_alpaca_summary():
 # ============================================
 # LIVE PRICES
 # ============================================
+def _parse_alpaca_ts(value):
+    if not value:
+        return None
+    try:
+        text = str(value).replace("Z", "+00:00")
+        if "." in text:
+            head, tail = text.split(".", 1)
+            offset = ""
+            for token in ("+", "-"):
+                if token in tail:
+                    index = tail.index(token)
+                    offset = tail[index:]
+                    tail = tail[:index]
+                    break
+            text = f"{head}.{tail[:6]}{offset}"
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def market_session_now():
+    now = datetime.now(ZoneInfo("America/New_York"))
+    if now.weekday() >= 5:
+        session = "WEEKEND"
+    else:
+        minutes = now.hour * 60 + now.minute
+        if 570 <= minutes < 960:
+            session = "REGULAR"
+        elif 240 <= minutes < 570:
+            session = "PREMARKET"
+        elif 960 <= minutes < 1200:
+            session = "AFTERHOURS"
+        else:
+            session = "OVERNIGHT"
+    return {
+        "session": session,
+        "is_regular": session == "REGULAR",
+        "is_extended": session in ("PREMARKET", "AFTERHOURS"),
+        "today_et": now.strftime("%Y-%m-%d"),
+        "now_et": now.isoformat(),
+    }
+
 
 async def get_live_prices(symbols):
     if not symbols:
         return {}
     symbols_str = ",".join(symbols[:50])
     url = "{}/v2/stocks/snapshots?symbols={}&feed=iex".format(ALPACA_DATA, symbols_str)
+    session = market_session_now()
+    now_utc = datetime.now(timezone.utc)
     async with httpx.AsyncClient(timeout=10) as client:
         try:
             r = await client.get(url, headers=HEADERS)
@@ -595,17 +643,33 @@ async def get_live_prices(symbols):
                 daily = snap.get("dailyBar", {})
                 prev = snap.get("prevDailyBar", {})
                 price = latest.get("p", 0) or minute.get("c", 0) or daily.get("c", 0)
-                prev_close = prev.get("c", price)
-                change = price - prev_close
-                change_pct = (change / prev_close * 100) if prev_close > 0 else 0
+                trade_dt = _parse_alpaca_ts(latest.get("t"))
+                trade_date_et = None
+                age_minutes = None
+                if trade_dt:
+                    trade_date_et = trade_dt.astimezone(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+                    age_minutes = round((now_utc - trade_dt).total_seconds() / 60, 1)
+                traded_today = trade_date_et == session["today_et"] if trade_date_et else False
+                daily_dt = _parse_alpaca_ts(daily.get("t"))
+                daily_date = daily_dt.astimezone(ZoneInfo("America/New_York")).strftime("%Y-%m-%d") if daily_dt else None
+                daily_is_today = daily_date == session["today_et"] if daily_date else False
+                reference_close = (prev.get("c", 0) or price) if daily_is_today else (daily.get("c", 0) or prev.get("c", 0) or price)
+                change = price - reference_close
+                change_pct = (change / reference_close * 100) if reference_close > 0 else 0
                 prices[sym] = {
                     "price": round(price, 2),
-                    "prev_close": round(prev_close, 2),
+                    "prev_close": round(reference_close, 2),
                     "change": round(change, 2),
                     "change_pct": round(change_pct, 2),
                     "volume": daily.get("v", 0),
                     "high": round(daily.get("h", 0), 2),
                     "low": round(daily.get("l", 0), 2),
+                    "trade_time": trade_dt.isoformat() if trade_dt else None,
+                    "trade_date_et": trade_date_et,
+                    "traded_today": traded_today,
+                    "stale": not traded_today,
+                    "age_minutes": age_minutes,
+                    "session": session["session"],
                 }
             return prices
         except Exception as e:
@@ -613,6 +677,45 @@ async def get_live_prices(symbols):
             return {}
 
 
+async def get_crypto_prices(symbols=None):
+    symbols = symbols or ["BTC/USD", "ETH/USD"]
+    symbols_str = ",".join(symbols)
+    url = "{}/v1beta3/crypto/us/snapshots?symbols={}".format(ALPACA_DATA, symbols_str)
+    now_utc = datetime.now(timezone.utc)
+    async with httpx.AsyncClient(timeout=10) as client:
+        try:
+            r = await client.get(url, headers=HEADERS)
+            if r.status_code != 200:
+                return {}
+            snapshots = r.json().get("snapshots", {})
+            prices = {}
+            for sym, snap in snapshots.items():
+                latest = snap.get("latestTrade", {})
+                minute = snap.get("minuteBar", {})
+                daily = snap.get("dailyBar", {})
+                prev = snap.get("prevDailyBar", {})
+                price = latest.get("p", 0) or minute.get("c", 0) or daily.get("c", 0)
+                prev_close = prev.get("c", 0) or price
+                change = price - prev_close
+                change_pct = (change / prev_close * 100) if prev_close > 0 else 0
+                trade_dt = _parse_alpaca_ts(latest.get("t"))
+                age_minutes = round((now_utc - trade_dt).total_seconds() / 60, 1) if trade_dt else None
+                prices[sym] = {
+                    "price": round(price, 2),
+                    "prev_close": round(prev_close, 2),
+                    "change": round(change, 2),
+                    "change_pct": round(change_pct, 2),
+                    "volume": daily.get("v", 0),
+                    "trade_time": trade_dt.isoformat() if trade_dt else None,
+                    "traded_today": True,
+                    "stale": False,
+                    "age_minutes": age_minutes,
+                    "session": "CRYPTO_24_7",
+                }
+            return prices
+        except Exception as e:
+            print("Crypto prices error: {}".format(e))
+            return {}
 # ============================================
 # PORTFOLIO PERIODS (per benchmark chart)
 # ============================================
