@@ -805,3 +805,92 @@ async def crash_deploy_check():
     """Valuta il crash deploy ORA (rispetta flag + dry_run)."""
     from app.services.crash_deploy_live import check_and_deploy
     return await check_and_deploy()
+
+
+# Il MacroAnalyst salva tutto il contesto in db.market_context "latest",
+# ma finora nessuna route lo esponeva: la Dashboard poteva leggere solo
+# il riassunto nel SharedBrain, che non contiene focus_sectors,
+# avoid_sectors, flusso intraday e forza relativa settoriale.
+
+
+@router.get("/market-context")
+async def get_market_context():
+    """
+    Contesto macro completo prodotto dal MacroAnalyst v3.3.
+
+    Restituisce regime dettagliato, leadership settoriale, flusso
+    intraday e forza relativa per settore su piu' finestre temporali.
+    """
+    db = get_db()
+    doc = await db.market_context.find_one({"_id": "latest"})
+
+    if not doc:
+        return {"available": False, "message": "Nessun market context disponibile"}
+
+    leadership = doc.get("leadership") or {}
+
+    # Solo i campi che servono al frontend: il documento completo contiene
+    # anche serie e dettagli che appesantirebbero inutilmente la risposta.
+    sectors = [
+        {
+            "sector": s.get("sector"),
+            "status": s.get("status"),
+            "flow": s.get("flow"),
+            "rs_intraday": s.get("rs_intraday", 0),
+            "rs_short": s.get("rs_short", 0),
+            "rs_swing": s.get("rs_swing", 0),
+            "rs_structural": s.get("rs_structural", 0),
+            "rank_swing": s.get("rank_swing"),
+            "rank_structural": s.get("rank_structural"),
+            "acceleration": s.get("acceleration", 0),
+        }
+        for s in (leadership.get("sectors") or [])
+    ]
+
+    return {
+        "available": True,
+        "analyzed_at": doc.get("analyzed_at"),
+        "strategy_version": "macro_analyst_v3_3",
+
+        "regime": doc.get("market_regime"),
+        "regime_detail": doc.get("regime_detail"),
+        "regime_detail_reason": doc.get("regime_detail_reason"),
+        "confidence": doc.get("regime_confidence"),
+        "raw_confidence": doc.get("regime_raw_confidence"),
+        "regime_changed": doc.get("regime_changed", False),
+        "exposure_multiplier": doc.get("exposure_multiplier"),
+
+        "volatility": doc.get("volatility_regime"),
+        "breadth_pct": doc.get("breadth_pct"),
+        "market_breadth": doc.get("market_breadth"),
+        "breadth_divergence": doc.get("breadth_divergence"),
+
+        "leadership_state": leadership.get("state"),
+        "leadership_description": leadership.get("description"),
+        "rotation_state": doc.get("rotation_state"),
+        "rotation_signal": doc.get("rotation_signal"),
+        "concentration_swing": leadership.get("concentration_swing", 0),
+        "participation_score": leadership.get("participation_score", 50),
+
+        "focus_sectors": doc.get("focus_sectors", []),
+        "avoid_sectors": doc.get("avoid_sectors", []),
+        "emerging_leaders": doc.get("emerging_leaders", []),
+        "fading_leaders": doc.get("fading_leaders", []),
+        "inflow_sectors": doc.get("inflow_sectors", []),
+        "outflow_sectors": doc.get("outflow_sectors", []),
+        "spike_sectors": doc.get("spike_sectors", []),
+        "flow_summary": doc.get("flow_summary"),
+        "intraday_available": doc.get("intraday_available", False),
+        "intraday_spy_move": leadership.get("intraday_spy_move", 0),
+
+        "sectors": sectors,
+        "top_sectors": leadership.get("top_sectors", []),
+        "top_sectors_structural": leadership.get("top_sectors_structural", []),
+
+        "timeframes": doc.get("timeframes", {}),
+        "crash_radar": doc.get("crash_radar", {}),
+        "sector_bottom": doc.get("sector_bottom", {}),
+
+        "llm_reasoning": doc.get("llm_reasoning"),
+    }
+
