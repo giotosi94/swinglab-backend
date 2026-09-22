@@ -1,6 +1,3 @@
-from datetime import datetime
-from zoneinfo import ZoneInfo
-
 from fastapi import APIRouter, Query
 
 from app.db.mongodb import get_db
@@ -14,44 +11,29 @@ SECTOR_CODES = ["XLK", "XLF", "XLV", "XLI", "XLY", "XLP", "XLE", "XLU", "XLB", "
 BARS_BUFFER = 12
 
 
-def _market_session():
+# L'analisi gira SEMPRE, in qualunque momento della giornata. Non esiste un
+# orario che la spegne: cambia solo la qualita' dichiarata del dato.
+#
+# Il criterio non e' l'orologio ma il TIMESTAMP dell'ultimo scambio. Se un
+# ETF non ha ancora scambiato oggi lo dichiariamo, invece di inventare un
+# movimento dello zero per cento che sembrerebbe un dato reale.
+
+
+async def _live_quotes(symbols):
     """
-    Stato della sessione USA.
+    Prezzi correnti per SPY e i settori, con informazione sulla freschezza.
 
-    Serve a decidere se ha senso proiettare il punto di oggi: a mercato
-    chiuso il prezzo live coincide con l'ultima chiusura e la proiezione
-    non aggiunge nulla.
-    """
-    now = datetime.now(ZoneInfo("America/New_York"))
-
-    if now.weekday() >= 5:
-        return {"is_open": False, "today": now.strftime("%Y-%m-%d"), "et": now.isoformat()}
-
-    open_time = now.replace(hour=9, minute=30, second=0, microsecond=0)
-    close_time = now.replace(hour=16, minute=0, second=0, microsecond=0)
-
-    return {
-        "is_open": open_time <= now <= close_time,
-        "today": now.strftime("%Y-%m-%d"),
-        "et": now.isoformat(),
-    }
-
-
-async def _live_ratios(symbols):
-    """
-    Prezzi live per SPY e i settori.
-
-    Le barre daily sono chiuse: durante la seduta non mostrano cosa sta
-    succedendo adesso. Questi prezzi servono solo per il punto proiettato.
+    get_live_prices restituisce anche traded_today e age_minutes: servono a
+    capire quali settori stanno davvero scambiando in questo momento.
     """
     try:
-        from app.services.alpaca_trader import get_live_prices
+        from app.services.alpaca_trader import get_live_prices, market_session_now
 
         quotes = await get_live_prices(list(symbols))
-        return quotes or {}
+        return quotes or {}, market_session_now()
     except Exception as e:
         print(f"  Sector live quotes non disponibili: {e}")
-        return {}
+        return {}, {"session": "UNKNOWN", "today_et": None, "is_regular": False}
 
 
 @router.get("/")
@@ -74,9 +56,10 @@ async def get_sector_relative_strength(
     """
     Forza relativa dei settori contro SPY, indicizzata a 100.
 
-    Con include_today e mercato aperto viene aggiunto un punto PROIETTATO
-    per la seduta in corso, calcolato dai prezzi live. E' marcato come
-    provvisorio perche' cambia fino alla chiusura.
+    Quando i prezzi correnti sono disponibili viene aggiunto un punto
+    PROIETTATO per la seduta in corso. E' marcato come provvisorio perche'
+    cambia fino alla chiusura, e viene disegnato solo per i settori che
+    hanno effettivamente scambiato oggi.
     """
     db = get_db()
     requested = ["SPY"] + SECTOR_CODES
@@ -109,26 +92,39 @@ async def get_sector_relative_strength(
 
     last_close_date = common_dates[-1]
 
-    # ---- Punto proiettato per la seduta in corso ----
-    session = _market_session()
-    projection_enabled = (
-        include_today
-        and session["is_open"]
-        and session["today"] != last_close_date
-    )
-
+    # ---- Punto proiettato: sempre tentato, mai forzato ----
+    #
+    # Nessun gate orario. Proviamo sempre a leggere i prezzi correnti: se
+    # SPY ha scambiato oggi il punto ha senso, altrimenti no. Lo decide il
+    # dato, non l'orologio.
     live_quotes = {}
+    session = {"session": "UNKNOWN", "today_et": None, "is_regular": False}
     spy_live = None
+    spy_traded_today = False
 
-    if projection_enabled:
-        live_quotes = await _live_ratios(requested)
+    if include_today:
+        live_quotes, session = await _live_quotes(requested)
+
         spy_quote = live_quotes.get("SPY") or {}
         spy_live = spy_quote.get("price")
+        spy_traded_today = bool(spy_quote.get("traded_today"))
 
         if spy_live:
             spy_live = float(spy_live)
-        else:
-            projection_enabled = False
+
+    today_et = session.get("today_et")
+
+    projection_enabled = bool(
+        include_today
+        and spy_live
+        and spy_traded_today
+        and today_et
+        and today_et != last_close_date
+    )
+
+    # Contatori di qualita': quanti settori stanno davvero scambiando.
+    sectors_traded_today = 0
+    sectors_no_trade = []
 
     series = []
 
@@ -166,32 +162,38 @@ async def get_sector_relative_strength(
 
         last_close_value = points[-1]["value"]
 
-        # ---- Proiezione di oggi ----
+        # ---- Proiezione di oggi, settore per settore ----
         projected_value = None
         intraday_move = None
 
-        if projection_enabled:
-            sector_quote = live_quotes.get(code) or {}
-            sector_live = sector_quote.get("price")
+        sector_quote = live_quotes.get(code) or {}
+        sector_traded = bool(sector_quote.get("traded_today"))
+        sector_live_price = sector_quote.get("price")
 
-            if sector_live and spy_live:
-                sector_live = float(sector_live)
-                live_ratio = sector_live / spy_live
-                projected_value = round(live_ratio / first_ratio * 100, 3)
+        if include_today and sector_quote:
+            if sector_traded:
+                sectors_traded_today += 1
+            else:
+                sectors_no_trade.append(code)
 
-                previous_close = sector_by_date.get(dates[-1], 0)
-                if previous_close > 0:
-                    intraday_move = round(
-                        (sector_live - previous_close) / previous_close * 100, 2
-                    )
+        # Il punto viene disegnato solo se QUESTO settore ha scambiato oggi.
+        # Un ETF fermo non deve produrre una linea piatta che sembra un dato.
+        if projection_enabled and sector_traded and sector_live_price and spy_live:
+            sector_live = float(sector_live_price)
+            live_ratio = sector_live / spy_live
+            projected_value = round(live_ratio / first_ratio * 100, 3)
 
-                points.append({
-                    "date": session["today"],
-                    "value": projected_value,
-                    "projected": True,
-                })
+            previous_close = sector_by_date.get(dates[-1], 0)
+            if previous_close > 0:
+                intraday_move = round(
+                    (sector_live - previous_close) / previous_close * 100, 2
+                )
 
-        final_value = points[-1]["value"]
+            points.append({
+                "date": today_et,
+                "value": projected_value,
+                "projected": True,
+            })
 
         # L'accelerazione resta calcolata sulle sole barre chiuse: un punto
         # provvisorio non deve alterare una metrica di tendenza.
@@ -210,6 +212,9 @@ async def get_sector_relative_strength(
             "last_value": last_close_value,
             "projected_value": projected_value,
             "has_projection": projected_value is not None,
+            "traded_today": sector_traded,
+            "live_price": round(float(sector_live_price), 2) if sector_live_price else None,
+            "quote_age_minutes": sector_quote.get("age_minutes"),
         })
 
     # L'ordinamento usa la chiusura: la classifica non deve ballare durante
@@ -290,11 +295,28 @@ async def get_sector_relative_strength(
         "end_date": last_close_date,
         "baseline": 100,
 
-        # ---- Stato della proiezione ----
-        "market_open": session["is_open"],
-        "today": session["today"],
+        # ---- Qualita' del dato corrente ----
+        #
+        # L'analisi e' sempre attiva: questi campi dicono al frontend quanto
+        # fidarsi del punto di oggi, non se mostrarlo o meno.
+        "session": session.get("session"),
+        "market_open": session.get("is_regular", False),
+        "today": today_et,
         "last_close_date": last_close_date,
+
         "projection_available": projection_enabled and any(i["has_projection"] for i in series),
+        "spy_traded_today": spy_traded_today,
+
+        "sectors_traded_today": sectors_traded_today,
+        "sectors_total": len(series),
+        "sectors_no_trade": sectors_no_trade,
+
+        "data_quality": (
+            "FULL" if session.get("is_regular") and sectors_traded_today >= len(series) * 0.8
+            else "PARTIAL" if sectors_traded_today > 0
+            else "CLOSED_BARS_ONLY"
+        ),
+
         "spy_intraday_move_pct": (
             round((spy_live - spy_by_date[last_close_date]) / spy_by_date[last_close_date] * 100, 2)
             if projection_enabled and spy_live and spy_by_date.get(last_close_date)
@@ -311,6 +333,7 @@ async def get_sector_relative_strength(
                 "projected_return_pct": item["projected_return_pct"],
                 "intraday_move_pct": item["intraday_move_pct"],
                 "acceleration_20d": item["acceleration_20d"],
+                "traded_today": item["traded_today"],
             }
             for index, item in enumerate(series)
         ],
