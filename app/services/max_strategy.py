@@ -103,6 +103,7 @@ def _swing_points(values, left=3, right=3, mode="low"):
 
 def _data_quality(df):
     anomalies = []
+    duplicate_count = int(df["datetime"].duplicated().sum())
     clean = df.copy().sort_values("datetime").drop_duplicates("datetime", keep="last").reset_index(drop=True)
     invalid_ohlc = clean[
         (clean["Low"] <= 0)
@@ -131,14 +132,35 @@ def _data_quality(df):
             })
     if split_suspects:
         anomalies.append({"type": "CORPORATE_ACTION_OR_SCALE_BREAK", "events": split_suspects[-5:]})
-    stale = int(clean["datetime"].duplicated().sum())
-    if stale:
-        anomalies.append({"type": "DUPLICATE_DATES", "count": stale})
-    status = "FAILED" if invalid_ohlc.shape[0] > 0 or split_suspects else "OK"
+    if duplicate_count:
+        anomalies.append({"type": "DUPLICATE_DATES", "count": duplicate_count})
+    last_bar = pd.Timestamp(clean["datetime"].iloc[-1]) if len(clean) else None
+    if last_bar is not None:
+        if last_bar.tzinfo is not None:
+            last_bar = last_bar.tz_convert(None)
+        today = pd.Timestamp.utcnow().tz_localize(None).normalize()
+        last_bar_day = last_bar.normalize()
+        stale_days = max(0, int((today - last_bar_day).days))
+    else:
+        stale_days = 9999
+    if stale_days > 7:
+        anomalies.append({
+            "type": "STALE_OR_DELISTED",
+            "last_bar_date": last_bar.strftime("%Y-%m-%d") if last_bar is not None else None,
+            "stale_days": stale_days,
+        })
+    has_corporate_action = bool(split_suspects)
+    is_stale = stale_days > 7
+    status = "FAILED" if invalid_ohlc.shape[0] > 0 or has_corporate_action or is_stale else "OK"
     return {
         "status": status,
         "live_eligible": status == "OK",
         "bars": len(clean),
+        "duplicate_dates": duplicate_count,
+        "last_bar_date": last_bar.strftime("%Y-%m-%d") if last_bar is not None else None,
+        "stale_days": stale_days,
+        "is_stale": is_stale,
+        "corporate_action_suspected": has_corporate_action,
         "anomalies": anomalies,
     }
 
@@ -1025,6 +1047,31 @@ def analyze_max_strategy(df, bars_4h=None):
     speculative_setup = _detect_speculative_volume_pocket(data, profiles, structural, active_base, atr)
     phase = _market_phase_gates_v141(data, profiles, bottom, structural, active_base, structural_base, speculative_setup, atr)
     mtf_plan = _multi_timeframe_plan(data, bars_4h, structural_base, active_base, profiles, bottom, atr)
+    entry_plan = mtf_plan["entry_plan"]
+    trigger_price = entry_plan.get("trigger_price")
+    maximum_entry_price = entry_plan.get("maximum_entry_price")
+    invalidation_price = entry_plan.get("invalidation_price")
+    plan_quality_rejections = []
+    if trigger_price is not None and _safe_float(trigger_price) <= 0:
+        plan_quality_rejections.append("INVALID_TRIGGER")
+    if trigger_price is not None and price > 0:
+        trigger_ratio = _safe_float(trigger_price) / price
+        if trigger_ratio < 0.25 or trigger_ratio > 4.0:
+            plan_quality_rejections.append("CORPORATE_ACTION_SUSPECTED")
+    if trigger_price is not None and maximum_entry_price is not None:
+        if _safe_float(maximum_entry_price) <= _safe_float(trigger_price):
+            plan_quality_rejections.append("INVALID_LEVEL_ORDER")
+    if invalidation_price is not None:
+        invalidation_value = _safe_float(invalidation_price)
+        if invalidation_value <= 0:
+            plan_quality_rejections.append("INVALID_LEVEL_ORDER")
+        elif price <= invalidation_value:
+            plan_quality_rejections.append("ALREADY_INVALIDATED")
+        elif trigger_price is not None and invalidation_value >= _safe_float(trigger_price):
+            plan_quality_rejections.append("INVALID_LEVEL_ORDER")
+    if plan_quality_rejections:
+        entry_plan["status"] = "BLOCKED"
+        entry_plan["order_action"] = "WAIT"
     qualified_profiles = [profile for profile in structural if profile.get("distance_atr", 99) <= 0.75 and profile.get("status") in ("VIRGIN", "FIRST_TEST", "RECLAIMED") and profile.get("impulse_move_pct", 0) >= 20 and profile.get("bars", 0) >= 20]
     active_structural_profile = min(qualified_profiles, key=lambda profile: profile.get("distance_atr", 99)) if qualified_profiles else None
     structural_event = None
@@ -1049,7 +1096,11 @@ def analyze_max_strategy(df, bars_4h=None):
         triggers.append("POC20_MIGRATION_UP")
     data_rejections = []
     if quality["status"] != "OK": data_rejections.append("DATA_QUALITY_FAILED")
+    if quality.get("is_stale"): data_rejections.append("STALE_OR_DELISTED")
+    if quality.get("corporate_action_suspected"): data_rejections.append("CORPORATE_ACTION_SUSPECTED")
+    data_rejections.extend(plan_quality_rejections)
     if price < 2: data_rejections.append("PRICE_BELOW_2")
+    data_rejections = list(dict.fromkeys(data_rejections))
     strategy_rejections = []
     if phase["falling_knife_block"]: strategy_rejections.append("FALLING_KNIFE_BLOCK")
     if phase["mature_markup_block"]: strategy_rejections.append("MATURE_MARKUP_BLOCK")
@@ -1085,7 +1136,10 @@ def analyze_max_strategy(df, bars_4h=None):
         and not blocking_phase
     )
     raw_plan_status = mtf_plan["entry_plan"].get("status")
-    if raw_plan_status == "ARMED" and not weekly_plan_qualified:
+    if plan_quality_rejections:
+        mtf_plan["entry_plan"]["status"] = "BLOCKED"
+        mtf_plan["entry_plan"]["order_action"] = "WAIT"
+    elif raw_plan_status == "ARMED" and not weekly_plan_qualified:
         mtf_plan["entry_plan"]["status"] = "DETECTED"
         mtf_plan["entry_plan"]["order_action"] = "WAIT"
     elif raw_plan_status in ("CONFIRMED_4H", "CONFIRMED_DAILY") and not weekly_plan_qualified:
