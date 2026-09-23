@@ -95,7 +95,7 @@ class AlphaStrategist(BaseAgent):
     """
 
     def __init__(self):
-        super().__init__(name="alpha_strategist", version="2.2")
+        super().__init__(name="alpha_strategist", version="2.3")
         # v2.0 — Confluence max score teorico (13 factors + 2 ML)
         # Original: 15.0 (13 factors)
         # + Factor 14 (ML WIN/LOSS): 2.5 max
@@ -1041,6 +1041,15 @@ class AlphaStrategist(BaseAgent):
             "avoid_candidates": 0,
         }
 
+        # v2.3 - diagnostica completa, senza modificare alcun filtro.
+        diagnostic = {
+            "rsi_too_high": [],
+            "rsi_too_low": [],
+            "setup_rejected": {},
+            "sector_full": {},
+            "confluence_near_misses": [],
+        }
+
         for a in assets:
             ticker = a.get("ticker", "")
 
@@ -1062,6 +1071,17 @@ class AlphaStrategist(BaseAgent):
                 continue
             if rsi > max_rsi or rsi < min_rsi:
                 skipped_reasons["rsi_filter"] += 1
+                row = {
+                    "ticker": ticker,
+                    "sector": sector,
+                    "setup_type": stype,
+                    "rsi": round(float(rsi), 1),
+                    "limit": max_rsi if rsi > max_rsi else min_rsi,
+                }
+                if rsi > max_rsi:
+                    diagnostic["rsi_too_high"].append(row)
+                else:
+                    diagnostic["rsi_too_low"].append(row)
                 continue
 
             # Volume filter smart
@@ -1081,13 +1101,16 @@ class AlphaStrategist(BaseAgent):
 
             if best_setups and stype not in best_setups:
                 skipped_reasons["setup_filter"] += 1
+                diagnostic["setup_rejected"][stype] = diagnostic["setup_rejected"].get(stype, 0) + 1
                 continue
             if stype in worst_setups:
                 skipped_reasons["setup_filter"] += 1
+                diagnostic["setup_rejected"][stype] = diagnostic["setup_rejected"].get(stype, 0) + 1
                 continue
             sector_count = open_sectors.count(sector)
             if sector_count >= max_per_sector:
                 skipped_reasons["sector_full"] += 1
+                diagnostic["sector_full"][sector] = diagnostic["sector_full"].get(sector, 0) + 1
                 continue
 
             # weak_sectors resta un dato osservato, non una penalita': deriva
@@ -1112,6 +1135,18 @@ class AlphaStrategist(BaseAgent):
 
             if conf_score < sector_threshold:
                 skipped_reasons["low_confluence"] += 1
+                diagnostic["confluence_near_misses"].append({
+                    "ticker": ticker,
+                    "sector": sector,
+                    "setup_type": stype,
+                    "rsi": round(float(rsi), 1),
+                    "confluence": round(float(conf_score), 1),
+                    "threshold": round(float(sector_threshold), 1),
+                    "gap": round(float(sector_threshold - conf_score), 1),
+                    "sector_flow": threshold_reason,
+                    "positive_factors": [f.get("name") for f in conf.get("factors", []) if f.get("pass")],
+                    "negative_factors": [f.get("name") for f in conf.get("factors", []) if not f.get("pass")],
+                })
 
                 # Se il titolo sarebbe passato con la soglia base, e' stata
                 # la leadership a fermarlo: va tracciato.
@@ -1327,11 +1362,29 @@ class AlphaStrategist(BaseAgent):
                 except Exception as e:
                     print(f"    LLM error {candidate.get('ticker')}: {e}")
         
+        diagnostic["confluence_near_misses"] = sorted(
+            diagnostic["confluence_near_misses"],
+            key=lambda row: (row["gap"], -row["confluence"]),
+        )[:15]
+        diagnostic["rsi_too_high"] = sorted(
+            diagnostic["rsi_too_high"], key=lambda row: row["rsi"]
+        )[:15]
+        diagnostic["rsi_too_low"] = sorted(
+            diagnostic["rsi_too_low"], key=lambda row: -row["rsi"]
+        )[:15]
+        diagnostic["setup_rejected"] = dict(sorted(
+            diagnostic["setup_rejected"].items(), key=lambda item: item[1], reverse=True
+        ))
+        diagnostic["sector_full"] = dict(sorted(
+            diagnostic["sector_full"].items(), key=lambda item: item[1], reverse=True
+        ))
+
         summary = {
             "total_assets_scanned": len(assets),
             "buy_candidates": len(top_candidates),
             "sell_signals": len(sell_signals),
             "skipped_reasons": skipped_reasons,
+            "filter_diagnostics": diagnostic,
             "market_regime": market_ctx.get("market_regime", "UNKNOWN"),
             "top_confluence": top_candidates[0]["confluence"] if top_candidates else 0,
             # 🆕 v2.0 — ML stats
@@ -1384,6 +1437,7 @@ class AlphaStrategist(BaseAgent):
                 "focus_sectors": leadership["focus"],
                 "avoid_sectors": leadership["avoid"],
                 "leadership_stats": leadership_stats,
+                "filter_diagnostics": diagnostic,
             },
             reasoning=f"Found {len(top_candidates)} buys, {len(sell_signals)} sells. "
                       f"Regime={market_ctx.get('market_regime')} "
@@ -1391,8 +1445,17 @@ class AlphaStrategist(BaseAgent):
             confidence=min(100, summary["top_confluence"]) if top_candidates else 20,
         )
 
-        print(f"🎯 AlphaStrategist v2.2: {len(top_candidates)} candidates, "
+        print(f"🎯 AlphaStrategist v2.3: {len(top_candidates)} candidates, "
               f"{len(sell_signals)} sell signals (ML: {len(ml_map)} tickers)")
+
+        if diagnostic["confluence_near_misses"]:
+            near = ", ".join(
+                f"{row['ticker']} {row['confluence']}/{row['threshold']}"
+                for row in diagnostic["confluence_near_misses"][:5]
+            )
+            print(f"  Diagnostica Alpha: migliori sotto soglia -> {near}")
+        print(f"  RSI esclusi: alti={len(diagnostic['rsi_too_high'])}, bassi={len(diagnostic['rsi_too_low'])} | "
+              f"setup={diagnostic['setup_rejected']} | settori saturi={diagnostic['sector_full']}")
 
         if leadership["available"]:
             focus_list = ", ".join(leadership["focus"]) or "nessuno"
