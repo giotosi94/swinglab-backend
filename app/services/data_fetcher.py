@@ -987,10 +987,22 @@ async def save_max_strategy_validation_snapshot(db, asset_doc, df):
         "created_at": datetime.utcnow(),
         "updated_at": datetime.utcnow(),
     }
+    insert_snapshot = dict(snapshot)
+    for field in (
+        "validation_cohort",
+        "data_eligible",
+        "strategy_eligible",
+        "trade_ready",
+        "rejection_reasons",
+        "updated_at",
+    ):
+        insert_snapshot.pop(field, None)
+    now = datetime.utcnow()
     await db.max_strategy_signals.update_one(
         {"setup_key": setup_key},
-        {"$setOnInsert": snapshot, "$set": {
-            "last_seen_at": datetime.utcnow(),
+        {"$setOnInsert": insert_snapshot, "$set": {
+            "last_seen_at": now,
+            "updated_at": now,
             "latest_status": status,
             "validation_cohort": validation_cohort,
             "data_eligible": data_eligible,
