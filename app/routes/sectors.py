@@ -405,25 +405,34 @@ def _bottom_classification(points):
     participation_score += 6.0 if b50_change_10d > 0 else 0.0
     participation_score += 6.0 if b200_change_20d > 0 else 0.0
     score = round(min(100.0, washout_score + recovery_score + stabilization_score + participation_score), 1)
-    washout = b200 <= 25 or percentile <= 15
-    recovering = b20_change_5d >= 8 and b50_change_10d > 0
+    washout = b200 <= 20 or (b200 <= 40 and percentile <= 20)
+    recovering = b20_change_5d >= 8 and b50_change_10d > 0 and new_low_change_5d < 0
     broad_recovery = b20 >= 45 and b20 > b50 and b50_change_10d >= 8
-    confirmed = b50 >= 50 and b200_change_20d > 0 and new_low20 <= 10
+    confirmed = washout and b50 >= 50 and b200_change_20d > 0 and new_low20 <= 10
+    correction_recovery = bool(
+        not washout
+        and b20_change_5d >= 15
+        and b50_change_10d > 0
+        and new_low_change_5d < 0
+    )
     if confirmed and score >= 65:
         state = "RECLAIM_CONFERMATO"
-        reason = "Recupero diffuso: breadth 50/200 giorni in espansione e nuovi minimi contenuti."
-    elif broad_recovery and score >= 55:
+        reason = "Dopo un washout, la breadth di medio e lungo periodo torna a espandersi con pochi nuovi minimi."
+    elif washout and broad_recovery and score >= 55:
         state = "RECUPERO_DIFFUSO"
-        reason = "La partecipazione di breve e medio periodo sta risalendo su una parte ampia del settore."
+        reason = "Il recupero successivo al washout coinvolge una quota crescente dei componenti."
     elif washout and recovering and score >= 40:
         state = "BOTTOM_IN_FORMAZIONE"
-        reason = "Breadth storicamente depressa, ma SMA20/SMA50 e nuovi minimi mostrano stabilizzazione."
+        reason = "Breadth assoluta e storica depresse, con recupero iniziale di SMA20/SMA50 e minori nuovi minimi."
+    elif correction_recovery:
+        state = "RECUPERO_DA_CORREZIONE"
+        reason = "La breadth di breve periodo rimbalza, ma la partecipazione SMA200 non indica un washout strutturale."
     elif washout:
         state = "WASHOUT"
-        reason = "Partecipazione estremamente debole senza conferma sufficiente di inversione."
+        reason = "Partecipazione assoluta e storica estremamente debole, senza inversione confermata."
     else:
         state = "NESSUN_BOTTOM"
-        reason = "Non risultano contemporaneamente washout e recupero diffuso della partecipazione."
+        reason = "Non risultano contemporaneamente washout assoluto e recupero diffuso della partecipazione."
     return {
         "state": state,
         "score": score,
@@ -586,10 +595,11 @@ async def get_sector_breadth_bottom(days: int = Query(252, ge=21, le=750)):
             "recovery": "Aumento della breadth SMA20 in 5 sedute e SMA50 in 10 sedute.",
             "stabilization": "Riduzione della percentuale di aziende su nuovi minimi a 20 sedute.",
             "states": {
-                "WASHOUT": "Debolezza estrema ancora senza inversione confermata.",
-                "BOTTOM_IN_FORMAZIONE": "Washout con recupero iniziale della partecipazione.",
-                "RECUPERO_DIFFUSO": "Ripresa estesa a una quota crescente dei componenti.",
-                "RECLAIM_CONFERMATO": "Breadth di medio periodo in espansione e nuovi minimi contenuti.",
+                "WASHOUT": "Partecipazione assoluta e storica estremamente debole, senza inversione confermata.",
+                "BOTTOM_IN_FORMAZIONE": "Washout reale con recupero iniziale della partecipazione e minori nuovi minimi.",
+                "RECUPERO_DIFFUSO": "Ripresa post-washout estesa a una quota crescente dei componenti.",
+                "RECLAIM_CONFERMATO": "Dopo un washout, breadth di medio periodo in espansione e nuovi minimi contenuti.",
+                "RECUPERO_DA_CORREZIONE": "Rimbalzo interno senza washout strutturale della breadth SMA200.",
                 "NESSUN_BOTTOM": "Condizioni quantitative di bottom non presenti.",
             },
         },
