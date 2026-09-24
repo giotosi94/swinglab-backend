@@ -889,22 +889,72 @@ async def save_max_strategy_validation_snapshot(db, asset_doc, df):
     if not ticker or df is None or len(df) == 0:
         return None
     signal_date = df["datetime"].iloc[-1].strftime("%Y-%m-%d")
-    trigger_price = plan.get("trigger_price")
-    setup_key = f"{ticker}:{signal_date}:{status}:{trigger_price}"
+    signal_price = _safe_number(asset_doc.get("price"))
+    trigger_price = _safe_number(plan.get("trigger_price"))
+    maximum_entry_price = _safe_number(plan.get("maximum_entry_price"))
+    invalidation_price = _safe_number(plan.get("invalidation_price"))
+    weekly_qualified = bool(plan.get("weekly_plan_qualified"))
+    blocking_phase = bool(plan.get("blocking_phase"))
+    data_eligible = bool(max_strategy.get("data_eligible"))
+    strategy_eligible = bool(max_strategy.get("strategy_eligible"))
+    trade_ready = bool(max_strategy.get("trade_ready"))
+    rejection_reasons = list(max_strategy.get("rejection_reasons") or [])
+    levels_valid = bool(
+        signal_price
+        and trigger_price
+        and maximum_entry_price
+        and trigger_price > 0
+        and maximum_entry_price > trigger_price
+        and (invalidation_price is None or 0 < invalidation_price < trigger_price)
+    )
+    already_invalidated = bool(invalidation_price and signal_price and signal_price <= invalidation_price)
+    if not levels_valid:
+        rejection_reasons.append("INVALID_LEVELS_FOR_VALIDATION")
+    if already_invalidated:
+        rejection_reasons.append("ALREADY_INVALIDATED")
+    rejection_reasons = list(dict.fromkeys(rejection_reasons))
+    qualified = bool(
+        data_eligible
+        and strategy_eligible
+        and weekly_qualified
+        and not blocking_phase
+        and levels_valid
+        and not already_invalidated
+    )
+    order_action = plan.get("order_action")
+    if not qualified:
+        validation_cohort = "INVALID"
+    elif status == "WAIT_RETEST":
+        validation_cohort = "RETEST_WATCH"
+    elif status == "TRIGGERED" and order_action != "BUY_ALLOWED":
+        validation_cohort = "TRIGGER_WATCH"
+    else:
+        validation_cohort = "ACTIONABLE"
+    trigger_key = round(trigger_price, 4) if trigger_price is not None else "none"
+    invalidation_key = round(invalidation_price, 4) if invalidation_price is not None else "none"
+    plan_key = f"{ticker}:{max_strategy.get('version')}:{trigger_key}:{invalidation_key}"
+    setup_key = f"{ticker}:{signal_date}:{status}:{trigger_key}"
     snapshot = {
         "setup_key": setup_key,
+        "plan_key": plan_key,
         "ticker": ticker,
         "signal_date": signal_date,
         "strategy_version": max_strategy.get("version"),
+        "validation_cohort": validation_cohort,
         "status": status,
-        "order_action": plan.get("order_action"),
+        "order_action": order_action,
         "execution_mode": plan.get("execution_mode"),
-        "signal_price": asset_doc.get("price"),
+        "signal_price": signal_price,
+        "entry_reference_price": trigger_price if validation_cohort == "ACTIONABLE" else None,
         "trigger_price": trigger_price,
-        "maximum_entry_price": plan.get("maximum_entry_price"),
-        "invalidation_price": plan.get("invalidation_price"),
-        "weekly_plan_qualified": plan.get("weekly_plan_qualified"),
-        "blocking_phase": plan.get("blocking_phase"),
+        "maximum_entry_price": maximum_entry_price,
+        "invalidation_price": invalidation_price,
+        "weekly_plan_qualified": weekly_qualified,
+        "blocking_phase": blocking_phase,
+        "data_eligible": data_eligible,
+        "strategy_eligible": strategy_eligible,
+        "trade_ready": trade_ready,
+        "rejection_reasons": rejection_reasons,
         "market_phase": (max_strategy.get("market_phase") or {}).get("phase"),
         "strategy_type": max_strategy.get("strategy_type"),
         "max_score": max_strategy.get("max_score"),
@@ -915,11 +965,21 @@ async def save_max_strategy_validation_snapshot(db, asset_doc, df):
         "active_base": max_strategy.get("active_base"),
         "outcomes": {
             "bars_observed": 0,
-            "mfe_pct": 0.0,
-            "mae_pct": 0.0,
+            "entry_triggered": False,
+            "entry_triggered_at": None,
+            "mfe_pct": None,
+            "mae_pct": None,
             "trigger_reached": False,
             "maximum_entry_exceeded": False,
             "invalidation_reached": False,
+            "return_5d_pct": None,
+            "return_10d_pct": None,
+            "return_20d_pct": None,
+        },
+        "watch_outcomes": {
+            "bars_observed": 0,
+            "mfe_pct": None,
+            "mae_pct": None,
             "return_5d_pct": None,
             "return_10d_pct": None,
             "return_20d_pct": None,
@@ -929,10 +989,52 @@ async def save_max_strategy_validation_snapshot(db, asset_doc, df):
     }
     await db.max_strategy_signals.update_one(
         {"setup_key": setup_key},
-        {"$setOnInsert": snapshot, "$set": {"last_seen_at": datetime.utcnow(), "latest_status": status}},
+        {"$setOnInsert": snapshot, "$set": {
+            "last_seen_at": datetime.utcnow(),
+            "latest_status": status,
+            "validation_cohort": validation_cohort,
+            "data_eligible": data_eligible,
+            "strategy_eligible": strategy_eligible,
+            "trade_ready": trade_ready,
+            "rejection_reasons": rejection_reasons,
+        }},
         upsert=True,
     )
     return setup_key
+
+
+def _safe_number(value):
+    try:
+        number = float(value)
+        return number if np.isfinite(number) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _legacy_validation_cohort(signal):
+    trigger = _safe_number(signal.get("trigger_price"))
+    maximum_entry = _safe_number(signal.get("maximum_entry_price"))
+    invalidation = _safe_number(signal.get("invalidation_price"))
+    signal_price = _safe_number(signal.get("signal_price"))
+    status = signal.get("status")
+    valid_levels = bool(
+        signal_price
+        and trigger
+        and maximum_entry
+        and trigger > 0
+        and maximum_entry > trigger
+        and (invalidation is None or 0 < invalidation < trigger)
+        and not (invalidation and signal_price <= invalidation)
+    )
+    if not valid_levels:
+        return "LEGACY_INVALID"
+    if status == "WAIT_RETEST":
+        return "RETEST_WATCH"
+    if status == "TRIGGERED":
+        return "TRIGGER_WATCH"
+    if status in ("ARMED", "CONFIRMED_4H", "CONFIRMED_DAILY"):
+        return "ACTIONABLE"
+    return "LEGACY_INVALID"
 
 
 async def update_max_strategy_validation_outcomes(db, ticker, df):
@@ -942,39 +1044,78 @@ async def update_max_strategy_validation_outcomes(db, ticker, df):
     updated = 0
     for signal in signals:
         signal_date = signal.get("signal_date")
-        signal_price = signal.get("signal_price")
+        signal_price = _safe_number(signal.get("signal_price"))
         if not signal_date or not signal_price or signal_price <= 0:
             continue
-        future = df[df["datetime"] > pd.to_datetime(signal_date)].copy()
+        cohort = signal.get("validation_cohort") or _legacy_validation_cohort(signal)
+        future = df[df["datetime"] > pd.to_datetime(signal_date)].copy().reset_index(drop=True)
         if len(future) == 0:
+            await db.max_strategy_signals.update_one(
+                {"_id": signal["_id"]},
+                {"$set": {"validation_cohort": cohort, "updated_at": datetime.utcnow()}},
+            )
             continue
-        bars_observed = len(future)
-        highest = float(future["High"].max())
-        lowest = float(future["Low"].min())
-        mfe_pct = (highest - signal_price) / signal_price * 100
-        mae_pct = (lowest - signal_price) / signal_price * 100
-        trigger = signal.get("trigger_price")
-        maximum_entry = signal.get("maximum_entry_price")
-        invalidation = signal.get("invalidation_price")
-        outcomes = {
-            "bars_observed": bars_observed,
-            "mfe_pct": round(mfe_pct, 2),
-            "mae_pct": round(mae_pct, 2),
-            "trigger_reached": bool(trigger and highest >= trigger),
-            "maximum_entry_exceeded": bool(maximum_entry and highest > maximum_entry),
-            "invalidation_reached": bool(invalidation and lowest <= invalidation),
-            "return_5d_pct": round((float(future["Close"].iloc[4]) - signal_price) / signal_price * 100, 2) if bars_observed >= 5 else None,
-            "return_10d_pct": round((float(future["Close"].iloc[9]) - signal_price) / signal_price * 100, 2) if bars_observed >= 10 else None,
-            "return_20d_pct": round((float(future["Close"].iloc[19]) - signal_price) / signal_price * 100, 2) if bars_observed >= 20 else None,
+        watch_highest = float(future["High"].max())
+        watch_lowest = float(future["Low"].min())
+        watch_mfe = max(0.0, (watch_highest - signal_price) / signal_price * 100)
+        watch_mae = min(0.0, (watch_lowest - signal_price) / signal_price * 100)
+        watch_outcomes = {
+            "bars_observed": len(future),
+            "mfe_pct": round(watch_mfe, 2),
+            "mae_pct": round(watch_mae, 2),
+            "return_5d_pct": round((float(future["Close"].iloc[4]) - signal_price) / signal_price * 100, 2) if len(future) >= 5 else None,
+            "return_10d_pct": round((float(future["Close"].iloc[9]) - signal_price) / signal_price * 100, 2) if len(future) >= 10 else None,
+            "return_20d_pct": round((float(future["Close"].iloc[19]) - signal_price) / signal_price * 100, 2) if len(future) >= 20 else None,
         }
+        trigger = _safe_number(signal.get("trigger_price"))
+        maximum_entry = _safe_number(signal.get("maximum_entry_price"))
+        invalidation = _safe_number(signal.get("invalidation_price"))
+        outcomes = {
+            "bars_observed": 0,
+            "entry_triggered": False,
+            "entry_triggered_at": None,
+            "mfe_pct": None,
+            "mae_pct": None,
+            "trigger_reached": False,
+            "maximum_entry_exceeded": False,
+            "invalidation_reached": False,
+            "return_5d_pct": None,
+            "return_10d_pct": None,
+            "return_20d_pct": None,
+        }
+        if cohort == "ACTIONABLE" and trigger and trigger > 0:
+            trigger_hits = future.index[future["High"] >= trigger].tolist()
+            if trigger_hits:
+                trigger_index = trigger_hits[0]
+                entry_bar = future.iloc[trigger_index]
+                post_entry = future.iloc[trigger_index:].reset_index(drop=True)
+                entry_price = trigger
+                highest = float(post_entry["High"].max())
+                lowest = float(post_entry["Low"].min())
+                outcomes = {
+                    "bars_observed": len(post_entry),
+                    "entry_triggered": True,
+                    "entry_triggered_at": pd.to_datetime(entry_bar["datetime"]).strftime("%Y-%m-%d"),
+                    "mfe_pct": round(max(0.0, (highest - entry_price) / entry_price * 100), 2),
+                    "mae_pct": round(min(0.0, (lowest - entry_price) / entry_price * 100), 2),
+                    "trigger_reached": True,
+                    "maximum_entry_exceeded": bool(maximum_entry and highest > maximum_entry),
+                    "invalidation_reached": bool(invalidation and lowest <= invalidation),
+                    "return_5d_pct": round((float(post_entry["Close"].iloc[4]) - entry_price) / entry_price * 100, 2) if len(post_entry) >= 5 else None,
+                    "return_10d_pct": round((float(post_entry["Close"].iloc[9]) - entry_price) / entry_price * 100, 2) if len(post_entry) >= 10 else None,
+                    "return_20d_pct": round((float(post_entry["Close"].iloc[19]) - entry_price) / entry_price * 100, 2) if len(post_entry) >= 20 else None,
+                }
         await db.max_strategy_signals.update_one(
             {"_id": signal["_id"]},
-            {"$set": {"outcomes": outcomes, "updated_at": datetime.utcnow()}},
+            {"$set": {
+                "validation_cohort": cohort,
+                "outcomes": outcomes,
+                "watch_outcomes": watch_outcomes,
+                "updated_at": datetime.utcnow(),
+            }},
         )
         updated += 1
     return updated
-
-
 # ============================================
 # SECTORS
 # ============================================
