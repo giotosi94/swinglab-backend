@@ -455,14 +455,15 @@ def _bottom_classification(points):
     }
 
 
-@router.get("/breadth-bottom")
-async def get_sector_breadth_bottom(days: int = Query(252, ge=21, le=252)):
-    db = get_db()
-    cached = await db.sector_bottom_breadth.find_one({"_id": "latest"})
-    if cached:
-        cached.pop("_id", None)
-        return cached
-
+async def rebuild_sector_bottom_breadth(db=None, days=252, force=False):
+    db = db or get_db()
+    days = max(21, min(int(days), 252))
+    if not force:
+        cached = await db.sector_bottom_breadth.find_one({"_id": "latest"})
+        if cached:
+            cached.pop("_id", None)
+            cached["cached"] = True
+            return cached
     assets = await db.assets.find(
         {"sector_code": {"$in": SECTOR_CODES}, "data_eligible": {"$ne": False}},
         {"ticker": 1, "sector_code": 1},
@@ -472,29 +473,22 @@ async def get_sector_breadth_bottom(days: int = Query(252, ge=21, le=252)):
         for asset in assets
         if asset.get("ticker") and asset.get("sector_code") in SECTOR_CODES
     }
-    tickers = list(ticker_sector)
     docs = await db.stock_bars.find(
-        {"ticker": {"$in": tickers}},
+        {"ticker": {"$in": list(ticker_sector)}},
         {"ticker": 1, "bars": {"$slice": -472}},
     ).to_list(400)
-
     sector_dates = {code: {} for code in SECTOR_CODES}
     sector_members = {code: 0 for code in SECTOR_CODES}
     all_dates = set()
-
     for doc in docs:
-        ticker = doc.get("ticker")
-        code = ticker_sector.get(ticker)
+        code = ticker_sector.get(doc.get("ticker"))
         if not code:
             continue
-        rows = []
-        for bar in doc.get("bars", []):
-            date = bar.get("date")
-            close = float(bar.get("c", 0) or 0)
-            low = float(bar.get("l", 0) or 0)
-            if date and close > 0 and low > 0:
-                rows.append((date, close, low))
-        rows.sort(key=lambda item: item[0])
+        rows = sorted([
+            (bar.get("date"), float(bar.get("c", 0) or 0), float(bar.get("l", 0) or 0))
+            for bar in doc.get("bars", [])
+            if bar.get("date") and float(bar.get("c", 0) or 0) > 0 and float(bar.get("l", 0) or 0) > 0
+        ], key=lambda item: item[0])
         if len(rows) < 200:
             continue
         sector_members[code] += 1
@@ -507,53 +501,46 @@ async def get_sector_breadth_bottom(days: int = Query(252, ge=21, le=252)):
             date, close, low = rows[index]
             all_dates.add(date)
             metrics = sector_dates[code].setdefault(date, {
-                "above20": 0, "eligible20": 0,
-                "above50": 0, "eligible50": 0,
-                "above200": 0, "eligible200": 0,
-                "new_low20": 0, "new_low_eligible": 0,
-                "distances200": [],
+                "above20": 0, "above50": 0, "above200": 0, "eligible": 0,
+                "new_low20": 0, "distances200": [],
             })
             sma20 = (prefix[index + 1] - prefix[index - 19]) / 20
             sma50 = (prefix[index + 1] - prefix[index - 49]) / 50
             sma200 = (prefix[index + 1] - prefix[index - 199]) / 200
-            metrics["eligible20"] += 1
-            metrics["eligible50"] += 1
-            metrics["eligible200"] += 1
+            metrics["eligible"] += 1
             metrics["above20"] += int(close > sma20)
             metrics["above50"] += int(close > sma50)
             metrics["above200"] += int(close > sma200)
             metrics["distances200"].append((close - sma200) / sma200 * 100)
-            metrics["new_low_eligible"] += 1
             metrics["new_low20"] += int(low <= min(lows[index - 19:index + 1]))
-
     requested_dates = sorted(all_dates)[-days:]
     sector_docs = await db.sectors.find(
         {"code": {"$in": SECTOR_CODES}}, {"code": 1, "name": 1}
     ).to_list(20)
     sector_names = {doc.get("code"): doc.get("name", doc.get("code")) for doc in sector_docs}
     series = []
-
     for code in SECTOR_CODES:
         points = []
         for date in requested_dates:
             metrics = sector_dates[code].get(date)
-            if not metrics or not metrics["eligible200"]:
+            if not metrics or not metrics["eligible"]:
                 continue
+            eligible = metrics["eligible"]
             distances = sorted(metrics["distances200"])
             middle = len(distances) // 2
             median = distances[middle] if len(distances) % 2 else (distances[middle - 1] + distances[middle]) / 2
-            above200 = metrics["above200"] / metrics["eligible200"] * 100
+            above200 = metrics["above200"] / eligible * 100
             points.append({
                 "date": date,
-                "above_sma20_pct": round(metrics["above20"] / metrics["eligible20"] * 100, 1),
-                "above_sma50_pct": round(metrics["above50"] / metrics["eligible50"] * 100, 1),
+                "above_sma20_pct": round(metrics["above20"] / eligible * 100, 1),
+                "above_sma50_pct": round(metrics["above50"] / eligible * 100, 1),
                 "above_sma200_pct": round(above200, 1),
                 "below_sma200_pct": round(100 - above200, 1),
                 "median_distance_sma200_pct": round(median, 2),
-                "new_low20_pct": round(metrics["new_low20"] / metrics["new_low_eligible"] * 100, 1),
-                "eligible_20": metrics["eligible20"],
-                "eligible_50": metrics["eligible50"],
-                "eligible_200": metrics["eligible200"],
+                "new_low20_pct": round(metrics["new_low20"] / eligible * 100, 1),
+                "eligible_20": eligible,
+                "eligible_50": eligible,
+                "eligible_200": eligible,
             })
         if points:
             series.append({
@@ -563,7 +550,6 @@ async def get_sector_breadth_bottom(days: int = Query(252, ge=21, le=252)):
                 "points": points,
                 "bottom": _bottom_classification(points),
             })
-
     series.sort(key=lambda item: item["bottom"]["score"], reverse=True)
     result = {
         "mode": "SECTOR_BOTTOM_BREADTH",
@@ -592,6 +578,32 @@ async def get_sector_breadth_bottom(days: int = Query(252, ge=21, le=252)):
         {"_id": "latest"}, {"_id": "latest", **result}, upsert=True
     )
     return result
+
+
+@router.get("/breadth-bottom")
+async def get_sector_breadth_bottom(days: int = Query(252, ge=21, le=252)):
+    db = get_db()
+    cached = await db.sector_bottom_breadth.find_one({"_id": "latest"})
+    if not cached:
+        return {
+            "error": "Sector Bottom Breadth non ancora calcolato. Attendere la prossima pipeline Stocks.",
+            "code": "BREADTH_CACHE_NOT_READY",
+        }
+    cached.pop("_id", None)
+    cached["cached"] = True
+    cached["requested_days"] = min(days, 252)
+    if days < 252:
+        cached["series"] = [
+            {**item, "points": (item.get("points") or [])[-days:]}
+            for item in cached.get("series", [])
+        ]
+        cached["executed_days"] = days
+        dates = [point.get("date") for item in cached["series"] for point in item.get("points", []) if point.get("date")]
+        if dates:
+            cached["start_date"] = min(dates)
+            cached["end_date"] = max(dates)
+    return cached
+
 
 @router.get("/{code}")
 async def get_sector(code: str):
