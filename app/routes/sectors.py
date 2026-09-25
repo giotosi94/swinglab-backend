@@ -456,14 +456,13 @@ def _bottom_classification(points):
 
 
 @router.get("/breadth-bottom")
-async def get_sector_breadth_bottom(days: int = Query(252, ge=21, le=750)):
-    """
-    Indicatore visuale equal-weighted per settore.
-    Misura la percentuale dei componenti sopra SMA20, SMA50 e SMA200,
-    la diffusione dei nuovi minimi a 20 sedute e la velocita' del recupero.
-    Non modifica Alpha, RiskManager, sizing o ordini.
-    """
+async def get_sector_breadth_bottom(days: int = Query(252, ge=21, le=252)):
     db = get_db()
+    cached = await db.sector_bottom_breadth.find_one({"_id": "latest"})
+    if cached:
+        cached.pop("_id", None)
+        return cached
+
     assets = await db.assets.find(
         {"sector_code": {"$in": SECTOR_CODES}, "data_eligible": {"$ne": False}},
         {"ticker": 1, "sector_code": 1},
@@ -473,16 +472,21 @@ async def get_sector_breadth_bottom(days: int = Query(252, ge=21, le=750)):
         for asset in assets
         if asset.get("ticker") and asset.get("sector_code") in SECTOR_CODES
     }
-    tickers = list(ticker_sector.keys())
-    bars_needed = min(1000, days + 220)
+    tickers = list(ticker_sector)
     docs = await db.stock_bars.find(
         {"ticker": {"$in": tickers}},
-        {"ticker": 1, "bars": {"$slice": -bars_needed}},
+        {"ticker": 1, "bars": {"$slice": -472}},
     ).to_list(400)
-    histories = {}
+
+    sector_dates = {code: {} for code in SECTOR_CODES}
+    sector_members = {code: 0 for code in SECTOR_CODES}
     all_dates = set()
+
     for doc in docs:
         ticker = doc.get("ticker")
+        code = ticker_sector.get(ticker)
+        if not code:
+            continue
         rows = []
         for bar in doc.get("bars", []):
             date = bar.get("date")
@@ -490,86 +494,78 @@ async def get_sector_breadth_bottom(days: int = Query(252, ge=21, le=750)):
             low = float(bar.get("l", 0) or 0)
             if date and close > 0 and low > 0:
                 rows.append((date, close, low))
-                all_dates.add(date)
         rows.sort(key=lambda item: item[0])
-        if rows:
-            histories[ticker] = rows
-    requested_dates = sorted(all_dates)[-days:]
-    sector_points = {code: [] for code in SECTOR_CODES}
-    by_ticker_date = {
-        ticker: {date: index for index, (date, _, _) in enumerate(rows)}
-        for ticker, rows in histories.items()
-    }
-    sector_members = {
-        code: [ticker for ticker, sector in ticker_sector.items() if sector == code and ticker in histories]
-        for code in SECTOR_CODES
-    }
-    for date in requested_dates:
-        for code in SECTOR_CODES:
-            counts = {20: 0, 50: 0, 200: 0}
-            eligible = {20: 0, 50: 0, 200: 0}
-            new_low20 = 0
-            new_low_eligible = 0
-            distances_200 = []
-            for ticker in sector_members[code]:
-                rows = histories[ticker]
-                index = by_ticker_date[ticker].get(date)
-                if index is None:
-                    continue
-                closes = [row[1] for row in rows]
-                lows = [row[2] for row in rows]
-                close = closes[index]
-                for period in (20, 50, 200):
-                    average = _sma(closes, index, period)
-                    if average and average > 0:
-                        eligible[period] += 1
-                        if close > average:
-                            counts[period] += 1
-                        if period == 200:
-                            distances_200.append((close - average) / average * 100)
-                if index >= 19:
-                    new_low_eligible += 1
-                    if lows[index] <= min(lows[index - 19:index + 1]):
-                        new_low20 += 1
-            if eligible[200] == 0:
-                continue
-            distance_median = 0.0
-            if distances_200:
-                ordered = sorted(distances_200)
-                middle = len(ordered) // 2
-                distance_median = ordered[middle] if len(ordered) % 2 else (ordered[middle - 1] + ordered[middle]) / 2
-            sector_points[code].append({
-                "date": date,
-                "above_sma20_pct": round(counts[20] / eligible[20] * 100, 1) if eligible[20] else None,
-                "above_sma50_pct": round(counts[50] / eligible[50] * 100, 1) if eligible[50] else None,
-                "above_sma200_pct": round(counts[200] / eligible[200] * 100, 1),
-                "below_sma200_pct": round(100 - counts[200] / eligible[200] * 100, 1),
-                "median_distance_sma200_pct": round(distance_median, 2),
-                "new_low20_pct": round(new_low20 / new_low_eligible * 100, 1) if new_low_eligible else None,
-                "eligible_20": eligible[20],
-                "eligible_50": eligible[50],
-                "eligible_200": eligible[200],
+        if len(rows) < 200:
+            continue
+        sector_members[code] += 1
+        closes = [row[1] for row in rows]
+        lows = [row[2] for row in rows]
+        prefix = [0.0]
+        for close in closes:
+            prefix.append(prefix[-1] + close)
+        for index in range(199, len(rows)):
+            date, close, low = rows[index]
+            all_dates.add(date)
+            metrics = sector_dates[code].setdefault(date, {
+                "above20": 0, "eligible20": 0,
+                "above50": 0, "eligible50": 0,
+                "above200": 0, "eligible200": 0,
+                "new_low20": 0, "new_low_eligible": 0,
+                "distances200": [],
             })
+            sma20 = (prefix[index + 1] - prefix[index - 19]) / 20
+            sma50 = (prefix[index + 1] - prefix[index - 49]) / 50
+            sma200 = (prefix[index + 1] - prefix[index - 199]) / 200
+            metrics["eligible20"] += 1
+            metrics["eligible50"] += 1
+            metrics["eligible200"] += 1
+            metrics["above20"] += int(close > sma20)
+            metrics["above50"] += int(close > sma50)
+            metrics["above200"] += int(close > sma200)
+            metrics["distances200"].append((close - sma200) / sma200 * 100)
+            metrics["new_low_eligible"] += 1
+            metrics["new_low20"] += int(low <= min(lows[index - 19:index + 1]))
+
+    requested_dates = sorted(all_dates)[-days:]
     sector_docs = await db.sectors.find(
-        {"code": {"$in": SECTOR_CODES}},
-        {"code": 1, "name": 1},
+        {"code": {"$in": SECTOR_CODES}}, {"code": 1, "name": 1}
     ).to_list(20)
     sector_names = {doc.get("code"): doc.get("name", doc.get("code")) for doc in sector_docs}
     series = []
+
     for code in SECTOR_CODES:
-        points = sector_points[code]
-        if not points:
-            continue
-        classification = _bottom_classification(points)
-        series.append({
-            "code": code,
-            "name": sector_names.get(code, code),
-            "members_total": len(sector_members[code]),
-            "points": points,
-            "bottom": classification,
-        })
+        points = []
+        for date in requested_dates:
+            metrics = sector_dates[code].get(date)
+            if not metrics or not metrics["eligible200"]:
+                continue
+            distances = sorted(metrics["distances200"])
+            middle = len(distances) // 2
+            median = distances[middle] if len(distances) % 2 else (distances[middle - 1] + distances[middle]) / 2
+            above200 = metrics["above200"] / metrics["eligible200"] * 100
+            points.append({
+                "date": date,
+                "above_sma20_pct": round(metrics["above20"] / metrics["eligible20"] * 100, 1),
+                "above_sma50_pct": round(metrics["above50"] / metrics["eligible50"] * 100, 1),
+                "above_sma200_pct": round(above200, 1),
+                "below_sma200_pct": round(100 - above200, 1),
+                "median_distance_sma200_pct": round(median, 2),
+                "new_low20_pct": round(metrics["new_low20"] / metrics["new_low_eligible"] * 100, 1),
+                "eligible_20": metrics["eligible20"],
+                "eligible_50": metrics["eligible50"],
+                "eligible_200": metrics["eligible200"],
+            })
+        if points:
+            series.append({
+                "code": code,
+                "name": sector_names.get(code, code),
+                "members_total": sector_members[code],
+                "points": points,
+                "bottom": _bottom_classification(points),
+            })
+
     series.sort(key=lambda item: item["bottom"]["score"], reverse=True)
-    return {
+    result = {
         "mode": "SECTOR_BOTTOM_BREADTH",
         "visual_only": True,
         "requested_days": days,
@@ -578,13 +574,8 @@ async def get_sector_breadth_bottom(days: int = Query(252, ge=21, le=750)):
         "end_date": requested_dates[-1] if requested_dates else None,
         "series": series,
         "ranking": [
-            {
-                "rank": index + 1,
-                "code": item["code"],
-                "name": item["name"],
-                "members_total": item["members_total"],
-                **item["bottom"],
-            }
+            {"rank": index + 1, "code": item["code"], "name": item["name"],
+             "members_total": item["members_total"], **item["bottom"]}
             for index, item in enumerate(series)
         ],
         "methodology": {
@@ -594,16 +585,13 @@ async def get_sector_breadth_bottom(days: int = Query(252, ge=21, le=750)):
             "washout": "Breadth SMA200 nel tratto piu' debole della propria distribuzione a un anno.",
             "recovery": "Aumento della breadth SMA20 in 5 sedute e SMA50 in 10 sedute.",
             "stabilization": "Riduzione della percentuale di aziende su nuovi minimi a 20 sedute.",
-            "states": {
-                "WASHOUT": "Partecipazione assoluta e storica estremamente debole, senza inversione confermata.",
-                "BOTTOM_IN_FORMAZIONE": "Washout reale con recupero iniziale della partecipazione e minori nuovi minimi.",
-                "RECUPERO_DIFFUSO": "Ripresa post-washout estesa a una quota crescente dei componenti.",
-                "RECLAIM_CONFERMATO": "Dopo un washout, breadth di medio periodo in espansione e nuovi minimi contenuti.",
-                "RECUPERO_DA_CORREZIONE": "Rimbalzo interno senza washout strutturale della breadth SMA200.",
-                "NESSUN_BOTTOM": "Condizioni quantitative di bottom non presenti.",
-            },
         },
+        "cached": False,
     }
+    await db.sector_bottom_breadth.replace_one(
+        {"_id": "latest"}, {"_id": "latest", **result}, upsert=True
+    )
+    return result
 
 @router.get("/{code}")
 async def get_sector(code: str):
