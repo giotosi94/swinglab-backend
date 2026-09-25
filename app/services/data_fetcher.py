@@ -1387,5 +1387,16 @@ async def fetch_and_analyze_stocks(force=False):
         print(f"  Average: {elapsed/len(results):.2f}s per stock")
     first_run_count = await db.stock_bars.count_documents({})
     print(f"  Bars in MongoDB: {first_run_count} stocks cached")
+    try:
+        from app.routes.sectors import rebuild_sector_bottom_breadth
+        breadth_start = time.time()
+        breadth = await rebuild_sector_bottom_breadth(db=db, days=252, force=True)
+        print(
+            f"  Sector Bottom Breadth: {len(breadth.get('series', []))}/11 sectors "
+            f"cached in {round(time.time() - breadth_start, 1)}s"
+        )
+    except Exception as error:
+        print(f"  Sector Bottom Breadth cache error: {error}")
+        traceback.print_exc()
     print("=" * 50)
     return results
