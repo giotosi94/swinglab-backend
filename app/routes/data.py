@@ -838,6 +838,13 @@ async def backtest_run(
     min_holding_days: int = 1,
     use_dynamic_sizing: bool = False,
     use_apm_exit_proxy: bool = False,
+    use_trend_leadership: bool = False,
+    park_cash_in_spy: bool = False,
+    trend_slots: int = 4,
+    trend_max_per_sector: int = 3,
+    trend_max_from_high_pct: float = 10.0,
+    trend_max_rsi: float = 80.0,
+    trend_rs_lookback: int = 126,
 ):
     from app.services.backtesting import run_backtest
 
@@ -859,6 +866,7 @@ async def backtest_run(
 
     if not use_preset:
         risk_params = {}
+        app_settings = {}
     max_positions = max_positions if max_positions is not None else 12
     position_size_pct = position_size_pct if position_size_pct is not None else 18.0
     min_confluence = min_confluence if min_confluence is not None else 48
@@ -887,6 +895,13 @@ async def backtest_run(
         min_holding_days=min_holding_days,
         use_dynamic_sizing=use_dynamic_sizing,
         use_apm_exit_proxy=use_apm_exit_proxy,
+        use_trend_leadership=use_trend_leadership,
+        park_cash_in_spy=park_cash_in_spy,
+        trend_slots=max(1, min(trend_slots, 8)),
+        trend_max_per_sector=max(1, min(trend_max_per_sector, 6)),
+        trend_max_from_high_pct=max(3.0, min(trend_max_from_high_pct, 25.0)),
+        trend_max_rsi=max(60.0, min(trend_max_rsi, 90.0)),
+        trend_rs_lookback=max(63, min(trend_rs_lookback, 200)),
         risk_pct_per_trade=risk_params.get("risk_pct_per_trade", app_settings.get("risk_pct_per_trade", 3.0) if use_preset else 3.0),
         max_position_pct=risk_params.get("max_position_pct", app_settings.get("max_position_pct", 25.0) if use_preset else 25.0),
         min_cash_reserve_pct=risk_params.get("min_cash_reserve_pct", app_settings.get("min_cash_reserve_pct", 5.0) if use_preset else 5.0),
