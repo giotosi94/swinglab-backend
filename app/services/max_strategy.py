@@ -947,6 +947,28 @@ def _multi_timeframe_plan(daily, bars_4h, structural_base, active_base, profiles
         neck_level = active_base.get("neck_high") or active_base.get("neck_center")
     candidate_levels = [level for level in [neck_level, primary.get("trigger_price") if primary else None] if level]
     trigger_price = max(candidate_levels) if candidate_levels else None
+    trigger_source = None
+    structure_anchor = None
+    if trigger_price:
+        trendline_level = _safe_float(primary.get("trigger_price")) if primary else 0.0
+        if neck_level and _safe_float(neck_level) >= trendline_level:
+            neck_source = structural_base if structural_base else active_base
+            trigger_source = "NECK_ROUNDING" if structural_base else "NECK_ACTIVE_BASE"
+            structure_anchor = {
+                "type": trigger_source,
+                "neck_center": neck_source.get("neck_center"),
+                "neck_high": neck_source.get("neck_high"),
+                "base_low": neck_source.get("base_low"),
+                "breakout_date": neck_source.get("breakout_date"),
+            }
+        else:
+            trigger_source = f"TRENDLINE_{primary.get('timeframe')}"
+            structure_anchor = {
+                "type": trigger_source,
+                "anchor_1_date": primary.get("anchor_1_date"),
+                "anchor_2_date": primary.get("anchor_2_date"),
+                "slope_per_bar": primary.get("slope_per_bar"),
+            }
     current_price = _safe_float(daily["Close"].iloc[-1])
     daily_confirmed = bool(trigger_price and current_price > trigger_price)
     available_4h = bars_4h is not None and len(bars_4h) >= 40
@@ -1010,6 +1032,9 @@ def _multi_timeframe_plan(daily, bars_4h, structural_base, active_base, profiles
         "entry_plan": {
             "status": state,
             "trigger_type": "DESCENDING_TRENDLINE_OR_NECK_BREAKOUT",
+            "trigger_source": trigger_source,
+            "structure_anchor": structure_anchor,
+            "atr14": round(atr, 4),
             "trigger_price": round(trigger_price, 4) if trigger_price else None,
             "maximum_entry_price": max_entry,
             "invalidation_price": invalidation,
