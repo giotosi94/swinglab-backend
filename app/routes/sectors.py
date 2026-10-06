@@ -456,7 +456,8 @@ def _bottom_classification(points):
 
 
 async def rebuild_sector_bottom_breadth(db=None, days=252, force=False):
-    db = db or get_db()
+    if db is None:
+        db = get_db()
     days = max(21, min(int(days), 252))
     if not force:
         cached = await db.sector_bottom_breadth.find_one({"_id": "latest"})
