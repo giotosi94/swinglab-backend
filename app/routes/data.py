@@ -8,8 +8,37 @@ from app.services.alpaca_trader import (
     get_live_prices, get_portfolio_periods, cancel_all_orders
 )
 from app.db.mongodb import get_db
+import asyncio
+from datetime import datetime as _dt
 
 router = APIRouter()
+
+_STOCKS_PIPELINE_LOCK = asyncio.Lock()
+_STOCKS_PIPELINE_STATE = {"started_at": None, "source": None}
+
+
+def _pipeline_busy_response(source):
+    return {
+        "status": "skipped",
+        "reason": "STOCKS_PIPELINE_ALREADY_RUNNING",
+        "requested_by": source,
+        "running_since": _STOCKS_PIPELINE_STATE.get("started_at"),
+        "running_source": _STOCKS_PIPELINE_STATE.get("source"),
+    }
+
+
+async def _run_stocks_pipeline_locked(source, with_sectors=False):
+    async with _STOCKS_PIPELINE_LOCK:
+        _STOCKS_PIPELINE_STATE["started_at"] = _dt.utcnow().isoformat()
+        _STOCKS_PIPELINE_STATE["source"] = source
+        try:
+            sectors = await fetch_and_analyze_sectors() if with_sectors else None
+            stocks = await fetch_and_analyze_stocks()
+            trader_result = await run_auto_trader()
+            return sectors, stocks, trader_result
+        finally:
+            _STOCKS_PIPELINE_STATE["started_at"] = None
+            _STOCKS_PIPELINE_STATE["source"] = None
 
 
 @router.post("/refresh/sectors")
@@ -20,8 +49,10 @@ async def refresh_sectors():
 
 @router.post("/refresh/stocks")
 async def refresh_stocks():
-    results = await fetch_and_analyze_stocks()
-    trader_result = await run_auto_trader()
+    if _STOCKS_PIPELINE_LOCK.locked():
+        print("[LOCK] refresh/stocks skipped: pipeline already running")
+        return _pipeline_busy_response("refresh/stocks")
+    _, results, trader_result = await _run_stocks_pipeline_locked("refresh/stocks")
     return {"message": "Stocks updated", "count": len(results), "auto_trader": trader_result}
 
 
@@ -43,11 +74,14 @@ async def refresh_stocks_async():
     import asyncio
     from datetime import datetime
     
+    if _STOCKS_PIPELINE_LOCK.locked():
+        print("[LOCK] refresh/stocks-async skipped: pipeline already running")
+        return _pipeline_busy_response("refresh/stocks-async")
+
     async def _run_in_background():
         try:
             print(f"[ASYNC] Pipeline started at {datetime.utcnow().isoformat()}")
-            results = await fetch_and_analyze_stocks()
-            trader_result = await run_auto_trader()
+            _, results, trader_result = await _run_stocks_pipeline_locked("refresh/stocks-async")
             buys = len(trader_result.get('steps', {}).get('executor', {}).get('details', {}).get('executed_buys', []))
             sells = len(trader_result.get('steps', {}).get('executor', {}).get('details', {}).get('executed_sells', []))
             print(f"[ASYNC] Pipeline completed: {len(results)} stocks, buys={buys}, sells={sells}")
@@ -66,9 +100,10 @@ async def refresh_stocks_async():
 
 @router.post("/refresh/all")
 async def refresh_all():
-    sectors = await fetch_and_analyze_sectors()
-    stocks = await fetch_and_analyze_stocks()
-    trader_result = await run_auto_trader()
+    if _STOCKS_PIPELINE_LOCK.locked():
+        print("[LOCK] refresh/all skipped: pipeline already running")
+        return _pipeline_busy_response("refresh/all")
+    sectors, stocks, trader_result = await _run_stocks_pipeline_locked("refresh/all", with_sectors=True)
     return {"message": "Full refresh completed", "sectors": len(sectors), "stocks": len(stocks), "auto_trader": trader_result}
 
 @router.post("/wipe/sector-bars")
@@ -223,9 +258,9 @@ async def get_max_strategy_shadow():
 
 
 @router.get("/max-strategy-validation")
-async def get_max_strategy_validation(limit: int = Query(50, ge=1, le=500), ticker: str = None):
+async def get_max_strategy_validation(limit: int = Query(50, ge=1, le=500), ticker: str = None, include_legacy: bool = False):
     db = get_db()
-    query = {}
+    query = {} if include_legacy else {"lifecycle_version": {"$gte": 1}}
     if ticker:
         query["ticker"] = ticker.upper()
     total = await db.max_strategy_signals.count_documents(query)
@@ -272,6 +307,8 @@ async def get_max_strategy_validation(limit: int = Query(50, ge=1, le=500), tick
         "summary": {
             "total": total,
             "ticker_filter": ticker.upper() if ticker else None,
+            "include_legacy": include_legacy,
+            "legacy_total": await db.max_strategy_signals.count_documents({"lifecycle_version": 0}),
             "status_counts": status_counts,
             "trigger_reached": triggered,
             "invalidation_reached": invalidated,
@@ -282,6 +319,103 @@ async def get_max_strategy_validation(limit: int = Query(50, ge=1, le=500), tick
             "averages": averages,
         },
         "signals": signals,
+    }
+
+
+def _iso(value):
+    return value.isoformat() if value is not None and hasattr(value, "isoformat") else value
+
+
+def _spy_forward_return(spy_bars, start_date, horizon):
+    if not spy_bars or not start_date:
+        return None
+    dates = [bar.get("date") for bar in spy_bars]
+    start_index = next((index for index, date in enumerate(dates) if date and date >= start_date), None)
+    if start_index is None or start_index + horizon - 1 >= len(spy_bars):
+        return None
+    start_price = spy_bars[start_index].get("c")
+    end_price = spy_bars[start_index + horizon - 1].get("c")
+    if not start_price or not end_price:
+        return None
+    return round((end_price - start_price) / start_price * 100, 2)
+
+
+@router.get("/max-strategy-plans")
+async def get_max_strategy_plans(
+    limit: int = Query(100, ge=1, le=500),
+    ticker: str = None,
+    active_only: bool = False,
+):
+    db = get_db()
+    query = {}
+    if ticker:
+        query["ticker"] = ticker.upper()
+    if active_only:
+        query["is_active"] = True
+
+    state_rows = await db.max_strategy_plans.aggregate([
+        {"$match": query},
+        {"$group": {"_id": "$lifecycle_state", "count": {"$sum": 1}}},
+    ]).to_list(20)
+    state_counts = {row["_id"] or "UNKNOWN": row["count"] for row in state_rows}
+
+    spy_doc = await db.stock_bars.find_one({"ticker": "SPY"}, {"bars": {"$slice": -400}})
+    spy_bars = (spy_doc or {}).get("bars") or []
+
+    triggered_plans = await db.max_strategy_plans.find(
+        {**query, "triggered_at": {"$ne": None}},
+        {"plan_key": 1, "ticker": 1, "triggered_at": 1, "outcomes": 1},
+    ).to_list(500)
+
+    horizons = {"5d": 5, "10d": 10, "20d": 20}
+    stats = {}
+    for label, horizon in horizons.items():
+        rows = []
+        for plan in triggered_plans:
+            value = (plan.get("outcomes") or {}).get(f"return_{label}_pct")
+            if value is None:
+                continue
+            spy_value = _spy_forward_return(spy_bars, plan.get("triggered_at"), horizon)
+            rows.append((value, spy_value))
+        if not rows:
+            stats[label] = {"plans": 0}
+            continue
+        returns = [value for value, _ in rows]
+        paired = [(value, spy_value) for value, spy_value in rows if spy_value is not None]
+        excess = [value - spy_value for value, spy_value in paired]
+        stats[label] = {
+            "plans": len(rows),
+            "avg_return_pct": round(sum(returns) / len(returns), 2),
+            "win_rate_pct": round(sum(1 for value in returns if value > 0) / len(returns) * 100, 1),
+            "avg_spy_return_pct": round(sum(spy for _, spy in paired) / len(paired), 2) if paired else None,
+            "avg_excess_vs_spy_pct": round(sum(excess) / len(excess), 2) if excess else None,
+            "beat_spy_pct": round(sum(1 for value in excess if value > 0) / len(excess) * 100, 1) if excess else None,
+        }
+
+    mfe = [p["outcomes"]["mfe_pct"] for p in triggered_plans if (p.get("outcomes") or {}).get("mfe_pct") is not None]
+    mae = [p["outcomes"]["mae_pct"] for p in triggered_plans if (p.get("outcomes") or {}).get("mae_pct") is not None]
+
+    plans = await db.max_strategy_plans.find(query).sort("updated_at", -1).limit(limit).to_list(limit)
+    for plan in plans:
+        plan["_id"] = str(plan["_id"])
+        for key in ("created_at", "updated_at"):
+            plan[key] = _iso(plan.get(key))
+        for event in plan.get("events") or []:
+            event["at"] = _iso(event.get("at"))
+
+    return {
+        "summary": {
+            "total_plans": await db.max_strategy_plans.count_documents(query),
+            "active_plans": await db.max_strategy_plans.count_documents({**query, "is_active": True}),
+            "triggered_plans": len(triggered_plans),
+            "state_counts": state_counts,
+            "avg_mfe_pct": round(sum(mfe) / len(mfe), 2) if mfe else None,
+            "avg_mae_pct": round(sum(mae) / len(mae), 2) if mae else None,
+            "performance_vs_spy": stats,
+            "benchmark": "SPY",
+            "live_execution_enabled": False,
+        },
+        "plans": plans,
     }
 
 
