@@ -416,6 +416,63 @@ def _apm_exit_proxy(bars_slice, entry_price):
     return negative >= 3 and pnl_pct < 3, int(negative)
 
 
+def _trend_leadership_signal(bars_slice, spy_closes_upto, weekly_trend, params):
+    if len(bars_slice) < 130 or len(spy_closes_upto) < 130:
+        return None
+    if weekly_trend != "BULL":
+        return None
+    closes = [b["c"] for b in bars_slice[-260:]]
+    highs = [b["h"] for b in bars_slice[-260:]]
+    lows = [b["l"] for b in bars_slice[-260:]]
+    price = closes[-1]
+    if price <= 0:
+        return None
+    ema20 = _calc_ema(closes[-120:], 20)
+    ema50 = _calc_ema(closes[-120:], 50)
+    if not (price > ema20 > ema50):
+        return None
+    pct_from_high = (price / max(highs) - 1) * 100
+    if pct_from_high < -params["max_from_high_pct"]:
+        return None
+    rsi = _calc_rsi(closes)
+    if rsi > params["max_rsi"]:
+        return None
+    day_change = (price / closes[-2] - 1) * 100 if closes[-2] else 0
+    if day_change > params["max_day_change_pct"]:
+        return None
+    trs = [
+        max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1]))
+        for i in range(len(closes) - 14, len(closes))
+    ]
+    atr = float(np.mean(trs)) if trs else price * 0.02
+    atr_pct = atr / price * 100
+    if (price - ema20) > params["max_atr_above_ema20"] * atr:
+        return None
+    lookback = params["rs_lookback"]
+    stock_ret = price / closes[-(lookback + 1)] - 1
+    spy_ret = spy_closes_upto[-1] / spy_closes_upto[-(lookback + 1)] - 1
+    rs_excess = (stock_ret - spy_ret) * 100
+    if rs_excess <= params["min_rs_excess_pct"]:
+        return None
+    stop_distance_pct = min(12.0, max(3.0, max(atr_pct * 2.0, (price - ema50) / price * 100)))
+    target_distance_pct = min(40.0, max(8.0, atr_pct * 4.0))
+    return {
+        "score": round(rs_excess, 2),
+        "entry_price": price,
+        "target_price": price * (1 + target_distance_pct / 100),
+        "stop_price": price * (1 - stop_distance_pct / 100),
+        "rsi": rsi,
+        "pct_from_high": round(pct_from_high, 2),
+    }
+
+
+def _trend_exit_signal(bars_slice):
+    closes = [b["c"] for b in bars_slice[-120:]]
+    if len(closes) < 60:
+        return False
+    return closes[-1] < _calc_ema(closes, 50)
+
+
 def _calc_metrics(equity_curve, trades):
     if len(equity_curve) < 2:
         return {}
@@ -598,6 +655,13 @@ async def run_backtest(
     min_holding_days: int = 1,
     use_dynamic_sizing: bool = False,
     use_apm_exit_proxy: bool = False,
+    use_trend_leadership: bool = False,
+    park_cash_in_spy: bool = False,
+    trend_max_per_sector: int = 3,
+    trend_max_from_high_pct: float = 10.0,
+    trend_max_rsi: float = 80.0,
+    trend_rs_lookback: int = 126,
+    trend_slots: int = 4,
     risk_pct_per_trade: float = 3.0,
     max_position_pct: float = 25.0,
     min_cash_reserve_pct: float = 5.0,
@@ -700,6 +764,25 @@ async def run_backtest(
     sizing_blocked_cash = 0
     sizing_blocked_risk = 0
     apm_exit_proxy_events = 0
+    trend_params = {
+        "max_from_high_pct": trend_max_from_high_pct,
+        "max_rsi": trend_max_rsi,
+        "max_day_change_pct": 8.0,
+        "max_atr_above_ema20": 2.0,
+        "rs_lookback": max(63, min(int(trend_rs_lookback), 200)),
+        "min_rs_excess_pct": 0.0,
+    }
+    position_channels = {}
+    trend_signal_days = 0
+    trend_candidates_total = 0
+    trend_entries = 0
+    trend_sector_blocked = 0
+    trend_exit_events = 0
+    park_shares = 0.0
+    park_days = 0
+    park_value_samples = []
+    park_buys = 0
+    last_spy_close = None
 
     for date in backtest_dates:
         # ===== 0. CRASH DEPLOY a FETTE progressive (Progetto Alpha) =====
@@ -868,6 +951,27 @@ async def run_backtest(
                         del positions[ticker]
                         continue
 
+                if pos.get("channel") == "TREND" and holding_days >= min_holding_days:
+                    idx_now = date_idx_map.get(ticker, {}).get(date)
+                    if idx_now is not None and _trend_exit_signal(bars[:idx_now + 1]):
+                        exit_price = close
+                        pnl_pct = (exit_price - entry) / entry * 100
+                        pnl_d = (exit_price - entry) * pos["shares"]
+                        cash += exit_price * pos["shares"]
+                        total_realized = realized_by_position.get((ticker, pos["entry_date"]), 0) + pnl_d
+                        initial_cost = entry * pos["initial_shares"]
+                        closed_position_returns.append(total_realized / initial_cost * 100 if initial_cost > 0 else 0)
+                        trades.append({
+                            "ticker": ticker, "entry_date": pos["entry_date"], "exit_date": date,
+                            "entry_price": round(entry, 2), "exit_price": round(exit_price, 2),
+                            "shares": pos["shares"], "initial_shares": pos["initial_shares"],
+                            "pnl_pct": round(pnl_pct, 2), "pnl_dollar": round(pnl_d, 2),
+                            "reason": "TREND_EXIT_EMA50",
+                        })
+                        trend_exit_events += 1
+                        del positions[ticker]
+                        continue
+
                 # SL hit (su qualsiasi residuo)
                 if low <= pos["sl"]:
                     exit_price = pos["sl"]
@@ -937,8 +1041,21 @@ async def run_backtest(
             if date not in sector_intelligence_cache:
                 sector_intelligence_cache[date] = _sector_intelligence_at(ticker_bars, sector_etf_map, date_idx_map, date, 63)
             sector_intelligence = sector_intelligence_cache[date]
+        n_spy_today = spy_close_by_date.get(date, 0)
+        spy_upto_today = spy_closes_ordered[:n_spy_today] if n_spy_today else []
+        _, regime_today = _historical_regime_multiplier(spy_upto_today)
+        if spy_upto_today:
+            last_spy_close = spy_upto_today[-1]
+        if park_shares > 0 and last_spy_close:
+            cash += park_shares * last_spy_close
+            park_shares = 0.0
+        trend_active_today = use_trend_leadership and regime_today in ("BULL", "NEUTRAL") and len(spy_upto_today) >= 130
+        if trend_active_today:
+            trend_signal_days += 1
+
         if len(positions) < max_positions:
             candidates = []
+            trend_candidates = []
             for ticker, bars in ticker_bars.items():
                 if ticker in positions:
                     continue
@@ -948,6 +1065,10 @@ async def run_backtest(
                 bars_slice = bars[:idx + 1]
                 _wt, _ws = _weekly_trend_bt(bars_slice)
                 mtf_debug[_wt] = mtf_debug.get(_wt, 0) + 1
+                if trend_active_today:
+                    trend_signal = _trend_leadership_signal(bars_slice, spy_upto_today, _wt, trend_params)
+                    if trend_signal:
+                        trend_candidates.append((ticker, trend_signal))
                 conf, target_price, stop_price, setup = _confluence_and_target(bars_slice, use_mtf=use_mtf, use_momentum=use_momentum)
 
                 # 🆕 SECTOR BOTTOM BOOST
@@ -981,7 +1102,40 @@ async def run_backtest(
                     candidates.append((ticker, conf, entry_price, target_price, stop_price, setup, sec_weight, confluence_before_sector, sector_adjustment, sector_signal))
             candidates.sort(key=lambda x: x[1], reverse=True)
             slots = max_positions - len(positions)
-            for ticker, conf, entry_price, target_price, stop_price, setup, sec_weight, confluence_before_sector, sector_adjustment, sector_signal in candidates[:slots]:
+            open_trend = sum(1 for p in positions.values() if p.get("channel") == "TREND")
+            open_alpha = len(positions) - open_trend
+            reserved_trend = max(0, min(int(trend_slots), max_positions)) if use_trend_leadership else 0
+            alpha_slots = max(0, min(slots, max_positions - reserved_trend - open_alpha))
+            trend_free = max(0, min(slots - alpha_slots, reserved_trend - open_trend))
+            selected = [candidate + ("ALPHA",) for candidate in candidates[:alpha_slots]]
+            trend_limit = len(selected) + trend_free
+            if trend_candidates:
+                trend_candidates_total += len(trend_candidates)
+                trend_candidates.sort(key=lambda item: item[1]["score"], reverse=True)
+                chosen = {item[0] for item in selected}
+                sector_load = {}
+                for open_ticker in positions:
+                    open_sector = ticker_to_sector.get(open_ticker)
+                    sector_load[open_sector] = sector_load.get(open_sector, 0) + 1
+                for item in selected:
+                    item_sector = ticker_to_sector.get(item[0])
+                    sector_load[item_sector] = sector_load.get(item_sector, 0) + 1
+                for trend_ticker, signal in trend_candidates:
+                    if len(selected) >= trend_limit:
+                        break
+                    if trend_ticker in chosen:
+                        continue
+                    trend_sector = ticker_to_sector.get(trend_ticker)
+                    if sector_load.get(trend_sector, 0) >= trend_max_per_sector:
+                        trend_sector_blocked += 1
+                        continue
+                    sector_load[trend_sector] = sector_load.get(trend_sector, 0) + 1
+                    chosen.add(trend_ticker)
+                    selected.append((
+                        trend_ticker, signal["score"], signal["entry_price"], signal["target_price"],
+                        signal["stop_price"], "trend_leadership", 0, signal["score"], 0.0, {}, "TREND",
+                    ))
+            for ticker, conf, entry_price, target_price, stop_price, setup, sec_weight, confluence_before_sector, sector_adjustment, sector_signal, channel in selected:
                 size_mult = 1.0 + min(0.5, sec_weight / 46) if sec_weight > 0 else 1.0
                 regime_multiplier = 1.0
                 regime_name = "FIXED"
@@ -1045,6 +1199,7 @@ async def run_backtest(
                     "regime_multiplier": regime_multiplier,
                     "dps_multiplier": dps_multiplier,
                     "kelly_multiplier": kelly_multiplier,
+                    "channel": channel,
                     "risk_reward": risk_reward,
                     "confluence_before_sector": confluence_before_sector,
                     "sector_adjustment": sector_adjustment,
@@ -1052,6 +1207,9 @@ async def run_backtest(
                     "sector_relative_return_pct": sector_signal.get("relative_return_pct", 0),
                     "sector_acceleration_20d": sector_signal.get("acceleration_20d", 0),
                 }
+                position_channels[(ticker, date)] = channel
+                if channel == "TREND":
+                    trend_entries += 1
                 sector_intelligence_entries[(ticker, date)] = {
                     "confluence_before_sector": confluence_before_sector,
                     "sector_adjustment": sector_adjustment,
@@ -1060,6 +1218,17 @@ async def run_backtest(
                     "sector_acceleration_20d": sector_signal.get("acceleration_20d", 0),
                     "promoted": confluence_before_sector < min_confluence <= conf,
                 }
+
+        if park_cash_in_spy and regime_today == "BULL" and last_spy_close:
+            equity_estimate = cash + sum(
+                p.get("last_price", p["entry_price"]) * p["shares"] for p in positions.values()
+            )
+            reserve = equity_estimate * (min_cash_reserve_pct / 100)
+            parkable = cash - reserve
+            if parkable > 100:
+                park_shares = parkable / last_spy_close
+                cash -= parkable
+                park_buys += 1
 
         # ===== 3. EQUITY =====
         positions_value = 0
@@ -1076,8 +1245,12 @@ async def run_backtest(
         if spy_position is not None and spy_position.get("shares", 0) > 0 and date in spy_close_by_date:
             spy_deploy_value = spy_position["shares"] * spy_closes_ordered[spy_close_by_date[date] - 1]
 
-        total_equity = cash + positions_value + crash_reserve + spy_deploy_value
-        invested_value = positions_value + spy_deploy_value
+        park_value = park_shares * last_spy_close if park_shares > 0 and last_spy_close else 0.0
+        if park_value > 0:
+            park_days += 1
+        total_equity = cash + positions_value + crash_reserve + spy_deploy_value + park_value
+        invested_value = positions_value + spy_deploy_value + park_value
+        park_value_samples.append(park_value / total_equity * 100 if total_equity > 0 else 0)
         equity_curve.append({
             "date": date,
             "equity": round(total_equity, 2),
@@ -1085,6 +1258,10 @@ async def run_backtest(
             "invested_value": round(invested_value, 2),
             "invested_pct": round(invested_value / total_equity * 100, 2) if total_equity > 0 else 0,
         })
+
+    if park_shares > 0 and last_spy_close:
+        cash += park_shares * last_spy_close
+        park_shares = 0.0
 
     # Chiudi posizioni residue
     last_date = backtest_dates[-1]
@@ -1138,6 +1315,16 @@ async def run_backtest(
         "promoted_profit_factor": round(promoted_profit / promoted_loss, 2) if promoted_loss > 0 else (999 if promoted_profit > 0 else 0),
         "promoted_pnl_dollar": round(sum(position.get("pnl_dollar", 0) for position in promoted_positions), 2),
     }
+    for position in position_trades:
+        position["channel"] = position_channels.get((position.get("ticker"), position.get("entry_date")), "ALPHA")
+    channel_metrics = {
+        channel_name: _calc_position_metrics([p for p in position_trades if p.get("channel") == channel_name])
+        for channel_name in ("ALPHA", "TREND")
+    }
+    for channel_name in ("ALPHA", "TREND"):
+        channel_metrics[channel_name]["pnl_dollar"] = round(sum(
+            p.get("pnl_dollar", 0) for p in position_trades if p.get("channel") == channel_name
+        ), 2)
     position_metrics = _calc_position_metrics(position_trades)
     apm_position_stats = _calc_apm_position_stats(position_trades)
     metrics = {
@@ -1241,6 +1428,13 @@ async def run_backtest(
             "use_sector_intelligence": use_sector_intelligence,
             "use_dynamic_sizing": use_dynamic_sizing,
             "use_apm_exit_proxy": use_apm_exit_proxy,
+            "use_trend_leadership": use_trend_leadership,
+            "park_cash_in_spy": park_cash_in_spy,
+            "trend_max_per_sector": trend_max_per_sector,
+            "trend_max_from_high_pct": trend_max_from_high_pct,
+            "trend_max_rsi": trend_max_rsi,
+            "trend_rs_lookback": trend_params["rs_lookback"],
+            "trend_slots": trend_slots,
             "risk_pct_per_trade": risk_pct_per_trade,
             "max_position_pct": max_position_pct,
             "min_cash_reserve_pct": min_cash_reserve_pct,
@@ -1256,6 +1450,8 @@ async def run_backtest(
         "validation_notes": [
             "La rotazione settoriale e' disattivata di default: resta un test informativo.",
             "APM_EXIT_PROXY usa solo indicatori point-in-time; non usa ML storico per evitare look-ahead bias.",
+            "Trend Leadership: regime SPY non BEAR, weekly BULL, prezzo sopra EMA20>EMA50, entro la distanza massima dal massimo, forza relativa positiva vs SPY sul lookback, RSI massimo, no gap oltre 8%, no estensione oltre 2 ATR da EMA20; uscita sotto EMA50.",
+            "Parcheggio SPY: solo in regime BULL point-in-time, liquidita' oltre la riserva minima, ribilanciato ogni giorno alla chiusura senza costi di transazione.",
             "DPS usa ML neutrale 50 finche' non saranno disponibili snapshot ML storici.",
             "Il backtest usa barre daily: il minimum holding di 24 ore equivale a 1 giorno di borsa.",
         ],
@@ -1275,6 +1471,21 @@ async def run_backtest(
             **apm_position_stats,
         },
         "sector_intelligence_stats": sector_intelligence_stats,
+        "channel_metrics": channel_metrics,
+        "trend_stats": {
+            "enabled": use_trend_leadership,
+            "active_days": trend_signal_days,
+            "candidates_total": trend_candidates_total,
+            "entries": trend_entries,
+            "sector_blocked": trend_sector_blocked,
+            "trend_exit_ema50": trend_exit_events,
+        },
+        "park_stats": {
+            "enabled": park_cash_in_spy,
+            "parked_days": park_days,
+            "park_rebalances": park_buys,
+            "avg_parked_pct": round(float(np.mean(park_value_samples)), 2) if park_value_samples else 0,
+        },
         "sizing_stats": {
             "enabled": use_dynamic_sizing,
             "avg_effective_size_pct": round(float(np.mean(sizing_samples)), 2) if sizing_samples else position_size_pct,
