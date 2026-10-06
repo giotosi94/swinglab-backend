@@ -8,6 +8,7 @@ from app.config import settings
 import traceback
 import time
 from app.services.max_strategy import analyze_max_strategy
+from app.services.max_plan_lifecycle import sync_max_plan, expire_plans_for_stale, mark_legacy_max_signals
 
 SECTOR_MAP = {
     "XLK": "Technology", "XLF": "Financials", "XLV": "Health Care",
@@ -105,6 +106,7 @@ async def cleanup_legacy_max_strategy_data(db):
     return {
         "assets": (await db.assets.delete_many({"ticker": {"$in": LEGACY_TICKERS}})).deleted_count,
         "signals": (await db.max_strategy_signals.delete_many({"ticker": {"$in": LEGACY_TICKERS}})).deleted_count,
+        "plans": (await db.max_strategy_plans.delete_many({"ticker": {"$in": LEGACY_TICKERS}})).deleted_count,
         "daily_bars": (await db.stock_bars.delete_many({"ticker": {"$in": LEGACY_TICKERS}})).deleted_count,
         "bars_4h": (await db.stock_bars_4h.delete_many({"ticker": {"$in": LEGACY_TICKERS}})).deleted_count,
     }
@@ -137,7 +139,7 @@ async def mark_stale_asset(db, ticker, sector_code, freshness):
         }},
         upsert=True,
     )
-    await db.max_strategy_signals.delete_many({"ticker": ticker, "outcomes.bars_observed": 0})
+    await expire_plans_for_stale(db, ticker, freshness["last_bar_date"])
 
 
 async def fetch_long_history_symbol(client, symbol, target_bars=750):
@@ -1322,6 +1324,9 @@ async def fetch_and_analyze_stocks(force=False):
     print("STOCKS REFRESH (Incremental + Parallel)")
     print("=" * 50)
     legacy_cleanup = await cleanup_legacy_max_strategy_data(db)
+    legacy_marked = await mark_legacy_max_signals(db)
+    if legacy_marked:
+        print(f"  Max signals marcati legacy: {legacy_marked}")
     if any(legacy_cleanup.values()):
         print(f"  Legacy cleanup: {legacy_cleanup}")
 
@@ -1370,8 +1375,7 @@ async def fetch_and_analyze_stocks(force=False):
                 asset_doc = analyze_stock(ticker, df, sector_code, sector_scores, prev_poc_position=prev_pos, df_4h=bars_4h_map.get(ticker))
                 if asset_doc:
                     await db.assets.update_one({"ticker": ticker}, {"$set": asset_doc}, upsert=True)
-                    await save_max_strategy_validation_snapshot(db, asset_doc, df)
-                    await update_max_strategy_validation_outcomes(db, ticker, df)
+                    await sync_max_plan(db, asset_doc, df)
                     results.append(asset_doc)
                     success += 1
                 else:
