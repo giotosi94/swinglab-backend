@@ -1048,6 +1048,14 @@ class AlphaStrategist(BaseAgent):
             "setup_rejected": {},
             "sector_full": {},
             "confluence_near_misses": [],
+            "setup_shadow": {
+                "evaluated": 0,
+                "would_pass": 0,
+                "would_pass_by_setup": {},
+                "would_pass_by_sector": {},
+                "uptrend_count": 0,
+                "top": [],
+            },
         }
 
         for a in assets:
@@ -1102,6 +1110,40 @@ class AlphaStrategist(BaseAgent):
             if best_setups and stype not in best_setups:
                 skipped_reasons["setup_filter"] += 1
                 diagnostic["setup_rejected"][stype] = diagnostic["setup_rejected"].get(stype, 0) + 1
+                try:
+                    shadow_conf = self._calc_confluence(a, market_ctx, params, ml_map.get(ticker))
+                    shadow_score = float(shadow_conf["score"])
+                    shadow_threshold, shadow_reason = self._sector_threshold(
+                        sector, min_conf, leadership, params
+                    )
+                    ema20_v = a.get("ema20", 0) or 0
+                    ema50_v = a.get("ema50", 0) or 0
+                    uptrend = bool(ema50_v > 0 and price > ema20_v > ema50_v)
+                    shadow = diagnostic["setup_shadow"]
+                    shadow["evaluated"] += 1
+                    if uptrend:
+                        shadow["uptrend_count"] += 1
+                    passes = shadow_score >= shadow_threshold
+                    if passes:
+                        shadow["would_pass"] += 1
+                        shadow["would_pass_by_setup"][stype] = shadow["would_pass_by_setup"].get(stype, 0) + 1
+                        shadow["would_pass_by_sector"][sector] = shadow["would_pass_by_sector"].get(sector, 0) + 1
+                    shadow["top"].append({
+                        "ticker": ticker,
+                        "sector": sector,
+                        "setup_type": stype,
+                        "rsi": round(float(rsi), 1),
+                        "confluence": round(shadow_score, 1),
+                        "threshold": round(float(shadow_threshold), 1),
+                        "would_pass": passes,
+                        "sector_flow": shadow_reason,
+                        "uptrend_ema": uptrend,
+                        "weekly_trend": (a.get("mtf") or {}).get("weekly_trend", "UNKNOWN"),
+                        "pct_from_high": a.get("pct_from_high"),
+                        "positive_factors": [f.get("name") for f in shadow_conf.get("factors", []) if f.get("pass")],
+                    })
+                except Exception as e:
+                    print(f"  Setup shadow error {ticker}: {e}")
                 continue
             if stype in worst_setups:
                 skipped_reasons["setup_filter"] += 1
@@ -1378,6 +1420,11 @@ class AlphaStrategist(BaseAgent):
         diagnostic["sector_full"] = dict(sorted(
             diagnostic["sector_full"].items(), key=lambda item: item[1], reverse=True
         ))
+        diagnostic["setup_shadow"]["top"] = sorted(
+            diagnostic["setup_shadow"]["top"],
+            key=lambda row: row["confluence"] - row["threshold"],
+            reverse=True,
+        )[:15]
 
         summary = {
             "total_assets_scanned": len(assets),
@@ -1456,6 +1503,14 @@ class AlphaStrategist(BaseAgent):
             print(f"  Diagnostica Alpha: migliori sotto soglia -> {near}")
         print(f"  RSI esclusi: alti={len(diagnostic['rsi_too_high'])}, bassi={len(diagnostic['rsi_too_low'])} | "
               f"setup={diagnostic['setup_rejected']} | settori saturi={diagnostic['sector_full']}")
+        shadow = diagnostic["setup_shadow"]
+        if shadow["evaluated"]:
+            best = ", ".join(
+                f"{row['ticker']} {row['confluence']}/{row['threshold']}"
+                for row in shadow["top"][:5]
+            )
+            print(f"  Setup shadow: {shadow['would_pass']}/{shadow['evaluated']} esclusi per setup "
+                  f"supererebbero la soglia | in uptrend EMA: {shadow['uptrend_count']} | top: {best}")
 
         if leadership["available"]:
             focus_list = ", ".join(leadership["focus"]) or "nessuno"
