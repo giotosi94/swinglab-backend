@@ -653,3 +653,138 @@ async def set_agent_param(agent_name: str, key: str, value: float):
     params[key] = int(value) if float(value).is_integer() else float(value)
     await agent.save_params(params)
     return {"agent": agent_name, "param": key, "old": old, "new": params[key]}
+
+
+LEADER_REPORT_FIELDS = {
+    "price_history": 0,
+    "vp_distribution": 0,
+    "multi_tf_vp": 0,
+    "max_strategy": 0,
+    "alpha_snapshot": 0,
+    "history": 0,
+    "llm_analysis": 0,
+}
+
+
+def _leader_return(bars, sessions):
+    closes = [b.get("c") for b in bars if b.get("c")]
+    if len(closes) <= sessions:
+        return None
+    past = closes[-(sessions + 1)]
+    if not past:
+        return None
+    return round((closes[-1] - past) / past * 100, 2)
+
+
+@router.get("/leader-miss-report")
+async def leader_miss_report(top: int = 20, sessions: int = 20):
+    from app.db.mongodb import get_db
+    from datetime import datetime
+    db = get_db()
+    top = max(5, min(top, 50))
+    sessions = max(5, min(sessions, 60))
+
+    returns = {}
+    cursor = db.stock_bars.find({}, {"ticker": 1, "bars": {"$slice": -(sessions + 1)}})
+    async for doc in cursor:
+        value = _leader_return(doc.get("bars") or [], sessions)
+        if value is not None:
+            returns[doc.get("ticker")] = value
+
+    spy_return = returns.get("SPY")
+    universe = set()
+    async for doc in db.assets.find({}, {"ticker": 1}):
+        universe.add(doc.get("ticker"))
+    ranked = sorted(
+        ((t, r) for t, r in returns.items() if t in universe),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    leaders = ranked[:top]
+    leader_tickers = [t for t, _ in leaders]
+
+    orch = _get_orch()
+    alpha = orch.alpha
+    params = await alpha.get_params()
+    market_ctx = await db.market_context.find_one({"_id": "latest"}) or {}
+    market_ctx.pop("_id", None)
+    leadership = alpha._build_leadership_context(market_ctx, params)
+
+    min_conf = params.get("min_confluence", 48)
+    max_rsi = params.get("max_rsi_entry", 68)
+    min_rsi = params.get("min_rsi_entry", 25)
+    max_rv = params.get("max_relative_volume", 3.0)
+    best_setups = params.get("best_setups", [])
+    worst_setups = params.get("worst_setups", [])
+
+    assets = {}
+    async for doc in db.assets.find({"ticker": {"$in": leader_tickers}}, LEADER_REPORT_FIELDS):
+        assets[doc.get("ticker")] = doc
+
+    rows = []
+    blockers = {}
+    for ticker, ret in leaders:
+        a = assets.get(ticker)
+        if not a:
+            continue
+        price = a.get("price", 0) or 0
+        rsi = a.get("rsi", 50) or 50
+        stype = a.get("setup_type", "neutral")
+        sector = a.get("sector_code", "")
+        rel_vol = a.get("relative_volume", 1) or 1
+        change_pct = a.get("change_pct", 0) or 0
+        ema20 = a.get("ema20", 0) or 0
+        ema50 = a.get("ema50", 0) or 0
+
+        reasons = []
+        if rsi > max_rsi:
+            reasons.append(f"RSI_HIGH {rsi:.0f}>{max_rsi}")
+        if rsi < min_rsi:
+            reasons.append(f"RSI_LOW {rsi:.0f}<{min_rsi}")
+        if rel_vol >= max_rv and not (rel_vol < 5.0 and 2.0 <= change_pct <= 8.0):
+            reasons.append(f"VOLUME {rel_vol:.1f}x")
+        if best_setups and stype not in best_setups:
+            reasons.append(f"SETUP {stype}")
+        if stype in worst_setups:
+            reasons.append(f"WORST_SETUP {stype}")
+
+        conf = alpha._calc_confluence(a, market_ctx, params, None)
+        threshold, flow = alpha._sector_threshold(sector, min_conf, leadership, params)
+        if conf["score"] < threshold:
+            reasons.append(f"CONFLUENCE {conf['score']}<{threshold}")
+
+        for reason in reasons:
+            key = reason.split(" ")[0]
+            blockers[key] = blockers.get(key, 0) + 1
+
+        rows.append({
+            "ticker": ticker,
+            "sector": sector,
+            "return_pct": ret,
+            "excess_vs_spy_pct": round(ret - spy_return, 2) if spy_return is not None else None,
+            "pct_from_high": a.get("pct_from_high"),
+            "rsi": round(float(rsi), 1),
+            "setup_type": stype,
+            "weekly_trend": (a.get("mtf") or {}).get("weekly_trend", "UNKNOWN"),
+            "uptrend_ema": bool(ema50 > 0 and price > ema20 > ema50),
+            "confluence_no_ml": conf["score"],
+            "threshold": threshold,
+            "sector_flow": flow,
+            "blocked_by": reasons,
+            "would_pass_alpha": not reasons,
+            "positive_factors": [f.get("name") for f in conf.get("factors", []) if f.get("pass") and f.get("pts", 0) != 0],
+        })
+
+    return {
+        "sessions": sessions,
+        "spy_return_pct": spy_return,
+        "leaders_analyzed": len(rows),
+        "leaders_beating_spy": sum(1 for r in rows if (r["excess_vs_spy_pct"] or 0) > 0),
+        "would_pass_alpha": sum(1 for r in rows if r["would_pass_alpha"]),
+        "blockers": dict(sorted(blockers.items(), key=lambda item: item[1], reverse=True)),
+        "regime_detail": market_ctx.get("regime_detail"),
+        "focus_sectors": leadership.get("focus", []),
+        "note": "Confluence ricalcolata senza ML; filtri Alpha replicati in sola lettura.",
+        "generated_at": datetime.utcnow().isoformat(),
+        "leaders": rows,
+    }
