@@ -40,6 +40,9 @@ class RiskManager(BaseAgent):
             "kelly_enabled": True,
             "kelly_min_trades": 20,
             "kelly_fractional_factor": 0.25,
+            "max_live_enabled": False,
+            "max_live_slots": 4,
+            "max_min_risk_reward": 1.0,
         }
 
     async def _check_loss_limits(self, account: dict, params: dict) -> dict:
@@ -387,8 +390,21 @@ class RiskManager(BaseAgent):
         max_position_value = equity * max_pos_pct * final_multiplier
         cash_reserve = equity * min_cash_reserve
         num_positions = len(positions)
+        max_live_enabled = bool(params.get("max_live_enabled", False))
+        max_live_slots = int(params.get("max_live_slots", 4)) if max_live_enabled else 0
+        max_min_rr = float(params.get("max_min_risk_reward", 1.0))
         
         db = get_db()
+        open_symbols = [p.get("symbol") for p in positions if p.get("symbol")]
+        open_max_positions = 0
+        if open_symbols:
+            open_max_tickers = await db.trade_history.distinct(
+                "ticker",
+                {"side": "buy", "channel": "MAX", "sell_linked": {"$ne": True}, "ticker": {"$in": open_symbols}},
+            )
+            open_max_positions = len(open_max_tickers)
+        open_alpha_positions = num_positions - open_max_positions
+        alpha_position_limit = max(0, max_positions - max_live_slots)
         assets_all = await db.assets.find({}, {"ticker": 1, "sector_code": 1}).to_list(300)
         ticker_to_sector = {a["ticker"]: a.get("sector_code", "UNKNOWN") for a in assets_all}
         sector_exposure = {}
@@ -459,17 +475,31 @@ class RiskManager(BaseAgent):
                 stop_loss = c["stop_loss"]
                 sector = c.get("sector", "UNKNOWN")
                 rr = c.get("risk_reward", 0)
+                is_max = c.get("channel") == "MAX"
+                approved_max = sum(1 for t in approved_trades if t.get("channel") == "MAX")
+                approved_alpha = len(approved_trades) - approved_max
                 
                 if num_positions + len(approved_trades) >= max_positions:
                     rejected_trades.append({**c, "reason": "Max positions reached"})
+                    continue
+                if is_max:
+                    if not max_live_enabled:
+                        rejected_trades.append({**c, "reason": "Max live disabled"})
+                        continue
+                    if open_max_positions + approved_max >= max_live_slots:
+                        rejected_trades.append({**c, "reason": f"Max slots full ({max_live_slots})"})
+                        continue
+                elif max_live_enabled and open_alpha_positions + approved_alpha >= alpha_position_limit:
+                    rejected_trades.append({**c, "reason": f"Alpha slots full ({alpha_position_limit}, {max_live_slots} riservati a Max)"})
                     continue
                 current_sector_count = sector_exposure.get(sector, 0)
                 approved_sector_count = sum(1 for t in approved_trades if t.get("sector") == sector)
                 if current_sector_count + approved_sector_count >= max_per_sector:
                     rejected_trades.append({**c, "reason": f"Sector {sector} full ({max_per_sector})"})
                     continue
-                if rr < min_rr:
-                    rejected_trades.append({**c, "reason": f"R/R too low: {rr} < {min_rr}"})
+                required_rr = max_min_rr if is_max else min_rr
+                if rr < required_rr:
+                    rejected_trades.append({**c, "reason": f"R/R too low: {rr} < {required_rr}"})
                     continue
                 if fractionable_only:
                     is_frac = fractionable_cache.get(ticker)
@@ -584,6 +614,12 @@ class RiskManager(BaseAgent):
             "total_exposure_pct": round(((total_market_value + new_exposure) / equity) * 100, 1) if equity > 0 else 0,
             "sector_exposure": sector_exposure,
             "current_positions": num_positions,
+            "max_live": {
+                "enabled": max_live_enabled,
+                "slots": max_live_slots,
+                "open_max_positions": open_max_positions,
+                "approved_max": [t["ticker"] for t in approved_trades if t.get("channel") == "MAX"],
+            },
             "max_positions": max_positions,
             "regime_multiplier": round(regime_multiplier, 2),
             "loss_check": loss_check,
