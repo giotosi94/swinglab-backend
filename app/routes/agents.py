@@ -33,9 +33,17 @@ async def run_pipeline():
     return await orch.run()
 
 
+LEARN_ALL_ENABLED = False
+
+
 @router.post("/learn")
-async def learn_all():
-    """Learning per tutti gli agenti."""
+async def learn_all(force: bool = False):
+    """Learning per tutti gli agenti. Disabilitato finche' il Learning Loop non conta per posizione."""
+    if not LEARN_ALL_ENABLED and not force:
+        return {
+            "status": "disabled",
+            "message": "Learning Loop disabilitato: conta ancora le tranche come trade separati. Nessun parametro modificato.",
+        }
     orch = _get_orch()
     return await orch.learn_all()
 
