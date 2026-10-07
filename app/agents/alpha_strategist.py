@@ -44,6 +44,8 @@ MAX_SHADOW_PROJECTION = {
     "max_strategy.entry_plan.invalidation_price": 1,
     "max_strategy.entry_plan.blocking_phase": 1,
     "max_strategy.entry_plan.weekly_plan_qualified": 1,
+    "max_strategy.entry_plan.atr14": 1,
+    "max_strategy.atr14": 1,
 }
 
 # Barre necessarie al calcolo ATR: 14 periodi piu' la chiusura precedente.
@@ -176,7 +178,11 @@ class AlphaStrategist(BaseAgent):
             # weak_sectors resta salvato e visibile ma non penalizza piu'
             # gli acquisti: la leadership del MacroAnalyst e' piu' aggiornata
             # e guarda il mercato, non solo lo storico dei nostri trade.
-            "weak_sector_penalty_enabled": False,  # se ML dice WIN score <30% + in perdita → sell
+            "weak_sector_penalty_enabled": False,
+            "max_live_enabled": False,
+            "max_live_slots": 4,
+            "max_stop_cap_pct": 8.0,
+            "max_target_atr_mult": 4.0,  # se ML dice WIN score <30% + in perdita → sell
         }
 
     def _build_leadership_context(self, market_ctx: dict, params: dict) -> dict:
@@ -959,6 +965,77 @@ class AlphaStrategist(BaseAgent):
             "candidates": shadow_candidates[:100],
         }
 
+    def _build_max_live_candidates(self, shadow_assets: list, assets_map: dict,
+                                   open_tickers: list, market_ctx: dict, params: dict) -> list:
+        if not params.get("max_live_enabled", False):
+            return []
+        if market_ctx.get("market_regime") == "CRASH":
+            return []
+        stop_cap = float(params.get("max_stop_cap_pct", 8.0))
+        target_mult = float(params.get("max_target_atr_mult", 4.0))
+        tracked = ("ARMED", "TRIGGERED", "CONFIRMED_4H", "CONFIRMED_DAILY", "WAIT_RETEST")
+        rows = []
+        for shadow_asset in shadow_assets:
+            ticker = shadow_asset.get("ticker", "")
+            if not ticker or ticker in open_tickers:
+                continue
+            max_strategy = shadow_asset.get("max_strategy") or {}
+            plan = max_strategy.get("entry_plan") or {}
+            if plan.get("status") not in tracked:
+                continue
+            if not max_strategy.get("strategy_eligible") or not plan.get("weekly_plan_qualified"):
+                continue
+            if plan.get("blocking_phase"):
+                continue
+            price = float(shadow_asset.get("price") or 0)
+            trigger = float(plan.get("trigger_price") or 0)
+            maximum_entry = float(plan.get("maximum_entry_price") or 0)
+            invalidation = float(plan.get("invalidation_price") or 0)
+            if price <= 0 or trigger <= 0 or maximum_entry <= trigger:
+                continue
+            if not (trigger <= price <= maximum_entry):
+                continue
+            if invalidation and price <= invalidation:
+                continue
+            stop_floor = price * (1 - stop_cap / 100)
+            stop_loss = max(invalidation, stop_floor) if invalidation else stop_floor
+            if stop_loss >= price:
+                continue
+            atr = float(plan.get("atr14") or max_strategy.get("atr14") or price * 0.02)
+            target_pct = min(40.0, max(8.0, atr / price * 100 * target_mult))
+            target_price = price * (1 + target_pct / 100)
+            risk = price - stop_loss
+            asset = assets_map.get(ticker, {})
+            max_score = float(max_strategy.get("max_score") or 0)
+            rows.append({
+                "ticker": ticker,
+                "channel": "MAX",
+                "price": round(price, 2),
+                "confluence": max_score,
+                "max_score": max_score,
+                "setup_score": asset.get("setup_score", 0),
+                "setup_type": f"max_{plan.get('status', '').lower()}",
+                "sector": asset.get("sector_code", ""),
+                "rsi": asset.get("rsi", 50),
+                "relative_volume": asset.get("relative_volume", 1),
+                "stop_loss": round(stop_loss, 2),
+                "target_price": round(target_price, 2),
+                "risk_reward": round((target_price - price) / risk, 2) if risk > 0 else 0,
+                "max_trigger_price": trigger,
+                "max_maximum_entry_price": maximum_entry,
+                "max_invalidation_price": invalidation,
+                "max_plan_status": plan.get("status"),
+                "strategy_type": max_strategy.get("strategy_type"),
+                "ml_prediction": "N/A",
+                "ml_score": 0,
+                "trend_prediction": "N/A",
+                "trend_up_prob": 0,
+                "weekly_trend": (asset.get("mtf") or {}).get("weekly_trend", "UNKNOWN"),
+                "sector_flow": "NEUTRAL",
+            })
+        rows.sort(key=lambda row: -row["max_score"])
+        return rows[: int(params.get("max_live_slots", 4)) * 2]
+
     async def analyze(self, context: dict) -> dict:
         db = get_db()
         params = await self.get_params()
@@ -989,6 +1066,9 @@ class AlphaStrategist(BaseAgent):
         shadow_assets = await self._load_max_shadow_assets(db)
         max_strategy_shadow = self._build_max_strategy_shadow(
             shadow_assets, open_tickers, market_ctx
+        )
+        max_live_candidates = self._build_max_live_candidates(
+            shadow_assets, assets_map, open_tickers, market_ctx, params
         )
         del shadow_assets
 
@@ -1535,6 +1615,15 @@ class AlphaStrategist(BaseAgent):
             print(f"  🧭 Leadership: non disponibile, soglia uniforme {min_conf} "
                   f"su tutti i settori")
 
+        if max_live_candidates:
+            max_tickers = {c["ticker"] for c in max_live_candidates}
+            top_candidates = max_live_candidates + [c for c in top_candidates if c["ticker"] not in max_tickers]
+            print(f"  🟠 Max live: {len(max_live_candidates)} candidati -> "
+                  f"{', '.join(c['ticker'] for c in max_live_candidates)}")
+        summary["max_live"] = {
+            "enabled": bool(params.get("max_live_enabled", False)),
+            "candidates": [c["ticker"] for c in max_live_candidates],
+        }
         return {
             "buy_candidates": top_candidates,
             "sell_signals": sell_signals,
