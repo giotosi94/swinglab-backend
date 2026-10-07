@@ -182,7 +182,12 @@ class AlphaStrategist(BaseAgent):
             "max_live_enabled": False,
             "max_live_slots": 4,
             "max_stop_cap_pct": 8.0,
-            "max_target_atr_mult": 4.0,  # se ML dice WIN score <30% + in perdita → sell
+            "max_target_atr_mult": 4.0,
+            "trend_live_enabled": False,
+            "trend_live_slots": 4,
+            "trend_max_from_high_pct": 10.0,
+            "trend_max_rsi": 80.0,
+            "trend_rs_lookback": 126,  # se ML dice WIN score <30% + in perdita → sell
         }
 
     def _build_leadership_context(self, market_ctx: dict, params: dict) -> dict:
@@ -1036,6 +1041,131 @@ class AlphaStrategist(BaseAgent):
         rows.sort(key=lambda row: -row["max_score"])
         return rows[: int(params.get("max_live_slots", 4)) * 2]
 
+    @staticmethod
+    def _trend_ema(values, period):
+        if len(values) < period:
+            return sum(values) / len(values) if values else 0.0
+        k = 2 / (period + 1)
+        ema = sum(values[:period]) / period
+        for value in values[period:]:
+            ema = value * k + ema * (1 - k)
+        return ema
+
+    @staticmethod
+    def _trend_rsi(closes, period=14):
+        if len(closes) < period + 1:
+            return 50.0
+        gains = []
+        losses = []
+        for i in range(len(closes) - period, len(closes)):
+            change = closes[i] - closes[i - 1]
+            gains.append(max(change, 0))
+            losses.append(max(-change, 0))
+        avg_gain = sum(gains) / period
+        avg_loss = sum(losses) / period
+        if avg_loss == 0:
+            return 100.0
+        return 100 - 100 / (1 + avg_gain / avg_loss)
+
+    async def _build_trend_live_candidates(self, db, assets: list, open_tickers: list,
+                                           exclude: set, market_ctx: dict, params: dict) -> list:
+        if not params.get("trend_live_enabled", False):
+            return []
+        if market_ctx.get("market_regime") in ("BEAR", "CRASH"):
+            return []
+        max_from_high = float(params.get("trend_max_from_high_pct", 10.0))
+        max_rsi = float(params.get("trend_max_rsi", 80.0))
+        lookback = int(params.get("trend_rs_lookback", 126))
+        prefiltered = []
+        for asset in assets:
+            ticker = asset.get("ticker", "")
+            if not ticker or ticker in open_tickers or ticker in exclude:
+                continue
+            if (asset.get("mtf") or {}).get("weekly_trend") != "BULL":
+                continue
+            price = float(asset.get("price") or 0)
+            ema20 = float(asset.get("ema20") or 0)
+            ema50 = float(asset.get("ema50") or 0)
+            if not (price > ema20 > ema50 > 0):
+                continue
+            if float(asset.get("rsi") or 50) > max_rsi + 3:
+                continue
+            prefiltered.append(asset)
+        if not prefiltered:
+            return []
+        spy_doc = await db.stock_bars.find_one({"ticker": "SPY"}, {"bars": {"$slice": -(lookback + 1)}})
+        spy_bars = (spy_doc or {}).get("bars") or []
+        if len(spy_bars) < lookback + 1:
+            return []
+        spy_ret = spy_bars[-1]["c"] / spy_bars[0]["c"] - 1
+        rows = []
+        for asset in prefiltered:
+            ticker = asset["ticker"]
+            doc = await db.stock_bars.find_one({"ticker": ticker}, {"bars": {"$slice": -260}})
+            bars = (doc or {}).get("bars") or []
+            if len(bars) < 130:
+                continue
+            closes = [b["c"] for b in bars]
+            highs = [b["h"] for b in bars]
+            lows = [b["l"] for b in bars]
+            price = closes[-1]
+            if price <= 0:
+                continue
+            pct_from_high = (price / max(highs) - 1) * 100
+            if pct_from_high < -max_from_high:
+                continue
+            day_change = (price / closes[-2] - 1) * 100 if closes[-2] else 0
+            if day_change > 8.0:
+                continue
+            rsi = self._trend_rsi(closes[-15:])
+            if rsi > max_rsi:
+                continue
+            window = closes[-120:]
+            ema20 = self._trend_ema(window, 20)
+            ema50 = self._trend_ema(window, 50)
+            if not (price > ema20 > ema50):
+                continue
+            trs = [
+                max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1]))
+                for i in range(len(closes) - 14, len(closes))
+            ]
+            atr = sum(trs) / len(trs) if trs else price * 0.02
+            atr_pct = atr / price * 100
+            if (price - ema20) > 2.0 * atr:
+                continue
+            stock_ret = price / closes[-(lookback + 1)] - 1
+            rs_excess = (stock_ret - spy_ret) * 100
+            if rs_excess <= 0:
+                continue
+            stop_pct = min(12.0, max(3.0, max(atr_pct * 2.0, (price - ema50) / price * 100)))
+            target_pct = min(40.0, max(8.0, atr_pct * 4.0))
+            stop_loss = price * (1 - stop_pct / 100)
+            target_price = price * (1 + target_pct / 100)
+            rows.append({
+                "ticker": ticker,
+                "channel": "TREND",
+                "price": round(price, 2),
+                "confluence": 55,
+                "trend_rs_excess_pct": round(rs_excess, 2),
+                "setup_score": asset.get("setup_score", 0),
+                "setup_type": "trend_leadership",
+                "sector": asset.get("sector_code", ""),
+                "rsi": round(rsi, 1),
+                "relative_volume": asset.get("relative_volume", 1),
+                "stop_loss": round(stop_loss, 2),
+                "target_price": round(target_price, 2),
+                "risk_reward": round(target_pct / stop_pct, 2),
+                "pct_from_high": round(pct_from_high, 2),
+                "ml_prediction": "N/A",
+                "ml_score": 0,
+                "trend_prediction": "N/A",
+                "trend_up_prob": 0,
+                "weekly_trend": "BULL",
+                "sector_flow": "NEUTRAL",
+            })
+        rows.sort(key=lambda row: -row["trend_rs_excess_pct"])
+        return rows[: int(params.get("trend_live_slots", 4)) * 2]
+
     async def analyze(self, context: dict) -> dict:
         db = get_db()
         params = await self.get_params()
@@ -1620,6 +1750,21 @@ class AlphaStrategist(BaseAgent):
             top_candidates = max_live_candidates + [c for c in top_candidates if c["ticker"] not in max_tickers]
             print(f"  🟠 Max live: {len(max_live_candidates)} candidati -> "
                   f"{', '.join(c['ticker'] for c in max_live_candidates)}")
+        trend_live_candidates = await self._build_trend_live_candidates(
+            db, assets, open_tickers, {c["ticker"] for c in top_candidates if c.get("channel") == "MAX"},
+            market_ctx, params,
+        )
+        if trend_live_candidates:
+            trend_tickers = {c["ticker"] for c in trend_live_candidates}
+            max_part = [c for c in top_candidates if c.get("channel") == "MAX"]
+            rest = [c for c in top_candidates if c.get("channel") != "MAX" and c["ticker"] not in trend_tickers]
+            top_candidates = max_part + trend_live_candidates + rest
+            print(f"  📈 Trend live: {len(trend_live_candidates)} candidati -> "
+                  f"{', '.join(c['ticker'] + ' RS+' + str(c['trend_rs_excess_pct']) for c in trend_live_candidates)}")
+        summary["trend_live"] = {
+            "enabled": bool(params.get("trend_live_enabled", False)),
+            "candidates": [c["ticker"] for c in trend_live_candidates],
+        }
         summary["max_live"] = {
             "enabled": bool(params.get("max_live_enabled", False)),
             "candidates": [c["ticker"] for c in max_live_candidates],
