@@ -812,8 +812,27 @@ async def bars_history_backfill_status(target_bars: int = 750):
     return job
 
 
-@router.post("/backtest/run")
-async def backtest_run(
+_BACKTEST_LOCK = asyncio.Lock()
+_BACKTEST_JOBS = {}
+_BACKTEST_STATE = {"current_job": None}
+
+
+def _plain(value):
+    if isinstance(value, dict):
+        return {str(k): _plain(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_plain(v) for v in value]
+    if hasattr(value, "item") and not isinstance(value, (str, bytes)):
+        try:
+            return value.item()
+        except Exception:
+            return value
+    if isinstance(value, float) and value != value:
+        return None
+    return value
+
+
+async def _resolve_backtest_kwargs(
     days: int = 180,
     min_confluence: float = None,
     max_positions: int = None,
@@ -871,7 +890,7 @@ async def backtest_run(
     position_size_pct = position_size_pct if position_size_pct is not None else 18.0
     min_confluence = min_confluence if min_confluence is not None else 48
 
-    result = await run_backtest(
+    kwargs = dict(
         days=days,
         min_confluence=min_confluence,
         max_positions=max_positions,
@@ -907,8 +926,151 @@ async def backtest_run(
         min_cash_reserve_pct=risk_params.get("min_cash_reserve_pct", app_settings.get("min_cash_reserve_pct", 5.0) if use_preset else 5.0),
         risk_params=risk_params,
     )
+    return kwargs, preset_name
+
+
+async def _execute_backtest_job(job_id, kwargs, preset_name):
+    from app.services.backtesting import run_backtest
+    db = get_db()
+    job = _BACKTEST_JOBS[job_id]
+    async with _BACKTEST_LOCK:
+        _BACKTEST_STATE["current_job"] = job_id
+        job["status"] = "running"
+        job["started_at"] = _dt.utcnow().isoformat()
+        print(f"[BACKTEST] job {job_id} started: days={kwargs.get('days')}")
+        try:
+            result = await run_backtest(**kwargs)
+            result["active_preset"] = preset_name
+            result = _plain(result)
+            job["status"] = "error" if result.get("error") else "done"
+            job["result"] = result
+            job["error"] = result.get("error")
+        except Exception as e:
+            job["status"] = "error"
+            job["error"] = str(e)
+            print(f"[BACKTEST] job {job_id} error: {e}")
+        finally:
+            job["finished_at"] = _dt.utcnow().isoformat()
+            _BACKTEST_STATE["current_job"] = None
+            print(f"[BACKTEST] job {job_id} {job['status']}")
+    try:
+        await db.backtest_results.update_one(
+            {"_id": job_id},
+            {"$set": {k: v for k, v in job.items() if k != "_id"}},
+            upsert=True,
+        )
+    except Exception as e:
+        print(f"[BACKTEST] save error {job_id}: {e}")
+    for old_id in list(_BACKTEST_JOBS.keys())[:-3]:
+        if _BACKTEST_JOBS[old_id].get("status") in ("done", "error"):
+            _BACKTEST_JOBS.pop(old_id, None)
+
+
+@router.post("/backtest/start")
+async def backtest_start(
+    days: int = 180,
+    min_confluence: float = None,
+    max_positions: int = None,
+    position_size_pct: float = None,
+    use_apm: bool = True,
+    t1_ratio: float = 0.40,
+    t2_ratio: float = 0.70,
+    t3_ratio: float = 1.00,
+    use_preset: bool = True,
+    use_mtf: bool = True,
+    use_momentum: bool = False,
+    use_sector_bottom: bool = False,
+    use_crash_deploy: bool = False,
+    use_rotation: bool = False,
+    use_sector_intelligence: bool = False,
+    t1_size_pct: float = 30.0,
+    t2_size_pct: float = 30.0,
+    t3_size_pct: float = 25.0,
+    floor_t1_pct: float = 0.0,
+    floor_t2_pct: float = 3.0,
+    floor_t3_pct: float = 8.0,
+    min_holding_days: int = 1,
+    use_dynamic_sizing: bool = False,
+    use_apm_exit_proxy: bool = False,
+    use_trend_leadership: bool = False,
+    park_cash_in_spy: bool = False,
+    trend_slots: int = 4,
+    trend_max_per_sector: int = 3,
+    trend_max_from_high_pct: float = 10.0,
+    trend_max_rsi: float = 80.0,
+    trend_rs_lookback: int = 126,
+):
+    params = dict(locals())
+    import uuid
+    if _BACKTEST_LOCK.locked() or _BACKTEST_STATE["current_job"]:
+        return {"status": "busy", "job_id": _BACKTEST_STATE["current_job"], "message": "Un backtest e' gia' in esecuzione"}
+    kwargs, preset_name = await _resolve_backtest_kwargs(**params)
+    job_id = uuid.uuid4().hex[:12]
+    _BACKTEST_JOBS[job_id] = {"job_id": job_id, "status": "queued", "days": kwargs.get("days"), "created_at": _dt.utcnow().isoformat()}
+    _BACKTEST_STATE["current_job"] = job_id
+    asyncio.create_task(_execute_backtest_job(job_id, kwargs, preset_name))
+    return {"status": "queued", "job_id": job_id}
+
+
+@router.get("/backtest/job/{job_id}")
+async def backtest_job(job_id: str):
+    job = _BACKTEST_JOBS.get(job_id)
+    if job is None:
+        doc = await get_db().backtest_results.find_one({"_id": job_id})
+        if not doc:
+            return {"job_id": job_id, "status": "not_found"}
+        doc.pop("_id", None)
+        return _plain(doc)
+    elapsed = None
+    if job.get("started_at"):
+        end = _dt.fromisoformat(job["finished_at"]) if job.get("finished_at") else _dt.utcnow()
+        elapsed = round((end - _dt.fromisoformat(job["started_at"])).total_seconds(), 1)
+    return {**job, "elapsed_s": elapsed}
+
+
+@router.post("/backtest/run")
+async def backtest_run(
+    days: int = 180,
+    min_confluence: float = None,
+    max_positions: int = None,
+    position_size_pct: float = None,
+    use_apm: bool = True,
+    t1_ratio: float = 0.40,
+    t2_ratio: float = 0.70,
+    t3_ratio: float = 1.00,
+    use_preset: bool = True,
+    use_mtf: bool = True,
+    use_momentum: bool = False,
+    use_sector_bottom: bool = False,
+    use_crash_deploy: bool = False,
+    use_rotation: bool = False,
+    use_sector_intelligence: bool = False,
+    t1_size_pct: float = 30.0,
+    t2_size_pct: float = 30.0,
+    t3_size_pct: float = 25.0,
+    floor_t1_pct: float = 0.0,
+    floor_t2_pct: float = 3.0,
+    floor_t3_pct: float = 8.0,
+    min_holding_days: int = 1,
+    use_dynamic_sizing: bool = False,
+    use_apm_exit_proxy: bool = False,
+    use_trend_leadership: bool = False,
+    park_cash_in_spy: bool = False,
+    trend_slots: int = 4,
+    trend_max_per_sector: int = 3,
+    trend_max_from_high_pct: float = 10.0,
+    trend_max_rsi: float = 80.0,
+    trend_rs_lookback: int = 126,
+):
+    params = dict(locals())
+    from app.services.backtesting import run_backtest
+    if _BACKTEST_LOCK.locked():
+        return {"error": "Un backtest e' gia' in esecuzione: usa /backtest/start"}
+    kwargs, preset_name = await _resolve_backtest_kwargs(**params)
+    async with _BACKTEST_LOCK:
+        result = await run_backtest(**kwargs)
     result["active_preset"] = preset_name
-    return result
+    return _plain(result)
 
 @router.post("/load-spy-history")
 async def load_spy_history_endpoint(years: int = 7):
