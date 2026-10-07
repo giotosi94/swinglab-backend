@@ -864,6 +864,7 @@ async def _resolve_backtest_kwargs(
     trend_max_from_high_pct: float = 10.0,
     trend_max_rsi: float = 80.0,
     trend_rs_lookback: int = 126,
+    core_spy_pct: float = 0.0,
 ):
     from app.services.backtesting import run_backtest
 
@@ -921,6 +922,7 @@ async def _resolve_backtest_kwargs(
         trend_max_from_high_pct=max(3.0, min(trend_max_from_high_pct, 25.0)),
         trend_max_rsi=max(60.0, min(trend_max_rsi, 90.0)),
         trend_rs_lookback=max(63, min(trend_rs_lookback, 200)),
+        core_spy_pct=max(0.0, min(core_spy_pct, 90.0)),
         risk_pct_per_trade=risk_params.get("risk_pct_per_trade", app_settings.get("risk_pct_per_trade", 3.0) if use_preset else 3.0),
         max_position_pct=risk_params.get("max_position_pct", app_settings.get("max_position_pct", 25.0) if use_preset else 25.0),
         min_cash_reserve_pct=risk_params.get("min_cash_reserve_pct", app_settings.get("min_cash_reserve_pct", 5.0) if use_preset else 5.0),
@@ -999,6 +1001,7 @@ async def backtest_start(
     trend_max_from_high_pct: float = 10.0,
     trend_max_rsi: float = 80.0,
     trend_rs_lookback: int = 126,
+    core_spy_pct: float = 0.0,
 ):
     params = dict(locals())
     import uuid
@@ -1061,6 +1064,7 @@ async def backtest_run(
     trend_max_from_high_pct: float = 10.0,
     trend_max_rsi: float = 80.0,
     trend_rs_lookback: int = 126,
+    core_spy_pct: float = 0.0,
 ):
     params = dict(locals())
     from app.services.backtesting import run_backtest
