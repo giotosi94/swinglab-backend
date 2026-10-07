@@ -116,6 +116,8 @@ async def save_settings(payload: dict):
         alpha_update["max_candidates"] = data["max_positions"] * 2
     if "fractionable_only" in data:
         alpha_update["fractionable_only"] = data["fractionable_only"]
+    if "max_per_sector" in data:
+        alpha_update["max_per_sector"] = data["max_per_sector"]
     if alpha_update:
         await db.agent_memory_alpha_strategist.update_one(
             {"_id": "params"}, {"$set": alpha_update}, upsert=True
@@ -332,6 +334,7 @@ async def apply_risk_preset(preset_name: str):
         {"$set": {
             "max_candidates": settings_data.get("max_positions", 8) * 2,
             "max_positions": settings_data.get("max_positions", 8),
+            "max_per_sector": settings_data.get("max_per_sector", 2),
         }},
         upsert=True,
     )
