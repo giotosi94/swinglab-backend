@@ -914,6 +914,7 @@ async def run_backtest(
     trend_max_rsi: float = 80.0,
     trend_rs_lookback: int = 126,
     trend_slots: int = 4,
+    core_spy_pct: float = 0.0,
     risk_pct_per_trade: float = 3.0,
     max_position_pct: float = 25.0,
     min_cash_reserve_pct: float = 5.0,
@@ -929,7 +930,20 @@ async def run_backtest(
     - Rotazione settoriale disattivata di default e solo testabile in isolamento
     """
     db = get_db()
-    all_bars = await db.stock_bars.find({}, {"ticker": 1, "bars": 1}).to_list(300)
+    from app.services.data_fetcher import SECTOR_STOCKS
+    universe_sector = {}
+    async for asset_doc in db.assets.find({}, {"ticker": 1, "sector_code": 1}):
+        asset_ticker = asset_doc.get("ticker")
+        if asset_ticker:
+            universe_sector[asset_ticker] = asset_doc.get("sector_code")
+    for sec, tickers in SECTOR_STOCKS.items():
+        for tk in tickers:
+            if not universe_sector.get(tk):
+                universe_sector[tk] = sec
+    reference_tickers = {"SPY"} | set(SECTOR_BOTTOM_CFG.keys())
+    tradable_tickers = {tk for tk in universe_sector if tk not in reference_tickers}
+    wanted = sorted(tradable_tickers | reference_tickers)
+    all_bars = await db.stock_bars.find({"ticker": {"$in": wanted}}, {"ticker": 1, "bars": 1}).to_list(len(wanted) + 10)
     if not all_bars:
         return {"error": "No stock_bars data available"}
 
@@ -940,15 +954,16 @@ async def run_backtest(
         bars = doc.get("bars", [])
         if len(bars) >= 60:
             ticker_bars[ticker] = bars
-            for b in bars:
-                all_dates.add(b["date"])
+            if ticker in tradable_tickers or ticker == "SPY":
+                for b in bars:
+                    all_dates.add(b["date"])
 
     if not ticker_bars:
         return {"error": "Not enough bars"}
 
     sorted_dates = sorted(all_dates)
     backtest_dates = sorted_dates[-days:] if len(sorted_dates) > days else sorted_dates
-    coverage_counts = sorted(len(bars) for bars in ticker_bars.values())
+    coverage_counts = sorted(len(bars) for tk, bars in ticker_bars.items() if tk in tradable_tickers)
     executed_days = len(backtest_dates)
     complete = sum(1 for count in coverage_counts if count >= executed_days)
     data_coverage = {
@@ -962,15 +977,13 @@ async def run_backtest(
         "bars_median": int(np.median(coverage_counts)) if coverage_counts else 0,
         "bars_max": max(coverage_counts) if coverage_counts else 0,
         "is_full_period": executed_days >= days,
+        "universe_assets": len(tradable_tickers),
+        "universe_with_bars": sum(1 for tk in ticker_bars if tk in tradable_tickers),
+        "universe_missing_bars": sorted(tk for tk in tradable_tickers if tk not in ticker_bars)[:40],
     }
 
     # 🆕 Mappe per Sector Bottom Detector
-    from app.services.data_fetcher import SECTOR_STOCKS
-    ticker_to_sector = {}
-    for sec, tickers in SECTOR_STOCKS.items():
-        for tk in tickers:
-            if tk in ticker_bars:
-                ticker_to_sector[tk] = sec
+    ticker_to_sector = {tk: sec for tk, sec in universe_sector.items() if tk in ticker_bars and sec}
     # date -> index per ogni ticker (per 200SMA veloce)
     date_idx_map = {}
     for tk, bars in ticker_bars.items():
@@ -1037,10 +1050,21 @@ async def run_backtest(
     park_value_samples = []
     park_buys = 0
     last_spy_close = None
+    core_spy_pct = max(0.0, min(float(core_spy_pct or 0), 90.0))
+    core_shares = 0.0
+    core_invested = 0.0
+    crash_cash_in = 0.0
+    crash_cash_out = 0.0
+    crash_freed_swing = 0.0
 
     for day_number, date in enumerate(backtest_dates):
         if day_number % 3 == 0:
             await asyncio.sleep(0)
+        if core_spy_pct > 0 and core_shares == 0 and date in spy_close_by_date:
+            core_price = spy_closes_ordered[spy_close_by_date[date] - 1]
+            core_invested = cash * core_spy_pct / 100
+            core_shares = core_invested / core_price
+            cash -= core_invested
         # ===== 0. CRASH DEPLOY a FETTE progressive (Progetto Alpha) =====
         # Entry scalato: più il mercato crolla, più carichi. Libera capitale dallo
         # swing per avere munizioni. Tiene fino al massimo precedente, poi lascia
@@ -1075,6 +1099,7 @@ async def run_backtest(
                             px = bp["c"] if bp else p.get("last_price", p["entry_price"])
                             freed = px * p["shares"] * 0.5
                             cash += freed
+                            crash_freed_swing += freed
                             p["shares"] *= 0.5
                         crash_deploy_events.append(
                             {"date": date, "action": "FREE_CAPITAL",
@@ -1088,6 +1113,7 @@ async def run_backtest(
                         spy_position["fette_done"].add(f["id"])
                         spy_position["peak_at_entry"] = max(spy_position["peak_at_entry"], spy_peak)
                         cash -= deploy_cash
+                        crash_cash_in += deploy_cash
                         crash_deploy_events.append(
                             {"date": date, "action": f"DEPLOY_FETTA_{f['id']}",
                              "spy_dd": round(spy_dd, 1), "spy_price": round(spy_price_today, 2),
@@ -1101,6 +1127,7 @@ async def run_backtest(
                 sell_sh = spy_position["shares"] * 0.80
                 exit_val = sell_sh * spy_price_today
                 cash += exit_val
+                crash_cash_out += exit_val
                 invested = spy_position["invested"]
                 sold_cost = invested * 0.80
                 pnl_spy = (exit_val - sold_cost) / sold_cost * 100 if sold_cost > 0 else 0
@@ -1312,7 +1339,7 @@ async def run_backtest(
             candidates = []
             trend_candidates = []
             for ticker, bars in ticker_bars.items():
-                if ticker in positions:
+                if ticker in positions or ticker not in tradable_tickers:
                     continue
                 idx = date_idx_map.get(ticker, {}).get(date)
                 if idx is None or idx < 50:
@@ -1501,10 +1528,11 @@ async def run_backtest(
             spy_deploy_value = spy_position["shares"] * spy_closes_ordered[spy_close_by_date[date] - 1]
 
         park_value = park_shares * last_spy_close if park_shares > 0 and last_spy_close else 0.0
+        core_value = core_shares * last_spy_close if core_shares > 0 and last_spy_close else 0.0
         if park_value > 0:
             park_days += 1
-        total_equity = cash + positions_value + crash_reserve + spy_deploy_value + park_value
-        invested_value = positions_value + spy_deploy_value + park_value
+        total_equity = cash + positions_value + crash_reserve + spy_deploy_value + park_value + core_value
+        invested_value = positions_value + spy_deploy_value + park_value + core_value
         park_value_samples.append(park_value / total_equity * 100 if total_equity > 0 else 0)
         equity_curve.append({
             "date": date,
@@ -1517,6 +1545,8 @@ async def run_backtest(
     if park_shares > 0 and last_spy_close:
         cash += park_shares * last_spy_close
         park_shares = 0.0
+    core_final_value = core_shares * spy_closes_ordered[-1] if core_shares > 0 and spy_closes_ordered else 0.0
+    cash += core_final_value
 
     # Chiudi posizioni residue
     last_date = backtest_dates[-1]
@@ -1538,6 +1568,7 @@ async def run_backtest(
         final_spy = spy_closes_ordered[-1]
         exit_val = spy_position["shares"] * final_spy
         cash += exit_val
+        crash_cash_out += exit_val
         inv = spy_position["invested"]
         pnl_spy = (exit_val - inv) / inv * 100 if inv > 0 else 0
         crash_deploy_events.append(
@@ -1595,6 +1626,8 @@ async def run_backtest(
 
     # SPY benchmark + curva allineata all'equity + correlazione
     spy_return = 0
+    spy_sharpe = 0
+    spy_max_dd = 0
     beta = 0
     correlation = 0
     aligned_days = 0
@@ -1607,6 +1640,10 @@ async def run_backtest(
         if len(spy_slice) >= 2:
             spy_start = spy_slice[0]["c"]
             spy_return = (spy_slice[-1]["c"] - spy_start) / spy_start * 100
+            spy_curve = [{"equity": b["c"]} for b in spy_slice]
+            spy_risk = _calc_metrics(spy_curve, [])
+            spy_sharpe = spy_risk.get("sharpe_ratio", 0)
+            spy_max_dd = spy_risk.get("max_drawdown_pct", 0)
             spy_by_date = {b["date"]: b["c"] for b in spy_slice}
 
             # 🆕 v2.1 — Attacca il valore SPY (in $ dallo stesso start capitale)
@@ -1689,6 +1726,7 @@ async def run_backtest(
             "trend_max_rsi": trend_max_rsi,
             "trend_rs_lookback": trend_params["rs_lookback"],
             "trend_slots": trend_slots,
+            "core_spy_pct": core_spy_pct,
             "risk_pct_per_trade": risk_pct_per_trade,
             "max_position_pct": max_position_pct,
             "min_cash_reserve_pct": min_cash_reserve_pct,
@@ -1708,10 +1746,17 @@ async def run_backtest(
             "Parcheggio SPY: solo in regime BULL point-in-time, liquidita' oltre la riserva minima, ribilanciato ogni giorno alla chiusura senza costi di transazione.",
             "DPS usa ML neutrale 50 finche' non saranno disponibili snapshot ML storici.",
             "Il backtest usa barre daily: il minimum holding di 24 ore equivale a 1 giorno di borsa.",
+            "Universo: solo i ticker della collection assets; SPY ed ETF settoriali sono solo riferimento e non vengono tradati.",
+            "Core SPY: quota fissa acquistata il primo giorno e tenuta fino alla fine, senza ribilanciamento.",
+            "Survivorship bias: l'universo e' quello attuale, i titoli usciti dall'indice non sono inclusi.",
         ],
         "benchmark": {
             "spy_return_pct": round(spy_return, 2),
             "alpha": round(metrics.get("total_return_pct", 0) - spy_return, 2),
+            "spy_sharpe": spy_sharpe,
+            "spy_max_drawdown_pct": spy_max_dd,
+            "sharpe_vs_spy": round(metrics.get("sharpe_ratio", 0) - spy_sharpe, 2),
+            "drawdown_vs_spy": round(spy_max_dd - metrics.get("max_drawdown_pct", 0), 2),
             "beta": beta,
             "correlation": correlation,
             "aligned_days": aligned_days,
@@ -1726,6 +1771,20 @@ async def run_backtest(
         },
         "sector_intelligence_stats": sector_intelligence_stats,
         "channel_metrics": channel_metrics,
+        "core_stats": {
+            "core_spy_pct": core_spy_pct,
+            "core_invested": round(core_invested, 2),
+            "core_final_value": round(core_final_value, 2),
+            "core_pnl_dollar": round(core_final_value - core_invested, 2),
+        },
+        "crash_stats": {
+            "enabled": use_crash_deploy,
+            "spy_bought": round(crash_cash_in, 2),
+            "spy_sold": round(crash_cash_out, 2),
+            "spy_pnl_dollar": round(crash_cash_out - crash_cash_in, 2),
+            "swing_capital_freed": round(crash_freed_swing, 2),
+            "deploy_events": sum(1 for e in crash_deploy_events if str(e.get("action", "")).startswith("DEPLOY")),
+        },
         "trend_stats": {
             "enabled": use_trend_leadership,
             "active_days": trend_signal_days,
