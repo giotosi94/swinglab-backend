@@ -915,6 +915,9 @@ async def run_backtest(
     trend_rs_lookback: int = 126,
     trend_slots: int = 4,
     core_spy_pct: float = 0.0,
+    use_max_strategy: bool = False,
+    max_slots: int = 3,
+    max_stop_cap_pct: float = 15.0,
     risk_pct_per_trade: float = 3.0,
     max_position_pct: float = 25.0,
     min_cash_reserve_pct: float = 5.0,
@@ -1001,6 +1004,31 @@ async def run_backtest(
     sector_intelligence_promoted = 0
     sector_intelligence_penalized_out = 0
     backtest_date_index = {date: i for i, date in enumerate(backtest_dates)}
+    max_signals_by_date = {}
+    max_signals_loaded = 0
+    if use_max_strategy and backtest_dates:
+        async for signal in db.max_backtest_signals.find(
+            {"qualified": True, "date": {"$gte": sorted_dates[max(0, len(sorted_dates) - days - 30)], "$lte": backtest_dates[-1]}},
+            {"_id": 0, "ticker": 1, "date": 1, "status": 1, "order_action": 1, "trade_ready": 1,
+             "trigger_price": 1, "maximum_entry_price": 1, "invalidation_price": 1, "atr14": 1,
+             "trigger_source": 1, "strategy_type": 1},
+        ):
+            if signal.get("ticker") in tradable_tickers and signal.get("ticker") in ticker_bars:
+                max_signals_by_date.setdefault(signal["date"], []).append(signal)
+                max_signals_loaded += 1
+    max_setups = {}
+    max_stats = {
+        "enabled": use_max_strategy,
+        "signals_loaded": max_signals_loaded,
+        "setups_activated": 0,
+        "entries": 0,
+        "entries_by_status": {},
+        "expired": 0,
+        "invalidated_before_entry": 0,
+        "skipped_above_max_entry": 0,
+        "stop_capped": 0,
+        "no_slot": 0,
+    }
 
     # 🆕 Crash Deploy: SPY closes indicizzate per data
     spy_doc_cd = await db.stock_bars.find_one({"ticker": "SPY"})
@@ -1335,6 +1363,66 @@ async def run_backtest(
         if trend_active_today:
             trend_signal_days += 1
 
+        max_candidates = []
+        if use_max_strategy:
+            for signal in max_signals_by_date.get(date, []):
+                if signal["ticker"] not in positions:
+                    max_setups[signal["ticker"]] = {**signal, "start_index": backtest_date_index.get(date, 0)}
+                    max_stats["setups_activated"] += 1
+            today_index = backtest_date_index.get(date, 0)
+            for max_ticker in list(max_setups.keys()):
+                setup_info = max_setups[max_ticker]
+                if max_ticker in positions:
+                    del max_setups[max_ticker]
+                    continue
+                bar = _bar_on(ticker_series, ticker_bars, max_ticker, date)
+                if not bar:
+                    continue
+                age = today_index - setup_info["start_index"]
+                if age > 15:
+                    max_stats["expired"] += 1
+                    del max_setups[max_ticker]
+                    continue
+                if age == 0:
+                    continue
+                trigger = setup_info.get("trigger_price") or 0
+                maximum_entry = setup_info.get("maximum_entry_price") or 0
+                invalidation = setup_info.get("invalidation_price") or 0
+                if invalidation and bar["c"] <= invalidation:
+                    max_stats["invalidated_before_entry"] += 1
+                    del max_setups[max_ticker]
+                    continue
+                status = setup_info.get("status")
+                entry_px = None
+                if status in ("CONFIRMED_4H", "CONFIRMED_DAILY"):
+                    if age == 1:
+                        entry_px = bar.get("o") or bar["c"]
+                elif status == "WAIT_RETEST":
+                    if bar["l"] <= maximum_entry and bar["c"] >= trigger:
+                        entry_px = bar["c"]
+                elif bar["h"] >= trigger:
+                    entry_px = max(bar.get("o") or trigger, trigger)
+                if entry_px is None:
+                    continue
+                if entry_px > maximum_entry:
+                    max_stats["skipped_above_max_entry"] += 1
+                    if status in ("CONFIRMED_4H", "CONFIRMED_DAILY") or bar["c"] > maximum_entry:
+                        del max_setups[max_ticker]
+                    continue
+                stop_floor = entry_px * (1 - max_stop_cap_pct / 100)
+                stop_px = max(invalidation, stop_floor) if invalidation else stop_floor
+                if invalidation and invalidation < stop_floor:
+                    max_stats["stop_capped"] += 1
+                if stop_px >= entry_px:
+                    del max_setups[max_ticker]
+                    continue
+                atr_value = setup_info.get("atr14") or entry_px * 0.02
+                target_pct = min(40.0, max(8.0, atr_value / entry_px * 100 * 4.0))
+                max_candidates.append((
+                    max_ticker, float(setup_info.get("max_score") or 0), entry_px, entry_px * (1 + target_pct / 100),
+                    stop_px, f"max_{(status or '').lower()}", 0, 0, 0.0, {}, "MAX",
+                ))
+
         if len(positions) < max_positions:
             candidates = []
             trend_candidates = []
@@ -1386,11 +1474,24 @@ async def run_backtest(
             candidates.sort(key=lambda x: x[1], reverse=True)
             slots = max_positions - len(positions)
             open_trend = sum(1 for p in positions.values() if p.get("channel") == "TREND")
-            open_alpha = len(positions) - open_trend
+            open_max = sum(1 for p in positions.values() if p.get("channel") == "MAX")
+            open_alpha = len(positions) - open_trend - open_max
+            reserved_max = max(0, min(int(max_slots), max_positions)) if use_max_strategy else 0
+            max_free = max(0, min(slots, reserved_max - open_max))
+            selected = []
+            for max_candidate in max_candidates:
+                if len(selected) >= max_free:
+                    max_stats["no_slot"] += 1
+                    continue
+                selected.append(max_candidate)
+                del max_setups[max_candidate[0]]
+            slots_after_max = slots - len(selected)
             reserved_trend = max(0, min(int(trend_slots), max_positions)) if use_trend_leadership else 0
-            alpha_slots = max(0, min(slots, max_positions - reserved_trend - open_alpha))
-            trend_free = max(0, min(slots - alpha_slots, reserved_trend - open_trend))
-            selected = [candidate + ("ALPHA",) for candidate in candidates[:alpha_slots]]
+            alpha_slots = max(0, min(slots_after_max, max_positions - reserved_trend - reserved_max - open_alpha))
+            trend_free = max(0, min(slots_after_max - alpha_slots, reserved_trend - open_trend))
+            max_chosen = {item[0] for item in selected}
+            selected.extend(candidate + ("ALPHA",) for candidate in candidates if candidate[0] not in max_chosen)
+            selected = selected[:len(max_chosen) + alpha_slots]
             trend_limit = len(selected) + trend_free
             if trend_candidates:
                 trend_candidates_total += len(trend_candidates)
@@ -1493,6 +1594,9 @@ async def run_backtest(
                 position_channels[(ticker, date)] = channel
                 if channel == "TREND":
                     trend_entries += 1
+                if channel == "MAX":
+                    max_stats["entries"] += 1
+                    max_stats["entries_by_status"][setup] = max_stats["entries_by_status"].get(setup, 0) + 1
                 sector_intelligence_entries[(ticker, date)] = {
                     "confluence_before_sector": confluence_before_sector,
                     "sector_adjustment": sector_adjustment,
@@ -1604,9 +1708,9 @@ async def run_backtest(
         position["channel"] = position_channels.get((position.get("ticker"), position.get("entry_date")), "ALPHA")
     channel_metrics = {
         channel_name: _calc_position_metrics([p for p in position_trades if p.get("channel") == channel_name])
-        for channel_name in ("ALPHA", "TREND")
+        for channel_name in ("ALPHA", "TREND", "MAX")
     }
-    for channel_name in ("ALPHA", "TREND"):
+    for channel_name in ("ALPHA", "TREND", "MAX"):
         channel_metrics[channel_name]["pnl_dollar"] = round(sum(
             p.get("pnl_dollar", 0) for p in position_trades if p.get("channel") == channel_name
         ), 2)
@@ -1727,6 +1831,9 @@ async def run_backtest(
             "trend_rs_lookback": trend_params["rs_lookback"],
             "trend_slots": trend_slots,
             "core_spy_pct": core_spy_pct,
+            "use_max_strategy": use_max_strategy,
+            "max_slots": max_slots,
+            "max_stop_cap_pct": max_stop_cap_pct,
             "risk_pct_per_trade": risk_pct_per_trade,
             "max_position_pct": max_position_pct,
             "min_cash_reserve_pct": min_cash_reserve_pct,
@@ -1749,6 +1856,7 @@ async def run_backtest(
             "Universo: solo i ticker della collection assets; SPY ed ETF settoriali sono solo riferimento e non vengono tradati.",
             "Core SPY: quota fissa acquistata il primo giorno e tenuta fino alla fine, senza ribilanciamento.",
             "Survivorship bias: l'universo e' quello attuale, i titoli usciti dall'indice non sono inclusi.",
+            "Max Strategy: segnali point-in-time dalla scansione storica settimanale (analyze_max_strategy live con as_of, solo daily, 4H storico non disponibile). Ingresso dal giorno successivo al segnale: ARMED su tocco del trigger, CONFIRMED all'apertura successiva, WAIT_RETEST su ritorno sotto il massimo d'ingresso con chiusura sopra il trigger. Stop = invalidazione, limitata al massimo stop configurato; scadenza 15 barre.",
         ],
         "benchmark": {
             "spy_return_pct": round(spy_return, 2),
@@ -1771,6 +1879,7 @@ async def run_backtest(
         },
         "sector_intelligence_stats": sector_intelligence_stats,
         "channel_metrics": channel_metrics,
+        "max_stats": max_stats,
         "core_stats": {
             "core_spy_pct": core_spy_pct,
             "core_invested": round(core_invested, 2),
