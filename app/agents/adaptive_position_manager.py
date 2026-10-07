@@ -240,6 +240,44 @@ class AdaptivePositionManager(BaseAgent):
                 print(f"  ⚠️ URGENT: {symbol} drop {pnl_pct:.1f}% — review nel prossimo run APM completo")
                 continue
 
+            if action is None and buy_trade.get("channel") == "TREND":
+                buy_date = buy_trade.get("date")
+                hours_held = 999.0
+                if buy_date:
+                    try:
+                        hours_held = (datetime.utcnow() - buy_date).total_seconds() / 3600
+                    except Exception:
+                        hours_held = 999.0
+                if hours_held >= params.get("apm_min_holding_hours", 24):
+                    asset_doc = await db.assets.find_one({"ticker": symbol}, {"ema50": 1})
+                    ema50_now = float((asset_doc or {}).get("ema50") or 0)
+                    if ema50_now > 0 and 0 < current_price < ema50_now:
+                        reason = f"TREND_EXIT_EMA50 (${current_price:.2f} < EMA50 ${ema50_now:.2f})"
+                        print(f"  📉 {symbol}: {reason}")
+                        exit_taken, exit_details = await self._execute_exit(
+                            symbol, pos, buy_trade, reason, None, None
+                        )
+                        if exit_taken:
+                            decision_log = {
+                                "ticker": symbol,
+                                "decision": "EXIT",
+                                "reason": reason,
+                                "current_pnl_pct": round(pnl_pct, 2),
+                                "current_price": current_price,
+                                "entry_price": entry_price,
+                                "action_taken": True,
+                                "action_details": exit_details,
+                                "trigger_type": "trend_exit",
+                            }
+                            actions_taken.append(decision_log)
+                            await self.log_decision(
+                                decision_type="apm_trend_exit",
+                                data=decision_log,
+                                reasoning=reason,
+                                confidence=80,
+                            )
+                continue
+
             if action == "SCALE_OUT":
                 print(f"  🚨 URGENT TRIGGER {symbol}: {reason}")
 
