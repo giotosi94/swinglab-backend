@@ -1,3 +1,4 @@
+import threading
 import math
 import numpy as np
 import pandas as pd
@@ -36,21 +37,20 @@ def _atr_series(df, period=14):
 def _volume_profile(df, bins=48):
     if df is None or len(df) < 8:
         return None
-    window = df.copy().reset_index(drop=True)
+    window = df.reset_index(drop=True)
     low = _safe_float(window["Low"].min())
     high = _safe_float(window["High"].max())
     if high <= low:
         return None
     edges = np.linspace(low, high, bins + 1)
     volumes = np.zeros(bins, dtype=float)
-    for row in window.itertuples(index=False):
-        bar_low = _safe_float(row.Low)
-        bar_high = _safe_float(row.High)
-        bar_volume = max(0.0, _safe_float(row.Volume))
-        if bar_high < bar_low or bar_volume <= 0:
-            continue
-        start = max(0, min(bins - 1, int(np.searchsorted(edges, bar_low, side="right") - 1)))
-        end = max(0, min(bins - 1, int(np.searchsorted(edges, bar_high, side="left"))))
+    lows = np.nan_to_num(window["Low"].to_numpy(dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+    highs = np.nan_to_num(window["High"].to_numpy(dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+    raw_volumes = np.maximum(np.nan_to_num(window["Volume"].to_numpy(dtype=float), nan=0.0, posinf=0.0, neginf=0.0), 0.0)
+    valid = (highs >= lows) & (raw_volumes > 0)
+    starts = np.clip(np.searchsorted(edges, lows, side="right") - 1, 0, bins - 1)
+    ends = np.clip(np.searchsorted(edges, highs, side="left"), 0, bins - 1)
+    for start, end, bar_volume in zip(starts[valid], ends[valid], raw_volumes[valid]):
         volumes[start:end + 1] += bar_volume / max(1, end - start + 1)
     total = float(volumes.sum())
     if total <= 0:
@@ -101,7 +101,7 @@ def _swing_points(values, left=3, right=3, mode="low"):
     return points
 
 
-def _data_quality(df):
+def _data_quality(df, as_of=None):
     anomalies = []
     duplicate_count = int(df["datetime"].duplicated().sum())
     clean = df.copy().sort_values("datetime").drop_duplicates("datetime", keep="last").reset_index(drop=True)
@@ -138,7 +138,13 @@ def _data_quality(df):
     if last_bar is not None:
         if last_bar.tzinfo is not None:
             last_bar = last_bar.tz_convert(None)
-        today = pd.Timestamp.utcnow().tz_localize(None).normalize()
+        if as_of is not None:
+            today = pd.Timestamp(as_of)
+            if today.tzinfo is not None:
+                today = today.tz_convert(None)
+            today = today.normalize()
+        else:
+            today = pd.Timestamp.utcnow().tz_localize(None).normalize()
         last_bar_day = last_bar.normalize()
         stale_days = max(0, int((today - last_bar_day).days))
     else:
@@ -165,14 +171,34 @@ def _data_quality(df):
     }
 
 
+_WEEKLY_CACHE = threading.local()
+
+
 def _weekly_frame(df):
-    return df.set_index("datetime").resample("W-FRI").agg({
+    key = None
+    if len(df):
+        key = (
+            len(df),
+            df["datetime"].iloc[0],
+            df["datetime"].iloc[-1],
+            float(df["Close"].iloc[-1]),
+            float(df["Close"].sum()),
+            float(df["Volume"].sum()),
+        )
+        if getattr(_WEEKLY_CACHE, "key", None) == key:
+            return _WEEKLY_CACHE.frame.copy()
+    frame = df.set_index("datetime").resample("W-FRI").agg({
         "Open": "first",
         "High": "max",
         "Low": "min",
         "Close": "last",
         "Volume": "sum",
     }).dropna().reset_index()
+    if key is not None:
+        _WEEKLY_CACHE.key = key
+        _WEEKLY_CACHE.frame = frame
+        return frame.copy()
+    return frame
 
 
 def _structural_profiles(df, atr):
@@ -1049,11 +1075,11 @@ def _multi_timeframe_plan(daily, bars_4h, structural_base, active_base, profiles
         },
     }
 
-def analyze_max_strategy(df, bars_4h=None):
+def analyze_max_strategy(df, bars_4h=None, as_of=None):
     if df is None or len(df) < 140:
         return {"status": "INSUFFICIENT_DATA", "bars": 0 if df is None else len(df), "data_eligible": False, "strategy_eligible": False, "trade_ready": False}
     data = df.copy().sort_values("datetime").reset_index(drop=True)
-    quality = _data_quality(data)
+    quality = _data_quality(data, as_of)
     price = _safe_float(data["Close"].iloc[-1])
     atr_series = _atr_series(data, 14)
     atr = _safe_float(atr_series.iloc[-1], price * 0.02)
