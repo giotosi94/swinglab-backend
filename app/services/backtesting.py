@@ -4,7 +4,9 @@ Include: APM Adaptive Targets, Scale-Out multi-target, Break-even SL,
 Trailing stops, gestione posizioni realistica.
 """
 
+import asyncio
 import numpy as np
+from array import array
 from datetime import datetime
 from app.db.mongodb import get_db
 
@@ -473,6 +475,256 @@ def _trend_exit_signal(bars_slice):
     return closes[-1] < _calc_ema(closes, 50)
 
 
+def _prefix_ema(values, period):
+    n = len(values)
+    out = array("d", [0.0]) * (n + 1)
+    for m in range(1, min(period, n + 1)):
+        out[m] = values[m - 1]
+    if n >= period:
+        k = 2 / (period + 1)
+        ema = np.mean(values[:period])
+        out[period] = ema
+        for m in range(period + 1, n + 1):
+            ema = values[m - 1] * k + ema * (1 - k)
+            out[m] = ema
+    return out
+
+
+def _prefix_max(values):
+    out = []
+    current = None
+    for value in values:
+        current = value if current is None or value > current else current
+        out.append(current)
+    return out
+
+
+def _build_series(bars):
+    closes = [b["c"] for b in bars]
+    highs = [b["h"] for b in bars]
+    lows = [b["l"] for b in bars]
+    volumes = [b["v"] for b in bars]
+    weekly = closes[4::5]
+    first_idx = {}
+    for i, b in enumerate(bars):
+        first_idx.setdefault(b["date"], i)
+    return {
+        "c": closes,
+        "h": highs,
+        "l": lows,
+        "v": volumes,
+        "ema10": _prefix_ema(closes, 10),
+        "ema20": _prefix_ema(closes, 20),
+        "ema50": _prefix_ema(closes, 50),
+        "high_max": _prefix_max(highs),
+        "weekly": weekly,
+        "wema10": _prefix_ema(weekly, 10),
+        "wema20": _prefix_ema(weekly, 20),
+        "wema50": _prefix_ema(weekly, 50),
+        "weekly_cache": {},
+        "first_idx": first_idx,
+    }
+
+
+def _fast_weekly_trend(series, idx):
+    n = idx + 1
+    if n < 60:
+        return "UNKNOWN", "flat"
+    n_w = len(range(4, n, 5))
+    cache = series["weekly_cache"]
+    if n_w in cache:
+        return cache[n_w]
+    if n_w < 12:
+        result = ("UNKNOWN", "flat")
+        cache[n_w] = result
+        return result
+    weekly = series["weekly"]
+    wprice = weekly[n_w - 1]
+    wema10 = series["wema10"][n_w]
+    wema20 = series["wema20"][n_w]
+    if n_w >= 50:
+        wema50 = series["wema50"][n_w]
+    else:
+        wema50 = _calc_ema(weekly[:n_w], n_w)
+    wema20_prev = series["wema20"][n_w - 4] if n_w > 24 else wema20
+    if wema20 > wema20_prev * 1.005:
+        slope = "rising"
+    elif wema20 < wema20_prev * 0.995:
+        slope = "falling"
+    else:
+        slope = "flat"
+    if wprice > wema10 > wema20 > wema50 and wema50 > 0:
+        trend = "BULL"
+    elif wprice > wema20 > wema50 and wema50 > 0:
+        trend = "BULL"
+    elif wprice > wema50 and wema50 > 0:
+        trend = "NEUTRAL"
+    elif wprice > wema20:
+        trend = "NEUTRAL"
+    else:
+        trend = "BEAR"
+    result = (trend, slope)
+    cache[n_w] = result
+    return result
+
+
+def _fast_confluence_and_target(series, idx, use_mtf=True, use_momentum=True):
+    n = idx + 1
+    if n < 50:
+        return 0, 0, 0, "none"
+    closes = series["c"]
+    highs = series["h"]
+    lows = series["l"]
+    volumes = series["v"]
+    price = closes[idx]
+    rsi = _calc_rsi(closes[max(0, n - 15):n]) if n >= 15 else 50.0
+    ema10 = series["ema10"][n]
+    ema20 = series["ema20"][n]
+    ema50 = series["ema50"][n]
+    avg_vol = np.mean(volumes[max(0, n - 20):n])
+    rel_vol = volumes[idx] / avg_vol if avg_vol > 0 else 1
+    ret_20d = ((price - closes[n - 21]) / closes[n - 21] * 100) if n >= 21 else 0
+    atr_period = 14
+    trs = []
+    for i in range(max(1, n - atr_period), n):
+        tr = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i-1]),
+            abs(lows[i] - closes[i-1]),
+        )
+        trs.append(tr)
+    atr = np.mean(trs) if trs else price * 0.02
+    atr_pct = (atr / price * 100) if price > 0 else 2.0
+    score = 0
+    if price > ema10 > ema20 > ema50:
+        score += 25
+    elif price > ema20 > ema50:
+        score += 15
+    elif price > ema50:
+        score += 5
+    if 40 <= rsi <= 60:
+        score += 20
+    elif 30 <= rsi < 40:
+        score += 12
+    elif rsi < 30:
+        score += 8
+    if ret_20d > 5:
+        score += 15
+    elif ret_20d > 0:
+        score += 8
+    if rel_vol >= 1.5:
+        score += 15
+    elif rel_vol >= 1.0:
+        score += 8
+    if closes[idx] > closes[n - 5]:
+        score += 10
+    wtrend, wslope = _fast_weekly_trend(series, idx) if use_mtf else ("UNKNOWN", "flat")
+    if wtrend == "BULL" and wslope == "rising":
+        score += 12
+    elif wtrend == "BULL":
+        score += 7
+    elif wtrend == "NEUTRAL":
+        score += 2
+    elif wtrend == "BEAR":
+        score -= 10
+    if use_momentum:
+        if 55 <= rsi <= 70:
+            score += 10
+        elif 70 < rsi <= 78:
+            score += 5
+        if ret_20d > 10:
+            score += 10
+        elif ret_20d > 5:
+            score += 5
+        high_all = series["high_max"][idx]
+        pfh = (price - high_all) / high_all * 100 if high_all > 0 else -50
+        if pfh > -3:
+            score += 8
+        elif pfh > -8:
+            score += 4
+    score = max(0, min(score, 100))
+    if price > ema10 > ema20 > ema50:
+        setup = "breakout"
+    elif abs(price - ema20) / price < 0.02:
+        setup = "ema_bounce"
+    elif rsi < 40:
+        setup = "pullback_to_poc"
+    else:
+        setup = "neutral"
+    target_multiplier = {
+        "breakout": 4.0,
+        "ema_bounce": 3.0,
+        "pullback_to_poc": 3.5,
+        "neutral": 3.0,
+    }.get(setup, 3.0)
+    target_distance_pct = min(40, max(4, atr_pct * target_multiplier))
+    sl_distance_pct = min(12, max(3, atr_pct * 1.5))
+    target_price = price * (1 + target_distance_pct / 100)
+    stop_price = price * (1 - sl_distance_pct / 100)
+    return score, target_price, stop_price, setup
+
+
+def _fast_trend_leadership_signal(series, idx, spy_closes_upto, weekly_trend, params):
+    n = idx + 1
+    if n < 130 or len(spy_closes_upto) < 130:
+        return None
+    if weekly_trend != "BULL":
+        return None
+    start = max(0, n - 260)
+    closes = series["c"][start:n]
+    highs = series["h"][start:n]
+    price = closes[-1]
+    if price <= 0:
+        return None
+    pct_from_high = (price / max(highs) - 1) * 100
+    if pct_from_high < -params["max_from_high_pct"]:
+        return None
+    day_change = (price / closes[-2] - 1) * 100 if closes[-2] else 0
+    if day_change > params["max_day_change_pct"]:
+        return None
+    rsi = _calc_rsi(closes[-15:])
+    if rsi > params["max_rsi"]:
+        return None
+    window = closes[-120:]
+    ema20 = _calc_ema(window, 20)
+    ema50 = _calc_ema(window, 50)
+    if not (price > ema20 > ema50):
+        return None
+    lows = series["l"][start:n]
+    trs = [
+        max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1]))
+        for i in range(len(closes) - 14, len(closes))
+    ]
+    atr = float(np.mean(trs)) if trs else price * 0.02
+    atr_pct = atr / price * 100
+    if (price - ema20) > params["max_atr_above_ema20"] * atr:
+        return None
+    lookback = params["rs_lookback"]
+    stock_ret = price / closes[-(lookback + 1)] - 1
+    spy_ret = spy_closes_upto[-1] / spy_closes_upto[-(lookback + 1)] - 1
+    rs_excess = (stock_ret - spy_ret) * 100
+    if rs_excess <= params["min_rs_excess_pct"]:
+        return None
+    stop_distance_pct = min(12.0, max(3.0, max(atr_pct * 2.0, (price - ema50) / price * 100)))
+    target_distance_pct = min(40.0, max(8.0, atr_pct * 4.0))
+    return {
+        "score": round(rs_excess, 2),
+        "entry_price": price,
+        "target_price": price * (1 + target_distance_pct / 100),
+        "stop_price": price * (1 - stop_distance_pct / 100),
+        "rsi": rsi,
+        "pct_from_high": round(pct_from_high, 2),
+    }
+
+
+def _bar_on(ticker_series, ticker_bars, ticker, date):
+    series = ticker_series.get(ticker)
+    if series is None:
+        return None
+    i = series["first_idx"].get(date)
+    return ticker_bars[ticker][i] if i is not None else None
+
+
 def _calc_metrics(equity_curve, trades):
     if len(equity_curve) < 2:
         return {}
@@ -677,7 +929,7 @@ async def run_backtest(
     - Rotazione settoriale disattivata di default e solo testabile in isolamento
     """
     db = get_db()
-    all_bars = await db.stock_bars.find({}).to_list(300)
+    all_bars = await db.stock_bars.find({}, {"ticker": 1, "bars": 1}).to_list(300)
     if not all_bars:
         return {"error": "No stock_bars data available"}
 
@@ -723,6 +975,8 @@ async def run_backtest(
     date_idx_map = {}
     for tk, bars in ticker_bars.items():
         date_idx_map[tk] = {b["date"]: i for i, b in enumerate(bars)}
+    del all_bars
+    ticker_series = {tk: _build_series(bars) for tk, bars in ticker_bars.items()}
     sector_bottom_cache = {}   # date -> {sector: weight}
     sector_bottom_hits = {}    # sector -> count (debug)
     # 🆕 Mappa settore -> ETF (per rotazione: gli ETF devono essere in ticker_bars)
@@ -784,7 +1038,9 @@ async def run_backtest(
     park_buys = 0
     last_spy_close = None
 
-    for date in backtest_dates:
+    for day_number, date in enumerate(backtest_dates):
+        if day_number % 3 == 0:
+            await asyncio.sleep(0)
         # ===== 0. CRASH DEPLOY a FETTE progressive (Progetto Alpha) =====
         # Entry scalato: più il mercato crolla, più carichi. Libera capitale dallo
         # swing per avere munizioni. Tiene fino al massimo precedente, poi lascia
@@ -815,8 +1071,7 @@ async def run_backtest(
                         # libera ~50% dello swing (chiudi metà posizioni al prezzo corrente)
                         for tk in list(positions.keys()):
                             p = positions[tk]
-                            bars_p = ticker_bars.get(tk, [])
-                            bp = next((b for b in bars_p if b["date"] == date), None)
+                            bp = _bar_on(ticker_series, ticker_bars, tk, date)
                             px = bp["c"] if bp else p.get("last_price", p["entry_price"])
                             freed = px * p["shares"] * 0.5
                             cash += freed
@@ -860,7 +1115,7 @@ async def run_backtest(
         for ticker in list(positions.keys()):
             pos = positions[ticker]
             bars = ticker_bars.get(ticker, [])
-            bar = next((b for b in bars if b["date"] == date), None)
+            bar = _bar_on(ticker_series, ticker_bars, ticker, date)
             if not bar:
                 continue
 
@@ -1062,14 +1317,15 @@ async def run_backtest(
                 idx = date_idx_map.get(ticker, {}).get(date)
                 if idx is None or idx < 50:
                     continue
-                bars_slice = bars[:idx + 1]
-                _wt, _ws = _weekly_trend_bt(bars_slice)
+                series = ticker_series[ticker]
+                _wt, _ws = _fast_weekly_trend(series, idx)
                 mtf_debug[_wt] = mtf_debug.get(_wt, 0) + 1
                 if trend_active_today:
-                    trend_signal = _trend_leadership_signal(bars_slice, spy_upto_today, _wt, trend_params)
+                    trend_signal = _fast_trend_leadership_signal(series, idx, spy_upto_today, _wt, trend_params)
                     if trend_signal:
                         trend_candidates.append((ticker, trend_signal))
-                conf, target_price, stop_price, setup = _confluence_and_target(bars_slice, use_mtf=use_mtf, use_momentum=use_momentum)
+                conf, target_price, stop_price, setup = _fast_confluence_and_target(series, idx, use_mtf=use_mtf, use_momentum=use_momentum)
+                entry_close = series["c"][idx]
 
                 # 🆕 SECTOR BOTTOM BOOST
                 sec = ticker_to_sector.get(ticker)
@@ -1098,7 +1354,7 @@ async def run_backtest(
                 if use_sector_intelligence and confluence_before_sector >= min_confluence > conf:
                     sector_intelligence_penalized_out += 1
                 if conf >= min_confluence:
-                    entry_price = bars_slice[-1]["c"]
+                    entry_price = entry_close
                     candidates.append((ticker, conf, entry_price, target_price, stop_price, setup, sec_weight, confluence_before_sector, sector_adjustment, sector_signal))
             candidates.sort(key=lambda x: x[1], reverse=True)
             slots = max_positions - len(positions)
@@ -1233,8 +1489,7 @@ async def run_backtest(
         # ===== 3. EQUITY =====
         positions_value = 0
         for ticker, pos in positions.items():
-            bars = ticker_bars.get(ticker, [])
-            bar = next((b for b in bars if b["date"] == date), None)
+            bar = _bar_on(ticker_series, ticker_bars, ticker, date)
             if bar:
                 positions_value += bar["c"] * pos["shares"]
                 pos["last_price"] = bar["c"]
@@ -1266,8 +1521,7 @@ async def run_backtest(
     # Chiudi posizioni residue
     last_date = backtest_dates[-1]
     for ticker, pos in positions.items():
-        bars = ticker_bars.get(ticker, [])
-        bar = next((b for b in bars if b["date"] == last_date), None)
+        bar = _bar_on(ticker_series, ticker_bars, ticker, last_date)
         exit_price = bar["c"] if bar else pos.get("last_price", pos["entry_price"])
         pnl_pct = (exit_price - pos["entry_price"]) / pos["entry_price"] * 100
         pnl_d = (exit_price - pos["entry_price"]) * pos["shares"]
@@ -1293,7 +1547,7 @@ async def run_backtest(
         # ricalcola l'ultimo punto equity col cash aggiornato
         if equity_curve:
             equity_curve[-1]["equity"] = round(cash + sum(
-                (next((b["c"] for b in ticker_bars.get(tk, []) if b["date"] == backtest_dates[-1]),
+                ((_bar_on(ticker_series, ticker_bars, tk, backtest_dates[-1]) or {}).get("c",
                       p.get("last_price", p["entry_price"])) * p["shares"])
                 for tk, p in positions.items()
             ), 2) if positions else round(cash, 2)
