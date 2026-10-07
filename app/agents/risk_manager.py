@@ -43,6 +43,9 @@ class RiskManager(BaseAgent):
             "max_live_enabled": False,
             "max_live_slots": 4,
             "max_min_risk_reward": 1.0,
+            "trend_live_enabled": False,
+            "trend_live_slots": 4,
+            "trend_min_risk_reward": 0.0,
         }
 
     async def _check_loss_limits(self, account: dict, params: dict) -> dict:
@@ -393,18 +396,27 @@ class RiskManager(BaseAgent):
         max_live_enabled = bool(params.get("max_live_enabled", False))
         max_live_slots = int(params.get("max_live_slots", 4)) if max_live_enabled else 0
         max_min_rr = float(params.get("max_min_risk_reward", 1.0))
+        trend_live_enabled = bool(params.get("trend_live_enabled", False))
+        trend_live_slots = int(params.get("trend_live_slots", 4)) if trend_live_enabled else 0
+        trend_min_rr = float(params.get("trend_min_risk_reward", 0.0))
         
         db = get_db()
         open_symbols = [p.get("symbol") for p in positions if p.get("symbol")]
         open_max_positions = 0
+        open_trend_positions = 0
         if open_symbols:
             open_max_tickers = await db.trade_history.distinct(
                 "ticker",
                 {"side": "buy", "channel": "MAX", "sell_linked": {"$ne": True}, "ticker": {"$in": open_symbols}},
             )
             open_max_positions = len(open_max_tickers)
-        open_alpha_positions = num_positions - open_max_positions
-        alpha_position_limit = max(0, max_positions - max_live_slots)
+            open_trend_tickers = await db.trade_history.distinct(
+                "ticker",
+                {"side": "buy", "channel": "TREND", "sell_linked": {"$ne": True}, "ticker": {"$in": open_symbols}},
+            )
+            open_trend_positions = len(open_trend_tickers)
+        open_alpha_positions = num_positions - open_max_positions - open_trend_positions
+        alpha_position_limit = max(0, max_positions - max_live_slots - trend_live_slots)
         assets_all = await db.assets.find({}, {"ticker": 1, "sector_code": 1}).to_list(300)
         ticker_to_sector = {a["ticker"]: a.get("sector_code", "UNKNOWN") for a in assets_all}
         sector_exposure = {}
@@ -476,8 +488,10 @@ class RiskManager(BaseAgent):
                 sector = c.get("sector", "UNKNOWN")
                 rr = c.get("risk_reward", 0)
                 is_max = c.get("channel") == "MAX"
+                is_trend = c.get("channel") == "TREND"
                 approved_max = sum(1 for t in approved_trades if t.get("channel") == "MAX")
-                approved_alpha = len(approved_trades) - approved_max
+                approved_trend = sum(1 for t in approved_trades if t.get("channel") == "TREND")
+                approved_alpha = len(approved_trades) - approved_max - approved_trend
                 
                 if num_positions + len(approved_trades) >= max_positions:
                     rejected_trades.append({**c, "reason": "Max positions reached"})
@@ -489,15 +503,22 @@ class RiskManager(BaseAgent):
                     if open_max_positions + approved_max >= max_live_slots:
                         rejected_trades.append({**c, "reason": f"Max slots full ({max_live_slots})"})
                         continue
-                elif max_live_enabled and open_alpha_positions + approved_alpha >= alpha_position_limit:
-                    rejected_trades.append({**c, "reason": f"Alpha slots full ({alpha_position_limit}, {max_live_slots} riservati a Max)"})
+                elif is_trend:
+                    if not trend_live_enabled:
+                        rejected_trades.append({**c, "reason": "Trend live disabled"})
+                        continue
+                    if open_trend_positions + approved_trend >= trend_live_slots:
+                        rejected_trades.append({**c, "reason": f"Trend slots full ({trend_live_slots})"})
+                        continue
+                elif (max_live_enabled or trend_live_enabled) and open_alpha_positions + approved_alpha >= alpha_position_limit:
+                    rejected_trades.append({**c, "reason": f"Alpha slots full ({alpha_position_limit}, {max_live_slots} Max + {trend_live_slots} Trend riservati)"})
                     continue
                 current_sector_count = sector_exposure.get(sector, 0)
                 approved_sector_count = sum(1 for t in approved_trades if t.get("sector") == sector)
                 if current_sector_count + approved_sector_count >= max_per_sector:
                     rejected_trades.append({**c, "reason": f"Sector {sector} full ({max_per_sector})"})
                     continue
-                required_rr = max_min_rr if is_max else min_rr
+                required_rr = max_min_rr if is_max else trend_min_rr if is_trend else min_rr
                 if rr < required_rr:
                     rejected_trades.append({**c, "reason": f"R/R too low: {rr} < {required_rr}"})
                     continue
@@ -614,6 +635,12 @@ class RiskManager(BaseAgent):
             "total_exposure_pct": round(((total_market_value + new_exposure) / equity) * 100, 1) if equity > 0 else 0,
             "sector_exposure": sector_exposure,
             "current_positions": num_positions,
+            "trend_live": {
+                "enabled": trend_live_enabled,
+                "slots": trend_live_slots,
+                "open_trend_positions": open_trend_positions,
+                "approved_trend": [t["ticker"] for t in approved_trades if t.get("channel") == "TREND"],
+            },
             "max_live": {
                 "enabled": max_live_enabled,
                 "slots": max_live_slots,
