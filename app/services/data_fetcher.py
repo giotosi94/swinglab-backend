@@ -9,6 +9,7 @@ import traceback
 import time
 from app.services.max_strategy import analyze_max_strategy
 from app.services.max_plan_lifecycle import sync_max_plan, expire_plans_for_stale, mark_legacy_max_signals
+from app.services.cycle_history import CycleBudget, get_cycle_contexts, get_cycle_coverage
 
 SECTOR_MAP = {
     "XLK": "Technology", "XLF": "Financials", "XLV": "Health Care",
@@ -1346,6 +1347,7 @@ async def fetch_and_analyze_stocks(force=False):
 
     batch_size = 20
     results = []
+    cycle_budget = CycleBudget()
 
     async with httpx.AsyncClient(timeout=30) as client:
         for batch_num in range(0, total, batch_size):
@@ -1357,6 +1359,16 @@ async def fetch_and_analyze_stocks(force=False):
 
             bars_map = await get_or_fetch_bars_batch(client, db, batch, max_concurrent=10)
             bars_4h_map = await get_or_fetch_4h_bars_batch(client, db, batch, max_concurrent=6)
+            batch_prices = {
+                ticker: float(frame["Close"].iloc[-1])
+                for ticker, frame in bars_map.items()
+                if frame is not None and len(frame)
+            }
+            try:
+                cycle_map = await get_cycle_contexts(client, db, batch, batch_prices, cycle_budget)
+            except Exception as error:
+                print(f"  Cycle context error: {error}")
+                cycle_map = {}
 
             success = 0; skipped = 0; stale = 0
             for ticker in batch:
@@ -1374,6 +1386,7 @@ async def fetch_and_analyze_stocks(force=False):
                 prev_pos = (prev_doc or {}).get("poc_shift", {}).get("poc_position")
                 asset_doc = analyze_stock(ticker, df, sector_code, sector_scores, prev_poc_position=prev_pos, df_4h=bars_4h_map.get(ticker))
                 if asset_doc:
+                    asset_doc["cycle_context"] = cycle_map.get(ticker)
                     await db.assets.update_one({"ticker": ticker}, {"$set": asset_doc}, upsert=True)
                     await sync_max_plan(db, asset_doc, df)
                     results.append(asset_doc)
@@ -1391,6 +1404,16 @@ async def fetch_and_analyze_stocks(force=False):
         print(f"  Average: {elapsed/len(results):.2f}s per stock")
     first_run_count = await db.stock_bars.count_documents({})
     print(f"  Bars in MongoDB: {first_run_count} stocks cached")
+    try:
+        coverage = await get_cycle_coverage(db)
+        print(
+            f"  Cycle history: {cycle_budget.fetched} aggiornati "
+            f"({cycle_budget.full} completi, {cycle_budget.incremental} incrementali, {cycle_budget.errors} errori) | "
+            f"copertura {coverage['tickers_with_cycle']}/{total} | anni min {coverage['years_min']} "
+            f"mediana {coverage['years_median']} max {coverage['years_max']}"
+        )
+    except Exception as error:
+        print(f"  Cycle coverage error: {error}")
     try:
         from app.routes.sectors import rebuild_sector_bottom_breadth
         breadth_start = time.time()
