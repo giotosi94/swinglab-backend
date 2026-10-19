@@ -84,6 +84,57 @@ ALPACA_HEADERS = {
 ALPACA_DATA_URL = "https://data.alpaca.markets"
 MAX_STORED_BARS = 1000
 MAX_STALE_CALENDAR_DAYS = 7
+BARS_REPAIR_VERSION = 1
+_BARS_REPAIR = {"remaining": 0, "repaired": 0, "errors": 0}
+
+
+def start_bars_repair_budget(budget):
+    _BARS_REPAIR["remaining"] = int(budget)
+    _BARS_REPAIR["repaired"] = 0
+    _BARS_REPAIR["errors"] = 0
+
+
+def _bar_from_raw(raw):
+    return {
+        "date": str(raw.get("t", ""))[:10],
+        "o": raw.get("o"), "h": raw.get("h"), "l": raw.get("l"), "c": raw.get("c"), "v": raw.get("v", 0),
+    }
+
+
+def _bar_changed(old, new):
+    for key in ("o", "h", "l", "c", "v"):
+        a = old.get(key)
+        b = new.get(key)
+        if a is None or b is None:
+            if a != b:
+                return True
+            continue
+        if abs(float(a) - float(b)) > 1e-9:
+            return True
+    return False
+
+
+def _merge_recent_bars(existing, fetched_raw):
+    index_by_date = {bar.get("date"): i for i, bar in enumerate(existing) if bar.get("date")}
+    changed = {}
+    appended = []
+    inserted_in_middle = False
+    last_date = existing[-1].get("date", "") if existing else ""
+    for raw in fetched_raw:
+        bar = _bar_from_raw(raw)
+        if not bar["date"]:
+            continue
+        position = index_by_date.get(bar["date"])
+        if position is not None:
+            if _bar_changed(existing[position], bar):
+                changed[position] = bar
+        elif bar["date"] > last_date:
+            appended.append(bar)
+        else:
+            inserted_in_middle = True
+            appended.append(bar)
+    appended.sort(key=lambda item: item["date"])
+    return changed, appended, inserted_in_middle
 LEGACY_TICKERS = ["CTRA", "SQ", "SEE", "EA", "MRO", "AVB", "MMC"]
 
 
@@ -629,8 +680,44 @@ async def _fetch_bars_alpaca(client, symbol, limit=252):
         return []
 
 
+async def _repair_bars_history(client, db, symbol, doc):
+    try:
+        fetched = await fetch_long_history_symbol(client, symbol, MAX_STORED_BARS)
+    except Exception as error:
+        _BARS_REPAIR["errors"] += 1
+        print(f"  Bars repair error {symbol}: {error}")
+        return None
+    if not fetched:
+        _BARS_REPAIR["errors"] += 1
+        return None
+    merged = {bar["date"]: bar for bar in doc.get("bars", []) if bar.get("date")}
+    merged.update({bar["date"]: bar for bar in fetched if bar.get("date")})
+    bars = sorted(merged.values(), key=lambda item: item["date"])[-MAX_STORED_BARS:]
+    await db.stock_bars.update_one(
+        {"ticker": symbol},
+        {"$set": {
+            "bars": bars,
+            "last_bar_date": bars[-1]["date"],
+            "bars_repair_version": BARS_REPAIR_VERSION,
+            "bars_repaired_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow(),
+        }},
+    )
+    _BARS_REPAIR["repaired"] += 1
+    return bars
+
+
 async def get_or_fetch_bars(client, db, symbol):
     doc = await db.stock_bars.find_one({"ticker": symbol})
+    if (
+        doc and doc.get("bars")
+        and doc.get("bars_repair_version") != BARS_REPAIR_VERSION
+        and _BARS_REPAIR["remaining"] > 0
+    ):
+        _BARS_REPAIR["remaining"] -= 1
+        repaired = await _repair_bars_history(client, db, symbol, doc)
+        if repaired:
+            return _bars_to_df(repaired)
 
     if doc and doc.get("bars") and len(doc["bars"]) >= 20:
         # Recency dell'ultima barra salvata
@@ -655,24 +742,33 @@ async def get_or_fetch_bars(client, db, symbol):
         # Altrimenti fetch fresh e merge (fetch_bars_from_api ora ritorna le barre recenti)
         new_bars_raw = await fetch_bars_from_api(client, symbol, limit=90)
         if new_bars_raw:
-            existing_dates = {b["date"] for b in doc["bars"]}
-            new_bars = []
-            for b in new_bars_raw:
-                bar_date = b["t"][:10]
-                if bar_date not in existing_dates:
-                    new_bars.append({
-                        "date": bar_date,
-                        "o": b["o"], "h": b["h"], "l": b["l"], "c": b["c"], "v": b["v"],
-                    })
-            if new_bars:
-                all_bars = doc["bars"] + new_bars
-                all_bars.sort(key=lambda x: x["date"])
+            existing = doc["bars"]
+            changed, appended, inserted_in_middle = _merge_recent_bars(existing, new_bars_raw)
+            if changed or appended:
+                all_bars = list(existing)
+                for position, bar in changed.items():
+                    all_bars[position] = bar
+                all_bars.extend(appended)
+                if inserted_in_middle:
+                    all_bars.sort(key=lambda x: x["date"])
                 all_bars = all_bars[-MAX_STORED_BARS:]
                 last_bar = all_bars[-1]["date"]
-                await db.stock_bars.update_one(
-                    {"ticker": symbol},
-                    {"$set": {"bars": all_bars, "last_bar_date": last_bar, "updated_at": datetime.utcnow()}}
-                )
+                now = datetime.utcnow()
+                if inserted_in_middle:
+                    await db.stock_bars.update_one(
+                        {"ticker": symbol},
+                        {"$set": {"bars": all_bars, "last_bar_date": last_bar, "updated_at": now}}
+                    )
+                else:
+                    if changed:
+                        await db.stock_bars.update_one(
+                            {"ticker": symbol},
+                            {"$set": {f"bars.{position}": bar for position, bar in changed.items()}}
+                        )
+                    update = {"$set": {"last_bar_date": last_bar, "updated_at": now}}
+                    if appended:
+                        update["$push"] = {"bars": {"$each": appended, "$slice": -MAX_STORED_BARS}}
+                    await db.stock_bars.update_one({"ticker": symbol}, update)
                 return _bars_to_df(all_bars)
 
         # Nessuna barra nuova: aggiorna solo il timestamp per non martellare l'API
@@ -1142,6 +1238,7 @@ async def fetch_and_analyze_sectors(force=False):
     print("SECTORS REFRESH (Incremental)")
     print("=" * 50)
 
+    start_bars_repair_budget(30)
     async with httpx.AsyncClient(timeout=30) as client:
         all_syms = [
             "SPY", "QQQ", "IWM", "DIA", "FXE", "UUP",
@@ -1348,6 +1445,7 @@ async def fetch_and_analyze_stocks(force=False):
     batch_size = 20
     results = []
     cycle_budget = CycleBudget()
+    start_bars_repair_budget(60)
 
     async with httpx.AsyncClient(timeout=30) as client:
         for batch_num in range(0, total, batch_size):
@@ -1404,6 +1502,11 @@ async def fetch_and_analyze_stocks(force=False):
         print(f"  Average: {elapsed/len(results):.2f}s per stock")
     first_run_count = await db.stock_bars.count_documents({})
     print(f"  Bars in MongoDB: {first_run_count} stocks cached")
+    repaired_total = await db.stock_bars.count_documents({"bars_repair_version": BARS_REPAIR_VERSION})
+    print(
+        f"  Bars repair v{BARS_REPAIR_VERSION}: {_BARS_REPAIR['repaired']} riparati in questa pipeline, "
+        f"{_BARS_REPAIR['errors']} errori | totale {repaired_total}/{first_run_count}"
+    )
     try:
         coverage = await get_cycle_coverage(db)
         print(
