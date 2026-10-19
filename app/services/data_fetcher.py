@@ -84,7 +84,8 @@ ALPACA_HEADERS = {
 ALPACA_DATA_URL = "https://data.alpaca.markets"
 MAX_STORED_BARS = 1000
 MAX_STALE_CALENDAR_DAYS = 7
-BARS_REPAIR_VERSION = 1
+BARS_REPAIR_VERSION = 2
+DATA_FEEDS = ("sip", "iex")
 _BARS_REPAIR = {"remaining": 0, "repaired": 0, "errors": 0}
 
 
@@ -199,28 +200,38 @@ async def fetch_long_history_symbol(client, symbol, target_bars=750):
     end = datetime.utcnow() - timedelta(minutes=20)
     start = end - timedelta(days=int(target_bars * 1.75) + 120)
     url = f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/bars"
-    page_token = None
     raw_bars = []
-    while True:
-        params = {
-            "timeframe": "1Day",
-            "start": start.strftime("%Y-%m-%dT00:00:00Z"),
-            "end": end.strftime("%Y-%m-%dT23:59:59Z"),
-            "limit": min(10000, target_bars + 100),
-            "feed": "iex",
-            "adjustment": "split",
-            "sort": "asc",
-        }
-        if page_token:
-            params["page_token"] = page_token
-        response = await client.get(url, headers=ALPACA_HEADERS, params=params)
-        if response.status_code != 200:
-            raise RuntimeError(f"Alpaca {response.status_code}: {response.text[:200]}")
-        payload = response.json()
-        raw_bars.extend(payload.get("bars", []))
-        page_token = payload.get("next_page_token")
-        if not page_token or len(raw_bars) >= target_bars:
+    last_error = None
+    for feed in DATA_FEEDS:
+        page_token = None
+        raw_bars = []
+        failed = False
+        while True:
+            params = {
+                "timeframe": "1Day",
+                "start": start.strftime("%Y-%m-%dT00:00:00Z"),
+                "end": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "limit": min(10000, target_bars + 100),
+                "feed": feed,
+                "adjustment": "split",
+                "sort": "asc",
+            }
+            if page_token:
+                params["page_token"] = page_token
+            response = await client.get(url, headers=ALPACA_HEADERS, params=params)
+            if response.status_code != 200:
+                last_error = f"Alpaca {feed} {response.status_code}: {response.text[:200]}"
+                failed = True
+                break
+            payload = response.json()
+            raw_bars.extend(payload.get("bars", []))
+            page_token = payload.get("next_page_token")
+            if not page_token or len(raw_bars) >= target_bars:
+                break
+        if not failed and raw_bars:
             break
+    if not raw_bars and last_error:
+        raise RuntimeError(last_error)
     normalized = {}
     for bar in raw_bars:
         date = str(bar.get("t", ""))[:10]
@@ -607,22 +618,24 @@ async def fetch_bars_from_api(client, symbol, limit=252):
     params = {
         "timeframe": "1Day",
         "start": start.strftime("%Y-%m-%dT00:00:00Z"),
-        "end": end.strftime("%Y-%m-%dT23:59:59Z"),
+        "end": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "limit": limit,
-        "feed": "iex",
+        "feed": "sip",
         "adjustment": "split",
         "sort": "desc",
     }
-    try:
-        r = await client.get(url, headers=ALPACA_HEADERS, params=params)
-        if r.status_code == 200:
-            data = r.json()
-            bars = data.get("bars", [])
-            if bars:
-                bars.reverse()  # desc -> cronologico (il resto del codice assume ascendente)
-                return bars
-    except Exception as e:
-        print(f"  Alpaca error {symbol}: {e}")
+    for feed in DATA_FEEDS:
+        params["feed"] = feed
+        try:
+            r = await client.get(url, headers=ALPACA_HEADERS, params=params)
+            if r.status_code == 200:
+                data = r.json()
+                bars = data.get("bars", [])
+                if bars:
+                    bars.reverse()
+                    return bars
+        except Exception as e:
+            print(f"  Alpaca {feed} error {symbol}: {e}")
 
     # Fallback: Twelve Data (solo se Alpaca fallisce)
     try:
@@ -662,22 +675,25 @@ async def _fetch_bars_alpaca(client, symbol, limit=252):
     params = {
         "timeframe": "1Day",
         "start": start.strftime("%Y-%m-%dT00:00:00Z"),
-        "end": end.strftime("%Y-%m-%dT23:59:59Z"),
+        "end": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "limit": limit,
-        "feed": "iex",
+        "feed": "sip",
         "adjustment": "split",
         "sort": "desc",
     }
-    try:
-        r = await client.get(url, headers=ALPACA_HEADERS, params=params)
-        if r.status_code != 200:
-            return []
-        data = r.json()
-        bars = data.get("bars", [])
-        bars.reverse()  # desc -> cronologico
-        return bars
-    except Exception:
-        return []
+    for feed in DATA_FEEDS:
+        params["feed"] = feed
+        try:
+            r = await client.get(url, headers=ALPACA_HEADERS, params=params)
+            if r.status_code != 200:
+                continue
+            bars = r.json().get("bars", [])
+            if bars:
+                bars.reverse()
+                return bars
+        except Exception:
+            continue
+    return []
 
 
 async def _repair_bars_history(client, db, symbol, doc):
@@ -832,17 +848,23 @@ async def fetch_4h_bars_from_api(client, symbol, limit=240):
     params = {
         "timeframe": "4Hour",
         "start": start.strftime("%Y-%m-%dT00:00:00Z"),
-        "end": end.strftime("%Y-%m-%dT23:59:59Z"),
+        "end": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "limit": min(1000, limit),
-        "feed": "iex",
+        "feed": "sip",
         "adjustment": "split",
         "sort": "desc",
     }
     try:
-        response = await client.get(url, headers=ALPACA_HEADERS, params=params)
-        if response.status_code != 200:
+        bars = []
+        for feed in DATA_FEEDS:
+            params["feed"] = feed
+            response = await client.get(url, headers=ALPACA_HEADERS, params=params)
+            if response.status_code == 200:
+                bars = response.json().get("bars", [])
+                if bars:
+                    break
+        if not bars:
             return []
-        bars = response.json().get("bars", [])
         bars.reverse()
         return [{
             "datetime": bar.get("t"),
@@ -855,7 +877,7 @@ async def fetch_4h_bars_from_api(client, symbol, limit=240):
 
 async def get_or_fetch_4h_bars(client, db, symbol, limit=240):
     doc = await db.stock_bars_4h.find_one({"ticker": symbol})
-    if doc and doc.get("bars"):
+    if doc and doc.get("bars") and doc.get("feed_version") == BARS_REPAIR_VERSION:
         updated = doc.get("updated_at")
         if updated and (datetime.utcnow() - updated).total_seconds() < 4 * 3600:
             return _bars_4h_to_df(doc["bars"])
@@ -863,7 +885,7 @@ async def get_or_fetch_4h_bars(client, db, symbol, limit=240):
     if bars:
         await db.stock_bars_4h.update_one(
             {"ticker": symbol},
-            {"$set": {"ticker": symbol, "timeframe": "4H", "bars": bars, "updated_at": datetime.utcnow()}},
+            {"$set": {"ticker": symbol, "timeframe": "4H", "bars": bars, "feed_version": BARS_REPAIR_VERSION, "updated_at": datetime.utcnow()}},
             upsert=True,
         )
         return _bars_4h_to_df(bars)
@@ -1445,7 +1467,7 @@ async def fetch_and_analyze_stocks(force=False):
     batch_size = 20
     results = []
     cycle_budget = CycleBudget()
-    start_bars_repair_budget(60)
+    start_bars_repair_budget(80)
 
     async with httpx.AsyncClient(timeout=30) as client:
         for batch_num in range(0, total, batch_size):
