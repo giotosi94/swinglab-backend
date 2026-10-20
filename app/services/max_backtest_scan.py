@@ -1,12 +1,15 @@
 import asyncio
-from datetime import datetime
+import bisect
+from datetime import datetime, timedelta
 
 import pandas as pd
 
 from app.db.mongodb import get_db
 from app.services.max_strategy import analyze_max_strategy
+from app.services.cycle_history import compute_cycle_static, cycle_position
 
-SCAN_VERSION = "max_structure_v1_5_2"
+SCAN_VERSION = "max_structure_v1_6_0"
+SCAN_GATES = {"apply_upper_block": False, "allow_rounding_exemption": True, "min_headroom_atr": 0.0}
 TRACKED_STATUSES = ("ARMED", "TRIGGERED", "CONFIRMED_4H", "CONFIRMED_DAILY", "WAIT_RETEST")
 REFERENCE_TICKERS = {"SPY", "XLK", "XLF", "XLV", "XLI", "XLY", "XLP", "XLE", "XLU", "XLB", "XLRE", "XLC"}
 MIN_HISTORY_BARS = 160
@@ -64,6 +67,17 @@ def _qualified(result, plan, price):
     )
 
 
+def _point_in_time_cycle(weekly, as_of, price):
+    if not weekly or not weekly.get("d"):
+        return None
+    cutoff = (as_of - timedelta(days=7)).strftime("%Y-%m-%d")
+    end_index = bisect.bisect_right(weekly["d"], cutoff) - 1
+    if end_index < 25:
+        return None
+    static = compute_cycle_static(weekly["d"], weekly["h"], weekly["l"], weekly["c"], end_index=end_index)
+    return cycle_position(static, price) if static else None
+
+
 def _compact_signal(ticker, date_text, result):
     plan = result.get("entry_plan") or {}
     status = plan.get("status")
@@ -91,6 +105,15 @@ def _compact_signal(ticker, date_text, result):
         "strategy_type": result.get("strategy_type"),
         "phase": (result.get("market_phase") or {}).get("phase"),
         "max_score": result.get("max_score"),
+        "cycle_usable": bool((result.get("cycle_gate") or {}).get("usable")),
+        "cycle_years": (result.get("cycle_gate") or {}).get("years"),
+        "cycle_position_pct": (result.get("cycle_gate") or {}).get("position_pct"),
+        "cycle_prior_advance_pct": (result.get("cycle_gate") or {}).get("prior_advance_pct"),
+        "cycle_decline_pct": (result.get("cycle_gate") or {}).get("decline_high_to_low_pct"),
+        "cycle_upper_extended": bool((result.get("cycle_gate") or {}).get("upper_extended")),
+        "cycle_deep_base": bool((result.get("cycle_gate") or {}).get("deep_cycle_base")),
+        "rounding_exemption_used": bool((result.get("cycle_gate") or {}).get("rounding_exemption_used")),
+        "overhead_headroom_atr": (result.get("cycle_gate") or {}).get("overhead_headroom_atr"),
     }
 
 
@@ -144,6 +167,7 @@ async def run_max_history_scan(scan_days=760, restart=False, is_busy=None):
             await _wait_if_busy(is_busy)
             doc = await db.stock_bars.find_one({"ticker": ticker}, {"bars": 1})
             bars = (doc or {}).get("bars") or []
+            weekly = await db.stock_bars_weekly.find_one({"ticker": ticker}, {"d": 1, "h": 1, "l": 1, "c": 1})
             ticker_signals = []
             if len(bars) >= MIN_HISTORY_BARS:
                 df = _bars_to_df(bars)
@@ -155,8 +179,9 @@ async def run_max_history_scan(scan_days=760, restart=False, is_busy=None):
                         await _wait_if_busy(is_busy)
                     window = df.iloc[:index + 1]
                     as_of = window["datetime"].iloc[-1]
+                    cycle = _point_in_time_cycle(weekly, as_of, float(window["Close"].iloc[-1]))
                     try:
-                        result = await asyncio.to_thread(analyze_max_strategy, window, None, as_of)
+                        result = await asyncio.to_thread(analyze_max_strategy, window, None, as_of, cycle, SCAN_GATES)
                     except Exception as e:
                         print(f"[MAX SCAN] {ticker} {as_of.date()} error: {e}")
                         result = None
@@ -167,6 +192,7 @@ async def run_max_history_scan(scan_days=760, restart=False, is_busy=None):
                             ticker_signals.append(signal)
                     await asyncio.sleep(PAUSE_SECONDS)
                 del df
+            weekly = None
             if _SCAN_STATE["stop"]:
                 break
             for signal in ticker_signals:
