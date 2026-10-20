@@ -868,6 +868,11 @@ async def _resolve_backtest_kwargs(
     use_max_strategy: bool = False,
     max_slots: int = 3,
     max_stop_cap_pct: float = 15.0,
+    max_cycle_filter: bool = False,
+    max_upper_position_pct: float = 60.0,
+    max_upper_prior_advance_pct: float = 100.0,
+    max_allow_rounding_exemption: bool = False,
+    max_min_headroom_atr: float = 0.0,
 ):
     from app.services.backtesting import run_backtest
 
@@ -929,6 +934,11 @@ async def _resolve_backtest_kwargs(
         use_max_strategy=use_max_strategy,
         max_slots=max(1, min(max_slots, 6)),
         max_stop_cap_pct=max(5.0, min(max_stop_cap_pct, 30.0)),
+        max_cycle_filter=max_cycle_filter,
+        max_upper_position_pct=max(30.0, min(max_upper_position_pct, 95.0)),
+        max_upper_prior_advance_pct=max(0.0, min(max_upper_prior_advance_pct, 1000.0)),
+        max_allow_rounding_exemption=max_allow_rounding_exemption,
+        max_min_headroom_atr=max(0.0, min(max_min_headroom_atr, 10.0)),
         risk_pct_per_trade=risk_params.get("risk_pct_per_trade", app_settings.get("risk_pct_per_trade", 3.0) if use_preset else 3.0),
         max_position_pct=risk_params.get("max_position_pct", app_settings.get("max_position_pct", 25.0) if use_preset else 25.0),
         min_cash_reserve_pct=risk_params.get("min_cash_reserve_pct", app_settings.get("min_cash_reserve_pct", 5.0) if use_preset else 5.0),
@@ -1011,6 +1021,11 @@ async def backtest_start(
     use_max_strategy: bool = False,
     max_slots: int = 3,
     max_stop_cap_pct: float = 15.0,
+    max_cycle_filter: bool = False,
+    max_upper_position_pct: float = 60.0,
+    max_upper_prior_advance_pct: float = 100.0,
+    max_allow_rounding_exemption: bool = False,
+    max_min_headroom_atr: float = 0.0,
 ):
     params = dict(locals())
     import uuid
@@ -1077,6 +1092,11 @@ async def backtest_run(
     use_max_strategy: bool = False,
     max_slots: int = 3,
     max_stop_cap_pct: float = 15.0,
+    max_cycle_filter: bool = False,
+    max_upper_position_pct: float = 60.0,
+    max_upper_prior_advance_pct: float = 100.0,
+    max_allow_rounding_exemption: bool = False,
+    max_min_headroom_atr: float = 0.0,
 ):
     params = dict(locals())
     from app.services.backtesting import run_backtest
