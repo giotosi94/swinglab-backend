@@ -171,6 +171,69 @@ def _data_quality(df, as_of=None):
     }
 
 
+DEFAULT_CYCLE_GATES = {
+    "min_years": 5.0,
+    "upper_position_pct": 60.0,
+    "upper_prior_advance_pct": 100.0,
+    "deep_position_pct": 40.0,
+    "deep_decline_pct": -40.0,
+    "apply_upper_block": True,
+    "allow_rounding_exemption": True,
+    "min_headroom_atr": 0.0,
+}
+EXEMPTION_STATES = ("ROUNDING_NECK_BREAKOUT", "POC_NECK_RETEST_CONFIRMED", "SECOND_LEG_REENTRY")
+
+
+def _overhead_headroom(price, atr, profiles, structural_profiles):
+    if price <= 0 or atr <= 0:
+        return None, None
+    levels = []
+    for profile in structural_profiles or []:
+        for key in ("poc", "vah"):
+            level = _safe_float(profile.get(key))
+            if level > price + atr * 0.25:
+                levels.append(level)
+    for name in ("poc60", "poc120"):
+        profile = (profiles or {}).get(name) or {}
+        for key in ("poc", "vah"):
+            level = _safe_float(profile.get(key))
+            if level > price + atr * 0.25:
+                levels.append(level)
+    if not levels:
+        return None, None
+    nearest = min(levels)
+    return round(nearest, 4), round((nearest - price) / atr, 2)
+
+
+def _cycle_gates(cycle, structural_base, settings):
+    usable = bool(cycle and _safe_float(cycle.get("years")) >= settings["min_years"])
+    position = _safe_float((cycle or {}).get("position_pct"), 50.0)
+    prior_advance = _safe_float((cycle or {}).get("prior_advance_pct"), 0.0)
+    decline = _safe_float((cycle or {}).get("decline_high_to_low_pct"), 0.0)
+    upper_extended = bool(
+        usable
+        and position > settings["upper_position_pct"]
+        and prior_advance >= settings["upper_prior_advance_pct"]
+    )
+    deep_base = bool(
+        usable
+        and position <= settings["deep_position_pct"]
+        and decline <= settings["deep_decline_pct"]
+    )
+    rounding_breakout = bool(structural_base and structural_base.get("state") in EXEMPTION_STATES)
+    return {
+        "usable": usable,
+        "years": _safe_float((cycle or {}).get("years")),
+        "position_pct": position if usable else None,
+        "zone": (cycle or {}).get("zone") if usable else None,
+        "prior_advance_pct": prior_advance if usable else None,
+        "decline_high_to_low_pct": decline if usable else None,
+        "upper_extended": upper_extended,
+        "deep_cycle_base": deep_base,
+        "rounding_exemption_eligible": bool(deep_base and rounding_breakout),
+    }
+
+
 _WEEKLY_CACHE = threading.local()
 
 
@@ -1075,7 +1138,7 @@ def _multi_timeframe_plan(daily, bars_4h, structural_base, active_base, profiles
         },
     }
 
-def analyze_max_strategy(df, bars_4h=None, as_of=None):
+def analyze_max_strategy(df, bars_4h=None, as_of=None, cycle=None, gates=None):
     if df is None or len(df) < 140:
         return {"status": "INSUFFICIENT_DATA", "bars": 0 if df is None else len(df), "data_eligible": False, "strategy_eligible": False, "trade_ready": False}
     data = df.copy().sort_values("datetime").reset_index(drop=True)
@@ -1097,6 +1160,25 @@ def analyze_max_strategy(df, bars_4h=None, as_of=None):
     structural_base = _detect_weekly_rounding_base_v131(data, atr)
     speculative_setup = _detect_speculative_volume_pocket(data, profiles, structural, active_base, atr)
     phase = _market_phase_gates_v141(data, profiles, bottom, structural, active_base, structural_base, speculative_setup, atr)
+    gate_settings = {**DEFAULT_CYCLE_GATES, **(gates or {})}
+    cycle_gate = _cycle_gates(cycle, structural_base, gate_settings)
+    overhead_level, overhead_headroom_atr = _overhead_headroom(price, atr, profiles, structural)
+    cycle_gate["overhead_node"] = overhead_level
+    cycle_gate["overhead_headroom_atr"] = overhead_headroom_atr
+    cycle_gate["rounding_exemption_used"] = False
+    if (
+        gate_settings["allow_rounding_exemption"]
+        and cycle_gate["rounding_exemption_eligible"]
+        and phase["mature_markup_block"]
+    ):
+        phase["mature_markup_block"] = False
+        phase["phase"] = "ROUNDING_BASE_BREAKOUT"
+        cycle_gate["rounding_exemption_used"] = True
+    cycle_gate["upper_block"] = bool(gate_settings["apply_upper_block"] and cycle_gate["upper_extended"])
+    min_headroom = _safe_float(gate_settings.get("min_headroom_atr"))
+    cycle_gate["headroom_block"] = bool(
+        min_headroom > 0 and overhead_headroom_atr is not None and overhead_headroom_atr < min_headroom
+    )
     mtf_plan = _multi_timeframe_plan(data, bars_4h, structural_base, active_base, profiles, bottom, atr)
     entry_plan = mtf_plan["entry_plan"]
     trigger_price = entry_plan.get("trigger_price")
@@ -1129,7 +1211,7 @@ def analyze_max_strategy(df, bars_4h=None, as_of=None):
     if active_structural_profile:
         status = active_structural_profile.get("status")
         structural_event = "MASTER_POC_RECLAIM" if status == "RECLAIMED" else "MASTER_POC_FIRST_TEST" if status == "FIRST_TEST" else "MASTER_POC_CONTACT"
-    strategy_type = "MAX_DEEP_REVERSAL" if phase["phase"] == "DEEP_REVERSAL" else "RANGE_BOTTOM_REVERSAL" if phase["phase"] == "RANGE_BOTTOM_REVERSAL" else "MASTER_POC_RETURN" if phase["phase"] == "MASTER_POC_REVERSAL" else None
+    strategy_type = "MAX_DEEP_REVERSAL" if phase["phase"] == "DEEP_REVERSAL" else "RANGE_BOTTOM_REVERSAL" if phase["phase"] == "RANGE_BOTTOM_REVERSAL" else "MASTER_POC_RETURN" if phase["phase"] == "MASTER_POC_REVERSAL" else "ROUNDING_BASE_BREAKOUT" if phase["phase"] == "ROUNDING_BASE_BREAKOUT" else None
     triggers = []
     if structural_event:
         triggers.append(structural_event)
@@ -1159,6 +1241,8 @@ def analyze_max_strategy(df, bars_4h=None, as_of=None):
     if phase["retest_in_progress_block"]: strategy_rejections.append("WAITING_REACTION_SWING")
     if not phase["momentum_change"]: strategy_rejections.append("MOMENTUM_CHANGE_REQUIRED")
     if not strategy_type: strategy_rejections.append("NO_QUALIFIED_REVERSAL")
+    if cycle_gate["upper_block"]: strategy_rejections.append("CYCLE_UPPER_EXTENDED")
+    if cycle_gate["headroom_block"]: strategy_rejections.append("OVERHEAD_VOLUME_TOO_CLOSE")
     executable_trigger = any(trigger in triggers for trigger in ("MASTER_POC_RECLAIM", "MASTER_POC_FIRST_TEST", "NECK_BREAKOUT", "NECK_RETEST", "ROUNDING_NECK_BREAKOUT", "POC_NECK_RETEST_CONFIRMED", "SECOND_LEG_REENTRY"))
     if not executable_trigger: strategy_rejections.append("NO_EXECUTABLE_STRUCTURAL_TRIGGER")
     score = 0
@@ -1176,6 +1260,8 @@ def analyze_max_strategy(df, bars_4h=None, as_of=None):
         or phase["mature_markup_block"]
         or phase["new_weekly_low"]
         or phase["retest_in_progress_block"]
+        or cycle_gate["upper_block"]
+        or cycle_gate["headroom_block"]
     )
     weekly_plan_qualified = bool(
         strategy_eligible
@@ -1198,7 +1284,7 @@ def analyze_max_strategy(df, bars_4h=None, as_of=None):
         mtf_plan["entry_plan"]["order_action"] = "WAIT"
     mtf_plan["entry_plan"]["weekly_plan_qualified"] = weekly_plan_qualified
     mtf_plan["entry_plan"]["blocking_phase"] = blocking_phase
-    watch_ready = data_eligible and phase["phase"] in ("DEEP_REVERSAL", "DEEP_DRAWDOWN_WAIT", "RANGE_BOTTOM_REVERSAL", "MASTER_POC_REVERSAL", "RETEST_WAITING_CONFIRMATION") and score >= 35 and not phase["mature_markup_block"]
+    watch_ready = data_eligible and phase["phase"] in ("DEEP_REVERSAL", "DEEP_DRAWDOWN_WAIT", "RANGE_BOTTOM_REVERSAL", "MASTER_POC_REVERSAL", "RETEST_WAITING_CONFIRMATION", "ROUNDING_BASE_BREAKOUT") and score >= 35 and not phase["mature_markup_block"]
     advanced_retest = structural_base and structural_base.get("state") in ("POC_NECK_RETEST_IN_PROGRESS", "POC_NECK_RETEST_CONFIRMED", "SECOND_LEG_REENTRY")
     tranche_1_trigger = structural_event in ("MASTER_POC_FIRST_TEST", "MASTER_POC_RECLAIM") and phase["momentum_change"] and phase["reaction_candle"] and phase["selling_volume_contracting"] and not advanced_retest and phase["range_position_52w"] < 70
     tranche_2_trigger = any(trigger in triggers for trigger in ("NECK_BREAKOUT", "ROUNDING_NECK_BREAKOUT")) and phase["momentum_change"]
@@ -1248,7 +1334,7 @@ def analyze_max_strategy(df, bars_4h=None, as_of=None):
         "speculative_setup": speculative_setup, "historical_cycle": historical_cycle, "current_management_signal": current_management_signal,
         "weekly_context": mtf_plan["weekly_context"], "daily_confirmation": mtf_plan["daily_confirmation"],
         "execution_4h": mtf_plan["execution_4h"], "entry_plan": mtf_plan["entry_plan"],
-        "compression": compression, "bottom": bottom, "triggers": triggers,
+        "compression": compression, "bottom": bottom, "triggers": triggers, "cycle_gate": cycle_gate,
         "data_rejection_reasons": data_rejections, "strategy_rejection_reasons": strategy_rejections, "rejection_reasons": rejection_reasons,
         "max_score": round(min(100, score), 1), "data_eligible": data_eligible, "strategy_eligible": strategy_eligible, "watch_ready": watch_ready,
         "tranche_1_ready": tranche_1_ready, "tranche_2_ready": tranche_2_ready, "tranche_3_ready": tranche_3_ready,
