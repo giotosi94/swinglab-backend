@@ -918,6 +918,11 @@ async def run_backtest(
     use_max_strategy: bool = False,
     max_slots: int = 3,
     max_stop_cap_pct: float = 15.0,
+    max_cycle_filter: bool = False,
+    max_upper_position_pct: float = 60.0,
+    max_upper_prior_advance_pct: float = 100.0,
+    max_allow_rounding_exemption: bool = False,
+    max_min_headroom_atr: float = 0.0,
     risk_pct_per_trade: float = 3.0,
     max_position_pct: float = 25.0,
     min_cash_reserve_pct: float = 5.0,
@@ -1006,16 +1011,38 @@ async def run_backtest(
     backtest_date_index = {date: i for i, date in enumerate(backtest_dates)}
     max_signals_by_date = {}
     max_signals_loaded = 0
+    max_filter_stats = {"cycle_blocked": 0, "exemption_removed": 0, "headroom_blocked": 0, "exemption_kept": 0}
     if use_max_strategy and backtest_dates:
+        from app.services.max_backtest_scan import SCAN_VERSION as MAX_SCAN_VERSION
         async for signal in db.max_backtest_signals.find(
-            {"qualified": True, "date": {"$gte": sorted_dates[max(0, len(sorted_dates) - days - 30)], "$lte": backtest_dates[-1]}},
+            {"qualified": True, "version": MAX_SCAN_VERSION, "date": {"$gte": sorted_dates[max(0, len(sorted_dates) - days - 30)], "$lte": backtest_dates[-1]}},
             {"_id": 0, "ticker": 1, "date": 1, "status": 1, "order_action": 1, "trade_ready": 1,
              "trigger_price": 1, "maximum_entry_price": 1, "invalidation_price": 1, "atr14": 1,
-             "trigger_source": 1, "strategy_type": 1},
+             "trigger_source": 1, "strategy_type": 1, "max_score": 1,
+             "cycle_usable": 1, "cycle_position_pct": 1, "cycle_prior_advance_pct": 1,
+             "rounding_exemption_used": 1, "overhead_headroom_atr": 1},
         ):
-            if signal.get("ticker") in tradable_tickers and signal.get("ticker") in ticker_bars:
-                max_signals_by_date.setdefault(signal["date"], []).append(signal)
-                max_signals_loaded += 1
+            if signal.get("ticker") not in tradable_tickers or signal.get("ticker") not in ticker_bars:
+                continue
+            if signal.get("rounding_exemption_used"):
+                if not max_allow_rounding_exemption:
+                    max_filter_stats["exemption_removed"] += 1
+                    continue
+                max_filter_stats["exemption_kept"] += 1
+            if (
+                max_cycle_filter
+                and signal.get("cycle_usable")
+                and (signal.get("cycle_position_pct") or 0) > max_upper_position_pct
+                and (signal.get("cycle_prior_advance_pct") or 0) >= max_upper_prior_advance_pct
+            ):
+                max_filter_stats["cycle_blocked"] += 1
+                continue
+            headroom = signal.get("overhead_headroom_atr")
+            if max_min_headroom_atr > 0 and headroom is not None and headroom < max_min_headroom_atr:
+                max_filter_stats["headroom_blocked"] += 1
+                continue
+            max_signals_by_date.setdefault(signal["date"], []).append(signal)
+            max_signals_loaded += 1
     max_setups = {}
     max_stats = {
         "enabled": use_max_strategy,
@@ -1028,6 +1055,7 @@ async def run_backtest(
         "skipped_above_max_entry": 0,
         "stop_capped": 0,
         "no_slot": 0,
+        "filters": max_filter_stats,
     }
 
     # 🆕 Crash Deploy: SPY closes indicizzate per data
@@ -1834,6 +1862,11 @@ async def run_backtest(
             "use_max_strategy": use_max_strategy,
             "max_slots": max_slots,
             "max_stop_cap_pct": max_stop_cap_pct,
+            "max_cycle_filter": max_cycle_filter,
+            "max_upper_position_pct": max_upper_position_pct,
+            "max_upper_prior_advance_pct": max_upper_prior_advance_pct,
+            "max_allow_rounding_exemption": max_allow_rounding_exemption,
+            "max_min_headroom_atr": max_min_headroom_atr,
             "risk_pct_per_trade": risk_pct_per_trade,
             "max_position_pct": max_position_pct,
             "min_cash_reserve_pct": min_cash_reserve_pct,
