@@ -7,7 +7,7 @@ from app.db.mongodb import get_db
 from app.config import settings
 import traceback
 import time
-from app.services.max_strategy import analyze_max_strategy
+from app.services.max_strategy import analyze_max_strategy, LIVE_CYCLE_GATES, LIVE_MAX_POLICY
 from app.services.max_plan_lifecycle import sync_max_plan, expire_plans_for_stale, mark_legacy_max_signals
 from app.services.cycle_history import CycleBudget, get_cycle_contexts, get_cycle_coverage
 
@@ -931,7 +931,7 @@ async def fetch_bars(client, symbol):
 # STOCK ANALYSIS
 # ============================================
 
-def analyze_stock(ticker, df, sector_code, sector_scores, prev_poc_position=None, df_4h=None):
+def analyze_stock(ticker, df, sector_code, sector_scores, prev_poc_position=None, df_4h=None, cycle_context=None):
     if df is None or len(df) < 20:
         return None
     close = df["Close"]; volume = df["Volume"]; high = df["High"]; low = df["Low"]
@@ -952,7 +952,11 @@ def analyze_stock(ticker, df, sector_code, sector_scores, prev_poc_position=None
 
     # 🆕 POC SHIFT (metodo Rea) — prev_poc_position letto dal DB (persistente)
     poc_shift = _detect_poc_shift(ticker, price, poc, prev_position=prev_poc_position)
-    max_strategy = analyze_max_strategy(df, bars_4h=df_4h)
+    max_strategy = analyze_max_strategy(
+        df, bars_4h=df_4h, cycle=cycle_context, gates=LIVE_CYCLE_GATES
+    )
+    max_strategy["live_policy"] = LIVE_MAX_POLICY
+    max_strategy["live_gate_settings"] = dict(LIVE_CYCLE_GATES)
 
     patterns = detect_candlestick_patterns(df)
     fvgs = detect_fvg(df); wyckoff = detect_wyckoff_phase(df)
@@ -1504,7 +1508,7 @@ async def fetch_and_analyze_stocks(force=False):
                 # 🆕 Leggi la posizione POC precedente dal DB (per lo shift persistente)
                 prev_doc = await db.assets.find_one({"ticker": ticker}, {"poc_shift": 1})
                 prev_pos = (prev_doc or {}).get("poc_shift", {}).get("poc_position")
-                asset_doc = analyze_stock(ticker, df, sector_code, sector_scores, prev_poc_position=prev_pos, df_4h=bars_4h_map.get(ticker))
+                asset_doc = analyze_stock(ticker, df, sector_code, sector_scores, prev_poc_position=prev_pos, df_4h=bars_4h_map.get(ticker), cycle_context=cycle_map.get(ticker))
                 if asset_doc:
                     asset_doc["cycle_context"] = cycle_map.get(ticker)
                     await db.assets.update_one({"ticker": ticker}, {"$set": asset_doc}, upsert=True)
