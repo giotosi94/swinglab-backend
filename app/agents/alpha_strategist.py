@@ -1,6 +1,7 @@
 from datetime import datetime
 from app.agents.base_agent import BaseAgent
 from app.db.mongodb import get_db
+from app.services.max_strategy import LIVE_MAX_POLICY, live_cycle_blocked
 
 
 # ==========================================================
@@ -31,6 +32,8 @@ MAX_SHADOW_PROJECTION = {
     "ticker": 1,
     "price": 1,
     "max_strategy.strategy_type": 1,
+    "max_strategy.live_policy": 1,
+    "max_strategy.cycle_gate.upper_block": 1,
     "max_strategy.strategy_eligible": 1,
     "max_strategy.trade_ready": 1,
     "max_strategy.max_score": 1,
@@ -985,6 +988,12 @@ class AlphaStrategist(BaseAgent):
             if not ticker or ticker in open_tickers:
                 continue
             max_strategy = shadow_asset.get("max_strategy") or {}
+            if max_strategy.get("live_policy") != LIVE_MAX_POLICY:
+                continue
+            if (max_strategy.get("cycle_gate") or {}).get("upper_block"):
+                continue
+            if live_cycle_blocked((assets_map.get(ticker) or {}).get("cycle_context")):
+                continue
             plan = max_strategy.get("entry_plan") or {}
             if plan.get("status") not in tracked:
                 continue
