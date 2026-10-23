@@ -382,7 +382,8 @@ def _configuration_registry(agents):
 
     def add(key, label, group, kind, minimum=None, maximum=None, owners=None, choices=None):
         targets = owners or [(risk, key)]
-        supported = all(name in defaults and field in defaults[name] for name, field in targets)
+        required_targets = targets[:1] if key in ("max_positions", "fractionable_only") else targets
+        supported = all(name in defaults and field in defaults[name] for name, field in required_targets)
         registry[key] = {
             "label": label,
             "group": group,
@@ -392,7 +393,9 @@ def _configuration_registry(agents):
             "choices": choices,
             "targets": targets,
             "editable": supported,
-            "reason": None if supported else "Parametro non dichiarato da tutti gli agenti destinatari: modifica non abilitata.",
+            "reason": None if supported else "Parametro non dichiarato dagli agenti responsabili: modifica non abilitata.",
+            "owner": targets[0][0],
+            "mirrors": [{"agent": name, "parameter": field} for name, field in targets[1:]],
         }
 
     def risk_key(key, alias=None):
