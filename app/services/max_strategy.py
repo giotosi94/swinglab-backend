@@ -181,6 +181,20 @@ DEFAULT_CYCLE_GATES = {
     "allow_rounding_exemption": True,
     "min_headroom_atr": 0.0,
 }
+LIVE_MAX_POLICY = "max_cycle_paper_v1"
+LIVE_CYCLE_GATES = {
+    **DEFAULT_CYCLE_GATES,
+    "upper_position_pct": 40.0,
+    "apply_upper_block": True,
+    "allow_rounding_exemption": False,
+    "min_headroom_atr": 0.0,
+}
+
+
+def live_cycle_blocked(cycle):
+    return _cycle_gates(cycle, None, LIVE_CYCLE_GATES)["upper_extended"]
+
+
 EXEMPTION_STATES = ("ROUNDING_NECK_BREAKOUT", "POC_NECK_RETEST_CONFIRMED", "SECOND_LEG_REENTRY")
 
 
