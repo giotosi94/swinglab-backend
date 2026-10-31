@@ -1,6 +1,7 @@
 from fastapi import APIRouter
 from app.agents.orchestrator import Orchestrator
 from app.agents.shared_brain import brain
+from datetime import datetime
 
 router = APIRouter()
 
@@ -33,19 +34,88 @@ async def run_pipeline():
     return await orch.run()
 
 
-LEARN_ALL_ENABLED = False
+# v3.0 Learning Machine — ora sicuro grazie a:
+# - get_position_trades() (aggregazione per posizione, no bias tranche)
+# - update_params_safe() con clamp 25%
+# - param history append-only
+LEARN_ALL_ENABLED = True
 
 
 @router.post("/learn")
 async def learn_all(force: bool = False):
-    """Learning per tutti gli agenti. Disabilitato finche' il Learning Loop non conta per posizione."""
+    """
+    🧬 Learning Loop per tutti gli agenti.
+
+    v3.0: abilitato di default. Usa aggregazione per posizione e clamp
+    sui parametri. Invia report Telegram riepilogativo.
+    """
     if not LEARN_ALL_ENABLED and not force:
         return {
             "status": "disabled",
-            "message": "Learning Loop disabilitato: conta ancora le tranche come trade separati. Nessun parametro modificato.",
+            "message": "Learning Loop disabilitato. Usa force=true per forzare.",
         }
+
     orch = _get_orch()
-    return await orch.learn_all()
+    results = await orch.learn_all()
+
+    # ---- Telegram summary ----
+    try:
+        from app.services.telegram_bot import send_telegram
+
+        msg = "🧬 <b>Learning Machine Report</b>\n\n"
+        msg += f"⏰ {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC\n\n"
+
+        for name, res in results.items():
+            status = res.get("status", "?")
+            if status == "ok":
+                r = res.get("result") or {}
+                # Estrae i pezzi più utili per ogni agente
+                if name == "alpha_strategist":
+                    msg += (
+                        f"🎯 <b>Alpha</b>: WR {r.get('win_rate', '?')}% | "
+                        f"min_conf {r.get('min_confluence', '?')} | "
+                        f"trades {r.get('total_trades', 0)}\n"
+                    )
+                elif name == "risk_manager":
+                    msg += (
+                        f"🛡️ <b>Risk</b>: WR {r.get('win_rate', '?')}% | "
+                        f"risk% {r.get('risk_pct_per_trade', '?')} | "
+                        f"minRR {r.get('min_risk_reward', '?')}\n"
+                    )
+                elif name == "adaptive_position_manager":
+                    auto = r.get("auto_tuning", "?")
+                    adj = r.get("adjustments") or []
+                    msg += (
+                        f"🧬 <b>APM</b>: auto={auto} | "
+                        f"decisions {r.get('total_decisions', 0)} | "
+                        f"adj {len(adj)}\n"
+                    )
+                elif name == "macro_analyst":
+                    msg += (
+                        f"🌍 <b>Macro</b>: accuracy {r.get('accuracy', '?')}% | "
+                        f"eval {r.get('total_evaluated', 0)}\n"
+                    )
+                elif name == "executor":
+                    msg += (
+                        f"⚡ <b>Executor</b>: fill_rate {r.get('fill_rate', '?')}% | "
+                        f"buffer {r.get('buffer', '?')}%\n"
+                    )
+                else:
+                    msg += f"• <b>{name}</b>: ok\n"
+            else:
+                msg += f"• <b>{name}</b>: ❌ {res.get('error', 'error')}\n"
+
+        msg += "\n✅ Learning completato. Parametri versionati in history."
+        await send_telegram(msg)
+    except Exception as e:
+        print(f"  Learning Telegram summary error: {e}")
+
+    return {
+        "status": "ok",
+        "learning_enabled": True,
+        "results": results,
+        "learned_at": datetime.utcnow().isoformat(),
+    }
 
 
 # ============================================
@@ -78,7 +148,6 @@ async def run_alpha():
     """Run solo AlphaStrategist → legge market dal brain, scrive candidates."""
     orch = _get_orch()
     try:
-        # Legge market state dal brain
         market = await brain.get_market()
         if not market:
             return {"status": "error", "message": "No market data. Run macro first."}
@@ -91,7 +160,6 @@ async def run_alpha():
             "positions": positions,
         })
 
-        # Scrive candidates nel brain
         await brain.write_candidates(
             result.get("buy_candidates", []),
             result.get("sell_signals", []),
@@ -128,7 +196,6 @@ async def run_risk():
             "positions": positions,
         })
 
-        # Scrive approved nel brain
         await brain.write_approved(
             result.get("approved_trades", []),
             result.get("approved_sells", []),
@@ -160,14 +227,12 @@ async def run_executor():
             "approved_sells": approved_sells,
         })
 
-        # Scrive executions nel brain
         await brain.write_executions(
             result.get("executed_buys", []),
             result.get("executed_sells", []),
             result,
         )
 
-        # Pulisce gli approved dopo l'esecuzione
         await brain.clear_approved()
 
         return {"status": "ok", "agent": "executor", "result": result}
@@ -186,7 +251,7 @@ async def get_brain():
 
 
 # ============================================
-# EXISTING ENDPOINTS (unchanged)
+# AGENT INTROSPECTION
 # ============================================
 
 @router.get("/{agent_name}/decisions")
@@ -222,47 +287,54 @@ async def agent_params(agent_name: str):
     return {"agent": agent_name, "params": params}
 
 
+@router.get("/{agent_name}/param-history")
+async def agent_param_history(agent_name: str, limit: int = 20):
+    """
+    🧬 v3.0 — Storico dei set di parametri (versioning).
+    Utile per audit e rollback.
+    """
+    orch = _get_orch()
+    agent = orch.agents.get(agent_name)
+    if not agent:
+        return {"error": f"Agent '{agent_name}' not found"}
+    if not hasattr(agent, "get_param_history"):
+        return {"error": "Agent does not support param history (upgrade BaseAgent)"}
+    history = await agent.get_param_history(limit=limit)
+    return {"agent": agent_name, "history": history}
+
+
 # ============================================
 # 🆕 v4.0 — APM ENDPOINTS
 # ============================================
 
 @router.get("/apm-history")
 async def apm_decisions(limit: int = 30):
-    """
-    🆕 v4.0 — Ritorna le ultime decisioni APM.
-    Include: HOLD, SCALE_OUT, EXIT, TIGHTEN_STOP.
-    """
+    """Ultime decisioni APM (HOLD, SCALE_OUT, EXIT, TIGHTEN_STOP)."""
     from app.db.mongodb import get_db
-    from datetime import datetime
-    
+
     db = get_db()
-    
-    # Leggi decisioni da agent_decisions_adaptive_position_manager
     col = db["agent_decisions_adaptive_position_manager"]
     decisions = await col.find().sort("created_at", -1).to_list(limit)
-    
-    # Serializza + estrai info chiave
+
     result = []
     for d in decisions:
         data = d.get("data", {})
-        action_taken = data.get("action_taken", False)
-        
         result.append({
             "id": str(d.get("_id", "")),
             "created_at": d.get("created_at").isoformat() if d.get("created_at") else "",
-            "type": d.get("type", "unknown"),  # apm_hold, apm_exit, apm_scale_out, apm_tighten_stop
+            "type": d.get("type", "unknown"),
             "ticker": data.get("ticker", ""),
             "decision": data.get("decision", "UNKNOWN"),
             "reason": data.get("reason", ""),
             "current_pnl_pct": data.get("current_pnl_pct", 0),
             "current_price": data.get("current_price", 0),
             "entry_price": data.get("entry_price", 0),
-            "action_taken": action_taken,
+            "action_taken": data.get("action_taken", False),
             "action_details": data.get("action_details", {}),
             "state_snapshot": data.get("state_snapshot", {}),
             "confidence": d.get("confidence", 0),
         })
-    
+
     return {
         "total": len(result),
         "decisions": result,
@@ -272,20 +344,14 @@ async def apm_decisions(limit: int = 30):
 
 @router.get("/apm/status")
 async def apm_status():
-    """
-    🆕 v4.0 — Ritorna stato APM (last run, prossima esecuzione).
-    """
+    """Stato APM (last run, prossima esecuzione)."""
     from app.db.mongodb import get_db
-    from datetime import datetime, timedelta
-    
+    from datetime import timedelta
+
     db = get_db()
-    
-    # Ultimo run APM
     last_run_doc = await db.apm_state.find_one({"_id": "last_run"})
-    
-    # Params APM
     params_doc = await db.agent_memory_adaptive_position_manager.find_one({"_id": "params"})
-    
+
     if not last_run_doc:
         return {
             "status": "never_run",
@@ -294,16 +360,15 @@ async def apm_status():
             "enabled": params_doc.get("apm_enabled", True) if params_doc else True,
             "interval_hours": params_doc.get("apm_check_interval_hours", 3) if params_doc else 3,
         }
-    
+
     last_run = last_run_doc.get("timestamp")
     interval_hours = params_doc.get("apm_check_interval_hours", 3) if params_doc else 3
-    
     next_check = last_run + timedelta(hours=interval_hours) if last_run else None
     remaining = None
     if next_check:
         remaining_seconds = (next_check - datetime.utcnow()).total_seconds()
         remaining = round(remaining_seconds / 3600, 2) if remaining_seconds > 0 else 0
-    
+
     return {
         "status": "active",
         "last_run": last_run.isoformat() if last_run else None,
@@ -318,35 +383,27 @@ async def apm_status():
 
 @router.get("/apm/summary")
 async def apm_summary(days: int = 7):
-    """
-    🆕 v4.0 — Riepilogo statistiche APM negli ultimi N giorni.
-    """
+    """Riepilogo statistiche APM negli ultimi N giorni."""
     from app.db.mongodb import get_db
-    from datetime import datetime, timedelta
-    
+    from datetime import timedelta
+
     db = get_db()
     cutoff = datetime.utcnow() - timedelta(days=days)
-    
     col = db["agent_decisions_adaptive_position_manager"]
-    decisions = await col.find({
-        "created_at": {"$gte": cutoff},
-    }).to_list(500)
-    
-    # Conta per tipo
+    decisions = await col.find({"created_at": {"$gte": cutoff}}).to_list(500)
+
     counts = {"HOLD": 0, "SCALE_OUT": 0, "EXIT": 0, "TIGHTEN_STOP": 0, "SKIP": 0}
     actions_taken = 0
     total_pnl_managed = 0
-    
+
     for d in decisions:
         data = d.get("data", {})
         decision = data.get("decision", "SKIP")
         counts[decision] = counts.get(decision, 0) + 1
-        
         if data.get("action_taken", False):
             actions_taken += 1
-        
         total_pnl_managed += abs(data.get("current_pnl_pct", 0))
-    
+
     return {
         "period_days": days,
         "total_decisions": len(decisions),
@@ -354,48 +411,30 @@ async def apm_summary(days: int = 7):
         "counts": counts,
         "avg_pnl_managed": round(total_pnl_managed / max(len(decisions), 1), 2),
     }
-    
-# ============================================
-# 🧬 FASE 3 — APM LEARNING LOOP ENDPOINT
-# ============================================
+
 
 @router.post("/apm/learn")
 async def apm_learn():
     """
     🧬 Trigger manuale del Learning Loop APM.
-    
-    Analizza le decisioni degli ultimi 30 giorni, auto-aggiusta le soglie
-    e manda report Telegram.
-    
-    Configurabile come cron settimanale (domenica 03:00 CEST).
+    Analizza le decisioni, auto-aggiusta (se abilitato) e manda report Telegram.
     """
     orch = _get_orch()
     try:
         result = await orch.apm.learn()
-        return {
-            "status": "ok",
-            "learning_result": result,
-        }
+        return {"status": "ok", "learning_result": result}
     except Exception as e:
-        return {
-            "status": "error",
-            "error": str(e),
-        }
-
+        return {"status": "error", "error": str(e)}
 
 
 @router.post("/apm/force-run")
 async def apm_force_run():
-    """
-    🔧 Forza APM a rieseguire immediatamente, ignorando il timer 3h.
-    Utile per debug/testing.
-    """
+    """Forza APM a rieseguire immediatamente, ignorando il timer."""
     from app.db.mongodb import get_db
-    from datetime import datetime
-    
+
     db = get_db()
     await db.apm_state.delete_one({"_id": "last_run"})
-    
+
     return {
         "status": "reset",
         "message": "APM timer reset. Next pipeline will run APM.",
@@ -411,50 +450,46 @@ async def apm_force_run():
 async def dps_kelly_status():
     """Ritorna stato completo DPS + Kelly: params, trade stats, sizing history."""
     from app.db.mongodb import get_db
-    from datetime import datetime, timedelta
-    
+    from datetime import timedelta
+
     db = get_db()
-    
-    # 1. Params correnti DPS + Kelly
+
     risk_params = await db.agent_memory_risk_manager.find_one({"_id": "params"})
     params = risk_params or {}
-    
-    # 2. Kelly calcolo su trade history
+
     trades = await db.trade_history.find({
         "side": "sell",
         "pnl_pct": {"$exists": True}
     }).sort("date", -1).limit(100).to_list(100)
-    
+
     n_trades = len(trades)
     kelly_min = params.get("kelly_min_trades", 20)
     kelly_active = n_trades >= kelly_min
-    
+
     wins = [t for t in trades if t.get("pnl_pct", 0) > 0]
     losses = [t for t in trades if t.get("pnl_pct", 0) <= 0]
-    
+
     win_rate = (len(wins) / n_trades * 100) if n_trades > 0 else 0
     avg_win = (sum(t.get("pnl_pct", 0) for t in wins) / len(wins)) if wins else 0
     avg_loss = abs(sum(t.get("pnl_pct", 0) for t in losses) / len(losses)) if losses else 0
-    
+
     kelly_pct = 0
     if avg_win > 0 and avg_loss > 0 and wins and losses:
         wr = win_rate / 100
         lr = 1 - wr
         kelly_pct = (wr * avg_win - lr * avg_loss) / avg_win * 100
-    
+
     fractional_factor = params.get("kelly_fractional_factor", 0.25)
     fractional_kelly = max(0, kelly_pct * fractional_factor)
-    
-    # 3. Ultimo risk report (per multipliers correnti)
+
     alpaca_state = await db.auto_trader.find_one({"_id": "alpaca_state"})
     latest_risk = alpaca_state.get("risk_report", {}) if alpaca_state else {}
-    
-    # 4. Ultime 30 decisions trade_approved con DPS info
+
     decisions = await db.agent_decisions_risk_manager.find({
         "type": "trade_approved",
         "created_at": {"$gte": datetime.utcnow() - timedelta(days=30)}
     }).sort("created_at", -1).limit(30).to_list(30)
-    
+
     sizing_history = []
     for d in decisions:
         data = d.get("data", {})
@@ -467,17 +502,16 @@ async def dps_kelly_status():
             "risk_reward": data.get("risk_reward", 0),
             "date": d.get("created_at").isoformat() if d.get("created_at") else "",
         })
-    
-    # 5. Distribution multipliers
+
     multipliers_dist = {}
     for s in sizing_history:
         mult = s["dps_multiplier"]
-        bucket = round(mult * 10) / 10  # 0.1 precision
+        bucket = round(mult * 10) / 10
         multipliers_dist[str(bucket)] = multipliers_dist.get(str(bucket), 0) + 1
-    
+
     avg_dps_mult = sum(s["dps_multiplier"] for s in sizing_history) / len(sizing_history) if sizing_history else 1.0
     avg_kelly_mult = sum(s["kelly_multiplier"] for s in sizing_history) / len(sizing_history) if sizing_history else 1.0
-    
+
     return {
         "params": {
             "dps_enabled": params.get("dps_enabled", True),
@@ -509,290 +543,6 @@ async def dps_kelly_status():
         },
         "sizing_history": sizing_history,
         "multipliers_distribution": multipliers_dist,
-        "stats": {
-            "avg_dps_multiplier": round(avg_dps_mult, 3),
-            "avg_kelly_multiplier": round(avg_kelly_mult, 3),
-            "total_approved_30d": len(sizing_history),
-        },
-        "generated_at": datetime.utcnow().isoformat(),
-    }
-
-
-
-# ============================================
-# v4.6 — POSITIONS ADAPTIVE TARGETS
-# ============================================
-
-@router.get("/apm/position-targets")
-async def apm_position_targets():
-    """
-    v4.6 — Target adattivi per ogni posizione aperta.
-    reached = persistente (legge last_target_hit dal DB, non solo il prezzo).
-    """
-    from app.db.mongodb import get_db
-    from app.services.alpaca_trader import get_positions
-
-    db = get_db()
-
-    positions = await get_positions() or []
-    if not positions:
-        return {"positions": [], "total": 0}
-
-    apm_params = await db.agent_memory_adaptive_position_manager.find_one({"_id": "params"}) or {}
-    default_t1 = apm_params.get("apm_target_1_pct", 5.0)
-    default_t2 = apm_params.get("apm_target_2_pct", 10.0)
-    default_t3 = apm_params.get("apm_target_3_pct", 20.0)
-
-    results = []
-    for pos in positions:
-        symbol = pos.get("symbol")
-        entry_price = float(pos.get("avg_entry_price", 0))
-        current_price = float(pos.get("current_price", 0))
-        pnl_pct = float(pos.get("unrealized_plpc", 0)) * 100
-        qty = float(pos.get("qty", 0))
-
-        if not symbol or entry_price <= 0:
-            continue
-
-        buy_trade = await db.trade_history.find_one(
-            {"ticker": symbol, "side": "buy", "sell_linked": {"$ne": True}},
-            sort=[("date", -1)]
-        )
-
-        adaptive_t1 = buy_trade.get("adaptive_t1_pct") if buy_trade else None
-        adaptive_t2 = buy_trade.get("adaptive_t2_pct") if buy_trade else None
-        adaptive_t3 = buy_trade.get("adaptive_t3_pct") if buy_trade else None
-
-        is_adaptive = bool(adaptive_t1 and adaptive_t1 > 0)
-
-        t1_pct = adaptive_t1 if is_adaptive else default_t1
-        t2_pct = adaptive_t2 if adaptive_t2 else default_t2
-        t3_pct = adaptive_t3 if adaptive_t3 else default_t3
-
-        t1_price = round(entry_price * (1 + t1_pct / 100), 2)
-        t2_price = round(entry_price * (1 + t2_pct / 100), 2)
-        t3_price = round(entry_price * (1 + t3_pct / 100), 2)
-
-        stop_loss = buy_trade.get("stop_loss", 0) if buy_trade else 0
-        original_target = buy_trade.get("target", 0) if buy_trade else 0
-        confluence = buy_trade.get("confluence", 0) if buy_trade else 0
-        setup_type = buy_trade.get("setup_type", "unknown") if buy_trade else "unknown"
-
-        last_target_hit = buy_trade.get("last_target_hit", 0) if buy_trade else 0
-        partial_scaled_out = buy_trade.get("partial_scaled_out", False) if buy_trade else False
-
-        dist_t1 = round(t1_pct - pnl_pct, 2)
-        dist_t2 = round(t2_pct - pnl_pct, 2)
-        dist_t3 = round(t3_pct - pnl_pct, 2)
-
-        progress_to_t1 = round(max(0, min(100, (pnl_pct / t1_pct) * 100)), 1) if t1_pct > 0 else 0
-        progress_to_t3 = round(max(0, min(100, (pnl_pct / t3_pct) * 100)), 1) if t3_pct > 0 else 0
-
-        results.append({
-            "ticker": symbol,
-            "entry_price": entry_price,
-            "current_price": current_price,
-            "pnl_pct": round(pnl_pct, 2),
-            "qty": qty,
-            "confluence": confluence,
-            "setup_type": setup_type,
-            "is_adaptive": is_adaptive,
-            "stop_loss": stop_loss,
-            "original_target": original_target,
-            "last_target_hit": last_target_hit,
-            "partial_scaled_out": partial_scaled_out,
-            "targets": {
-                "t1": {
-                    "pct": t1_pct,
-                    "price": t1_price,
-                    "distance_pct": dist_t1,
-                    "reached": last_target_hit >= 1 or pnl_pct >= t1_pct,
-                    "progress": progress_to_t1,
-                    "size_pct": 50,
-                },
-                "t2": {
-                    "pct": t2_pct,
-                    "price": t2_price,
-                    "distance_pct": dist_t2,
-                    "reached": last_target_hit >= 2 or pnl_pct >= t2_pct,
-                    "progress": round(max(0, min(100, (pnl_pct / t2_pct) * 100)), 1) if t2_pct > 0 else 0,
-                    "size_pct": 30,
-                },
-                "t3": {
-                    "pct": t3_pct,
-                    "price": t3_price,
-                    "distance_pct": dist_t3,
-                    "reached": last_target_hit >= 3 or pnl_pct >= t3_pct,
-                    "progress": progress_to_t3,
-                    "size_pct": 20,
-                },
-            },
-        })
-
-    return {
-        "positions": results,
-        "total": len(results),
-    }
-
-@router.get("/alpha-radar")
-async def alpha_radar():
-    """🆕 Progetto Alpha — legge Crash Radar + Sector Bottom dall'ultimo market_context."""
-    from app.db.mongodb import get_db
-    db = get_db()
-    ctx = await db.market_context.find_one({"_id": "latest"})
-    if not ctx:
-        return {"error": "No market context. Run macro first."}
-    return {
-        "crash_radar": ctx.get("crash_radar", {}),
-        "sector_bottom": ctx.get("sector_bottom", {}),
-        "market_regime": ctx.get("market_regime", "UNKNOWN"),
-        "updated_at": ctx.get("analyzed_at", ""),
-    }
-
-@router.post("/{agent_name}/set-param")
-async def set_agent_param(agent_name: str, key: str, value: float):
-    """🔧 Forza un parametro di un agente nel DB (override di learn/default)."""
-    orch = _get_orch()
-    agent = orch.agents.get(agent_name)
-    if not agent:
-        return {"error": f"Agent '{agent_name}' not found"}
-    params = await agent.get_params()
-    old = params.get(key)
-    params[key] = int(value) if float(value).is_integer() else float(value)
-    await agent.save_params(params)
-    return {"agent": agent_name, "param": key, "old": old, "new": params[key]}
-
-
-LEADER_REPORT_FIELDS = {
-    "price_history": 0,
-    "vp_distribution": 0,
-    "multi_tf_vp": 0,
-    "max_strategy": 0,
-    "alpha_snapshot": 0,
-    "history": 0,
-    "llm_analysis": 0,
-}
-
-
-def _leader_return(bars, sessions):
-    closes = [b.get("c") for b in bars if b.get("c")]
-    if len(closes) <= sessions:
-        return None
-    past = closes[-(sessions + 1)]
-    if not past:
-        return None
-    return round((closes[-1] - past) / past * 100, 2)
-
-
-@router.get("/leader-miss-report")
-async def leader_miss_report(top: int = 20, sessions: int = 20):
-    from app.db.mongodb import get_db
-    from datetime import datetime
-    db = get_db()
-    top = max(5, min(top, 50))
-    sessions = max(5, min(sessions, 60))
-
-    returns = {}
-    cursor = db.stock_bars.find({}, {"ticker": 1, "bars": {"$slice": -(sessions + 1)}})
-    async for doc in cursor:
-        value = _leader_return(doc.get("bars") or [], sessions)
-        if value is not None:
-            returns[doc.get("ticker")] = value
-
-    spy_return = returns.get("SPY")
-    universe = set()
-    async for doc in db.assets.find({}, {"ticker": 1}):
-        universe.add(doc.get("ticker"))
-    ranked = sorted(
-        ((t, r) for t, r in returns.items() if t in universe),
-        key=lambda item: item[1],
-        reverse=True,
-    )
-    leaders = ranked[:top]
-    leader_tickers = [t for t, _ in leaders]
-
-    orch = _get_orch()
-    alpha = orch.alpha
-    params = await alpha.get_params()
-    market_ctx = await db.market_context.find_one({"_id": "latest"}) or {}
-    market_ctx.pop("_id", None)
-    leadership = alpha._build_leadership_context(market_ctx, params)
-
-    min_conf = params.get("min_confluence", 48)
-    max_rsi = params.get("max_rsi_entry", 68)
-    min_rsi = params.get("min_rsi_entry", 25)
-    max_rv = params.get("max_relative_volume", 3.0)
-    best_setups = params.get("best_setups", [])
-    worst_setups = params.get("worst_setups", [])
-
-    assets = {}
-    async for doc in db.assets.find({"ticker": {"$in": leader_tickers}}, LEADER_REPORT_FIELDS):
-        assets[doc.get("ticker")] = doc
-
-    rows = []
-    blockers = {}
-    for ticker, ret in leaders:
-        a = assets.get(ticker)
-        if not a:
-            continue
-        price = a.get("price", 0) or 0
-        rsi = a.get("rsi", 50) or 50
-        stype = a.get("setup_type", "neutral")
-        sector = a.get("sector_code", "")
-        rel_vol = a.get("relative_volume", 1) or 1
-        change_pct = a.get("change_pct", 0) or 0
-        ema20 = a.get("ema20", 0) or 0
-        ema50 = a.get("ema50", 0) or 0
-
-        reasons = []
-        if rsi > max_rsi:
-            reasons.append(f"RSI_HIGH {rsi:.0f}>{max_rsi}")
-        if rsi < min_rsi:
-            reasons.append(f"RSI_LOW {rsi:.0f}<{min_rsi}")
-        if rel_vol >= max_rv and not (rel_vol < 5.0 and 2.0 <= change_pct <= 8.0):
-            reasons.append(f"VOLUME {rel_vol:.1f}x")
-        if best_setups and stype not in best_setups:
-            reasons.append(f"SETUP {stype}")
-        if stype in worst_setups:
-            reasons.append(f"WORST_SETUP {stype}")
-
-        conf = alpha._calc_confluence(a, market_ctx, params, None)
-        threshold, flow = alpha._sector_threshold(sector, min_conf, leadership, params)
-        if conf["score"] < threshold:
-            reasons.append(f"CONFLUENCE {conf['score']}<{threshold}")
-
-        for reason in reasons:
-            key = reason.split(" ")[0]
-            blockers[key] = blockers.get(key, 0) + 1
-
-        rows.append({
-            "ticker": ticker,
-            "sector": sector,
-            "return_pct": ret,
-            "excess_vs_spy_pct": round(ret - spy_return, 2) if spy_return is not None else None,
-            "pct_from_high": a.get("pct_from_high"),
-            "rsi": round(float(rsi), 1),
-            "setup_type": stype,
-            "weekly_trend": (a.get("mtf") or {}).get("weekly_trend", "UNKNOWN"),
-            "uptrend_ema": bool(ema50 > 0 and price > ema20 > ema50),
-            "confluence_no_ml": conf["score"],
-            "threshold": threshold,
-            "sector_flow": flow,
-            "blocked_by": reasons,
-            "would_pass_alpha": not reasons,
-            "positive_factors": [f.get("name") for f in conf.get("factors", []) if f.get("pass") and f.get("pts", 0) != 0],
-        })
-
-    return {
-        "sessions": sessions,
-        "spy_return_pct": spy_return,
-        "leaders_analyzed": len(rows),
-        "leaders_beating_spy": sum(1 for r in rows if (r["excess_vs_spy_pct"] or 0) > 0),
-        "would_pass_alpha": sum(1 for r in rows if r["would_pass_alpha"]),
-        "blockers": dict(sorted(blockers.items(), key=lambda item: item[1], reverse=True)),
-        "regime_detail": market_ctx.get("regime_detail"),
-        "focus_sectors": leadership.get("focus", []),
-        "note": "Confluence ricalcolata senza ML; filtri Alpha replicati in sola lettura.",
-        "generated_at": datetime.utcnow().isoformat(),
-        "leaders": rows,
+        "avg_dps_multiplier": round(avg_dps_mult, 3),
+        "avg_kelly_multiplier": round(avg_kelly_mult, 3),
     }
