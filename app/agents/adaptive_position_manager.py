@@ -1048,7 +1048,8 @@ class AdaptivePositionManager(BaseAgent):
     # LEARNING
     # ==========================================
 
-        async def learn(self) -> dict:
+
+    async def learn(self) -> dict:
         """
         🧬 APM Learning Loop v3.0
 
