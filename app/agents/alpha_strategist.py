@@ -1785,7 +1785,7 @@ class AlphaStrategist(BaseAgent):
             "max_strategy_shadow": max_strategy_shadow,
         }
 
-       async def learn(self) -> dict:
+    async def learn(self) -> dict:
         """
         🧬 AlphaStrategist Learning Loop v3.0
 
