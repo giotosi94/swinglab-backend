@@ -14,10 +14,6 @@ def _get_orch():
     return _orch
 
 
-# ============================================
-# FULL PIPELINE (backward compatible)
-# ============================================
-
 @router.get("/status")
 async def agents_status():
     """Stato completo di tutti gli agenti + shared brain."""
@@ -34,21 +30,12 @@ async def run_pipeline():
     return await orch.run()
 
 
-# v3.0 Learning Machine — ora sicuro grazie a:
-# - get_position_trades() (aggregazione per posizione, no bias tranche)
-# - update_params_safe() con clamp 25%
-# - param history append-only
 LEARN_ALL_ENABLED = True
 
 
 @router.post("/learn")
 async def learn_all(force: bool = False):
-    """
-    🧬 Learning Loop per tutti gli agenti.
-
-    v3.0: abilitato di default. Usa aggregazione per posizione e clamp
-    sui parametri. Invia report Telegram riepilogativo.
-    """
+    """Learning Loop per tutti gli agenti."""
     if not LEARN_ALL_ENABLED and not force:
         return {
             "status": "disabled",
@@ -58,7 +45,6 @@ async def learn_all(force: bool = False):
     orch = _get_orch()
     results = await orch.learn_all()
 
-    # ---- Telegram summary ----
     try:
         from app.services.telegram_bot import send_telegram
 
@@ -69,7 +55,6 @@ async def learn_all(force: bool = False):
             status = res.get("status", "?")
             if status == "ok":
                 r = res.get("result") or {}
-                # Estrae i pezzi più utili per ogni agente
                 if name == "alpha_strategist":
                     msg += (
                         f"🎯 <b>Alpha</b>: WR {r.get('win_rate', '?')}% | "
@@ -118,9 +103,42 @@ async def learn_all(force: bool = False):
     }
 
 
-# ============================================
-# INDIVIDUAL AGENT ENDPOINTS
-# ============================================
+@router.post("/professional-report")
+async def generate_desk_brief():
+    """
+    Genera on-demand il Desk Brief professionale (LLM) e lo salva
+    in SharedBrain + market_context. Non richiede un pipeline completo.
+    """
+    try:
+        from app.services.professional_report import (
+            build_context_from_brain,
+            generate_professional_report,
+            save_professional_report,
+        )
+        ctx = await build_context_from_brain()
+        text = generate_professional_report(ctx)
+        if not text:
+            return {
+                "status": "skipped",
+                "message": "LLM non disponibile o risposta vuota",
+                "context_preview": {
+                    "regime": ctx.get("regime"),
+                    "focus": ctx.get("focus_sectors"),
+                    "avoid": ctx.get("avoid_sectors"),
+                },
+            }
+        await save_professional_report(text, meta={
+            "regime": ctx.get("regime"),
+            "source": "on_demand",
+        })
+        return {
+            "status": "ok",
+            "professional_report": text,
+            "generated_at": datetime.utcnow().isoformat(),
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
 
 @router.post("/macro/run")
 async def run_macro():
@@ -240,19 +258,11 @@ async def run_executor():
         return {"status": "error", "agent": "executor", "error": str(e)}
 
 
-# ============================================
-# SHARED BRAIN ENDPOINT
-# ============================================
-
 @router.get("/brain")
 async def get_brain():
     """Legge lo stato completo del shared brain."""
     return await brain.get_full_state()
 
-
-# ============================================
-# AGENT INTROSPECTION
-# ============================================
 
 @router.get("/{agent_name}/decisions")
 async def agent_decisions(agent_name: str, limit: int = 20):
@@ -289,10 +299,7 @@ async def agent_params(agent_name: str):
 
 @router.get("/{agent_name}/param-history")
 async def agent_param_history(agent_name: str, limit: int = 20):
-    """
-    🧬 v3.0 — Storico dei set di parametri (versioning).
-    Utile per audit e rollback.
-    """
+    """Storico dei set di parametri (versioning)."""
     orch = _get_orch()
     agent = orch.agents.get(agent_name)
     if not agent:
@@ -303,13 +310,9 @@ async def agent_param_history(agent_name: str, limit: int = 20):
     return {"agent": agent_name, "history": history}
 
 
-# ============================================
-# 🆕 v4.0 — APM ENDPOINTS
-# ============================================
-
 @router.get("/apm-history")
 async def apm_decisions(limit: int = 30):
-    """Ultime decisioni APM (HOLD, SCALE_OUT, EXIT, TIGHTEN_STOP)."""
+    """Ultime decisioni APM."""
     from app.db.mongodb import get_db
 
     db = get_db()
@@ -415,10 +418,7 @@ async def apm_summary(days: int = 7):
 
 @router.post("/apm/learn")
 async def apm_learn():
-    """
-    🧬 Trigger manuale del Learning Loop APM.
-    Analizza le decisioni, auto-aggiusta (se abilitato) e manda report Telegram.
-    """
+    """Trigger manuale del Learning Loop APM."""
     orch = _get_orch()
     try:
         result = await orch.apm.learn()
@@ -439,110 +439,4 @@ async def apm_force_run():
         "status": "reset",
         "message": "APM timer reset. Next pipeline will run APM.",
         "reset_at": datetime.utcnow().isoformat(),
-    }
-
-
-# ============================================
-# v4.5 — DPS + KELLY ANALYTICS ENDPOINT
-# ============================================
-
-@router.get("/dps/status")
-async def dps_kelly_status():
-    """Ritorna stato completo DPS + Kelly: params, trade stats, sizing history."""
-    from app.db.mongodb import get_db
-    from datetime import timedelta
-
-    db = get_db()
-
-    risk_params = await db.agent_memory_risk_manager.find_one({"_id": "params"})
-    params = risk_params or {}
-
-    trades = await db.trade_history.find({
-        "side": "sell",
-        "pnl_pct": {"$exists": True}
-    }).sort("date", -1).limit(100).to_list(100)
-
-    n_trades = len(trades)
-    kelly_min = params.get("kelly_min_trades", 20)
-    kelly_active = n_trades >= kelly_min
-
-    wins = [t for t in trades if t.get("pnl_pct", 0) > 0]
-    losses = [t for t in trades if t.get("pnl_pct", 0) <= 0]
-
-    win_rate = (len(wins) / n_trades * 100) if n_trades > 0 else 0
-    avg_win = (sum(t.get("pnl_pct", 0) for t in wins) / len(wins)) if wins else 0
-    avg_loss = abs(sum(t.get("pnl_pct", 0) for t in losses) / len(losses)) if losses else 0
-
-    kelly_pct = 0
-    if avg_win > 0 and avg_loss > 0 and wins and losses:
-        wr = win_rate / 100
-        lr = 1 - wr
-        kelly_pct = (wr * avg_win - lr * avg_loss) / avg_win * 100
-
-    fractional_factor = params.get("kelly_fractional_factor", 0.25)
-    fractional_kelly = max(0, kelly_pct * fractional_factor)
-
-    alpaca_state = await db.auto_trader.find_one({"_id": "alpaca_state"})
-    latest_risk = alpaca_state.get("risk_report", {}) if alpaca_state else {}
-
-    decisions = await db.agent_decisions_risk_manager.find({
-        "type": "trade_approved",
-        "created_at": {"$gte": datetime.utcnow() - timedelta(days=30)}
-    }).sort("created_at", -1).limit(30).to_list(30)
-
-    sizing_history = []
-    for d in decisions:
-        data = d.get("data", {})
-        sizing_history.append({
-            "ticker": data.get("ticker"),
-            "notional_usd": data.get("notional_usd", 0),
-            "dps_multiplier": data.get("dps_multiplier", 1.0),
-            "kelly_multiplier": data.get("kelly_multiplier", 1.0),
-            "confluence": data.get("confluence", 0),
-            "risk_reward": data.get("risk_reward", 0),
-            "date": d.get("created_at").isoformat() if d.get("created_at") else "",
-        })
-
-    multipliers_dist = {}
-    for s in sizing_history:
-        mult = s["dps_multiplier"]
-        bucket = round(mult * 10) / 10
-        multipliers_dist[str(bucket)] = multipliers_dist.get(str(bucket), 0) + 1
-
-    avg_dps_mult = sum(s["dps_multiplier"] for s in sizing_history) / len(sizing_history) if sizing_history else 1.0
-    avg_kelly_mult = sum(s["kelly_multiplier"] for s in sizing_history) / len(sizing_history) if sizing_history else 1.0
-
-    return {
-        "params": {
-            "dps_enabled": params.get("dps_enabled", True),
-            "dps_rr_ideal": params.get("dps_rr_ideal", 2.5),
-            "dps_ml_ideal": params.get("dps_ml_ideal", 75.0),
-            "dps_conf_ideal": params.get("dps_conf_ideal", 55.0),
-            "dps_max_multiplier": params.get("dps_max_multiplier", 1.6),
-            "dps_aggressiveness": params.get("dps_aggressiveness", 1.0),
-            "kelly_enabled": params.get("kelly_enabled", True),
-            "kelly_min_trades": kelly_min,
-            "kelly_fractional_factor": fractional_factor,
-        },
-        "kelly_status": {
-            "active": kelly_active,
-            "n_trades": n_trades,
-            "trades_needed": max(0, kelly_min - n_trades),
-            "win_rate": round(win_rate, 1),
-            "avg_win": round(avg_win, 2),
-            "avg_loss": round(avg_loss, 2),
-            "kelly_pct": round(kelly_pct, 2),
-            "fractional_kelly": round(fractional_kelly, 2),
-            "current_multiplier": latest_risk.get("kelly_multiplier", 1.0),
-        },
-        "current_risk_report": {
-            "kelly_multiplier": latest_risk.get("kelly_multiplier", 1.0),
-            "position_size_pct": latest_risk.get("position_size_pct", 12.0),
-            "risk_per_trade_usd": latest_risk.get("risk_per_trade_usd", 0),
-            "final_multiplier": latest_risk.get("final_multiplier", 0.6),
-        },
-        "sizing_history": sizing_history,
-        "multipliers_distribution": multipliers_dist,
-        "avg_dps_multiplier": round(avg_dps_mult, 3),
-        "avg_kelly_multiplier": round(avg_kelly_mult, 3),
     }
