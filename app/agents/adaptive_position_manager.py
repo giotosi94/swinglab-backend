@@ -1048,20 +1048,16 @@ class AdaptivePositionManager(BaseAgent):
     # LEARNING
     # ==========================================
 
-    async def learn(self) -> dict:
+        async def learn(self) -> dict:
         """
-        🧬 APM Learning Loop
+        🧬 APM Learning Loop v3.0
 
-        ⚠️ AUTO-TUNING DISABILITATO (audit P2-8).
-        La metrica precedente (exit_pnl > -1 = "corretto") non misurava
-        cosa succede DOPO l'uscita, quindi non poteva rilevare le uscite
-        premature — che sono esattamente il problema osservato sui 193
-        trade (+1.13% medio dopo l'exit). Peggio: con correct_rate >= 0.70
-        ABBASSAVA la soglia rendendo l'APM piu' aggressivo.
+        Metrica corretta: confronta il prezzo a +5 giorni dall'EXIT.
+        - Se il prezzo sale dopo EXIT → uscita prematura → alza soglie EXIT
+        - Se il prezzo scende dopo EXIT → uscita corretta → può abbassare leggermente
 
-        Ora il loop produce solo statistiche e report, senza toccare i
-        parametri. Riattivare dopo aver riscritto la metrica confrontando
-        il prezzo a +5/+10 giorni dall'uscita.
+        Usa update_params_safe() (clamp 25%) e scrive in param history.
+        Report Telegram sempre inviato.
         """
         db = get_db()
         params = await self.get_params()
@@ -1076,7 +1072,7 @@ class AdaptivePositionManager(BaseAgent):
             return {
                 "message": "Not enough decisions to learn (need 10+)",
                 "count": len(decisions),
-                "auto_tuning": "disabled",
+                "auto_tuning": "skipped",
             }
 
         stats = {
@@ -1099,14 +1095,13 @@ class AdaptivePositionManager(BaseAgent):
                     "created_at": d.get("created_at"),
                 })
 
-        # ---- Analisi EXIT: cosa e' successo DOPO l'uscita ----
+        # ---- Analisi EXIT: cosa è successo DOPO l'uscita (+5 giorni) ----
         exit_analysis = {
             "total_analyzed": 0,
             "price_higher_after": 0,
             "price_lower_after": 0,
             "avg_move_after_pct": 0.0,
         }
-
         moves_after = []
 
         for exit_dec in stats["EXIT"]["outcomes"]:
@@ -1165,6 +1160,41 @@ class AdaptivePositionManager(BaseAgent):
             hold_stats["avg_pnl"] = round(sum(pnls) / len(pnls), 2)
             hold_stats["wins_ratio"] = round(wins / len(pnls) * 100, 1)
 
+        # ---- AUTO-TUNING (v3.0) ----
+        adjustments = []
+        proposed = {}
+
+        n_analyzed = exit_analysis["total_analyzed"]
+        if n_analyzed >= 5:
+            premature_ratio = exit_analysis["price_higher_after"] / n_analyzed
+            avg_move = exit_analysis["avg_move_after_pct"]
+
+            conf_th = params.get("apm_exit_confluence_threshold", 25)
+            ml_th = params.get("apm_exit_ml_threshold", 35)
+            min_neg = params.get("apm_exit_min_negative_factors", 3)
+            min_hold = params.get("apm_min_holding_hours", 24)
+
+            if premature_ratio >= 0.55 or avg_move > 1.5:
+                proposed["apm_exit_confluence_threshold"] = min(40, conf_th + 3)
+                proposed["apm_exit_ml_threshold"] = min(50, ml_th + 3)
+                proposed["apm_exit_min_negative_factors"] = min(5, min_neg + 1)
+                proposed["apm_min_holding_hours"] = min(48, min_hold + 6)
+                adjustments.append(
+                    f"Uscite premature {premature_ratio*100:.0f}% (avg +{avg_move:.1f}%) → soglie EXIT alzate"
+                )
+            elif premature_ratio <= 0.30 and avg_move < -0.5 and n_analyzed >= 8:
+                proposed["apm_exit_confluence_threshold"] = max(18, conf_th - 2)
+                proposed["apm_exit_ml_threshold"] = max(25, ml_th - 2)
+                adjustments.append(
+                    f"EXIT corrette (premature {premature_ratio*100:.0f}%, avg {avg_move:.1f}%) → soglie leggermente abbassate"
+                )
+
+        update_result = {"updated": False, "changes": {}}
+        if proposed:
+            update_result = await self.update_params_safe(proposed, reason="apm_learn_v3")
+            if update_result.get("updated"):
+                params = update_result["params"]
+
         await self.save_performance({
             "total_decisions": len(decisions),
             "hold_count": stats["HOLD"]["count"],
@@ -1175,13 +1205,15 @@ class AdaptivePositionManager(BaseAgent):
             "exit_premature_count": exit_analysis["price_higher_after"],
             "avg_hold_pnl": hold_stats["avg_pnl"],
             "hold_wins_ratio": hold_stats["wins_ratio"],
-            "auto_tuning": "disabled",
+            "auto_tuning": "enabled" if proposed else "no_signal",
+            "adjustments": adjustments,
         })
 
+        # ---- Telegram report ----
         try:
             from app.services.telegram_bot import send_telegram
 
-            msg = "🧬 <b>APM Learning Report</b>\n\n"
+            msg = "🧬 <b>APM Learning Report v3.0</b>\n\n"
             msg += "📊 <b>Ultimi 30 giorni:</b>\n"
             msg += f"  Total decisioni: {len(decisions)}\n"
             msg += f"  🟢 HOLD: {stats['HOLD']['count']}\n"
@@ -1190,22 +1222,33 @@ class AdaptivePositionManager(BaseAgent):
             msg += f"  🛡️ TIGHTEN: {stats['TIGHTEN_STOP']['count']}\n\n"
 
             if exit_analysis["total_analyzed"] > 0:
-                msg += "🚪 <b>Cosa e' successo dopo le EXIT (5g):</b>\n"
+                msg += "🚪 <b>Dopo le EXIT (+5g):</b>\n"
                 msg += f"  Analizzate: {exit_analysis['total_analyzed']}\n"
-                msg += f"  Prezzo SALITO dopo: {exit_analysis['price_higher_after']} (uscite premature)\n"
-                msg += f"  Prezzo SCESO dopo: {exit_analysis['price_lower_after']} (uscite corrette)\n"
+                msg += f"  Prezzo SALITO: {exit_analysis['price_higher_after']} (premature)\n"
+                msg += f"  Prezzo SCESO: {exit_analysis['price_lower_after']} (corrette)\n"
                 msg += f"  Movimento medio: {exit_analysis['avg_move_after_pct']:+.2f}%\n\n"
 
             msg += "📈 <b>HOLD stats:</b>\n"
             msg += f"  Avg P&L: {hold_stats['avg_pnl']:+.2f}%\n"
             msg += f"  Wins ratio: {hold_stats['wins_ratio']}%\n\n"
-            msg += "🔒 <b>Auto-tuning disabilitato</b> (protocollo 50 trade)\n"
+
+            if update_result.get("updated"):
+                msg += "⚙️ <b>Auto-tuning applicato:</b>\n"
+                for k, ch in update_result.get("changes", {}).items():
+                    clamped = " (clamped)" if ch.get("clamped") else ""
+                    msg += f"  {k}: {ch['from']} → {ch['to']}{clamped}\n"
+                for a in adjustments:
+                    msg += f"  • {a}\n"
+            else:
+                msg += "🔒 Nessun aggiustamento (dati insufficienti o segnale neutro)\n"
 
             await send_telegram(msg)
         except Exception as e:
             print(f"  APM Learning Telegram error: {e}")
 
-        print(f"🧬 APM LEARN: {len(decisions)} decisions analyzed, auto-tuning OFF")
+        print(f"🧬 APM LEARN v3: {len(decisions)} decisions, "
+              f"premature={exit_analysis['price_higher_after']}/{exit_analysis['total_analyzed']}, "
+              f"updated={update_result.get('updated')}")
 
         return {
             "total_decisions": len(decisions),
@@ -1216,8 +1259,10 @@ class AdaptivePositionManager(BaseAgent):
                 "apm_exit_confluence_threshold": params.get("apm_exit_confluence_threshold"),
                 "apm_exit_ml_threshold": params.get("apm_exit_ml_threshold"),
                 "apm_exit_min_negative_factors": params.get("apm_exit_min_negative_factors"),
+                "apm_min_holding_hours": params.get("apm_min_holding_hours"),
             },
-            "auto_tuning": "disabled",
-            "adjustments": [],
+            "auto_tuning": "enabled" if proposed else "no_signal",
+            "adjustments": adjustments,
+            "param_changes": update_result.get("changes", {}),
             "learned_at": datetime.utcnow().isoformat(),
         }
