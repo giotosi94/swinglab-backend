@@ -1785,77 +1785,103 @@ class AlphaStrategist(BaseAgent):
             "max_strategy_shadow": max_strategy_shadow,
         }
 
-    async def learn(self) -> dict:
-        """Learning loop (invariato dalla v1.0)."""
+       async def learn(self) -> dict:
+        """
+        🧬 AlphaStrategist Learning Loop v3.0
+
+        - Aggrega per POSIZIONE (buy_order_id) → elimina il bias dei scale-out/tranche
+        - Time-decay sui trade
+        - Aggiorna min_confluence, max_rsi_entry, best/worst_setups, weak_sectors
+        - Usa update_params_safe() (clamp 25%) + param history
+        """
         db = get_db()
         params = await self.get_params()
-        fw = params.get("factor_weights", self.default_params()["factor_weights"])
 
-        trades = await db.trade_history.find({"side": "sell"}).to_list(500)
+        # Usa l'helper del BaseAgent v3 (aggregazione per posizione)
+        positions = await self.get_position_trades(lookback_days=180)
 
-        if len(trades) < self.min_decisions_to_learn:
-            return {"message": "Not enough trades to learn", "trades": len(trades)}
+        if len(positions) < self.min_decisions_to_learn:
+            return {
+                "message": "Not enough closed positions to learn",
+                "positions": len(positions),
+            }
 
-        wins = [t for t in trades if t.get("pnl_pct", 0) > 0]
-        losses = [t for t in trades if t.get("pnl_pct", 0) <= 0]
-        total = len(trades)
-        win_rate = len(wins) / total * 100 if total > 0 else 50
-
+        # Statistiche pesate
+        total_weight = 0.0
+        win_weight = 0.0
         setup_stats = {}
-        for t in trades:
-            st = t.get("setup_type", "unknown")
-            weight = self.calc_weight(t.get("date", datetime.utcnow()))
-            if st not in setup_stats:
-                setup_stats[st] = {"wins": 0, "losses": 0, "w_wins": 0, "w_losses": 0, "total_pnl": 0}
-            if t.get("pnl_pct", 0) > 0:
-                setup_stats[st]["wins"] += 1
-                setup_stats[st]["w_wins"] += weight
-            else:
-                setup_stats[st]["losses"] += 1
-                setup_stats[st]["w_losses"] += weight
-            setup_stats[st]["total_pnl"] += t.get("pnl_pct", 0)
+        sector_stats = {}
+        conf_buckets = {"high": {"w": 0.0, "l": 0.0}, "mid": {"w": 0.0, "l": 0.0}, "low": {"w": 0.0, "l": 0.0}}
+        rsi_loss_weights = []
+        rsi_loss_values = []
 
+        for pos in positions:
+            w = pos.get("weight", 0.5)
+            pnl = pos.get("total_pnl_pct", 0)
+            sample = pos.get("sample_trade") or {}
+            is_win = pnl > 0
+
+            total_weight += w
+            if is_win:
+                win_weight += w
+
+            # Setup
+            st = sample.get("setup_type", "unknown")
+            if st not in setup_stats:
+                setup_stats[st] = {"w_wins": 0.0, "w_losses": 0.0, "count": 0}
+            if is_win:
+                setup_stats[st]["w_wins"] += w
+            else:
+                setup_stats[st]["w_losses"] += w
+            setup_stats[st]["count"] += 1
+
+            # Settore
+            sec = sample.get("sector", "unknown")
+            if sec not in sector_stats:
+                sector_stats[sec] = {"w_wins": 0.0, "w_losses": 0.0, "count": 0}
+            if is_win:
+                sector_stats[sec]["w_wins"] += w
+            else:
+                sector_stats[sec]["w_losses"] += w
+            sector_stats[sec]["count"] += 1
+
+            # Confluence bucket
+            conf = sample.get("confluence", 50)
+            bucket = "high" if conf >= 60 else ("mid" if conf >= 35 else "low")
+            if is_win:
+                conf_buckets[bucket]["w"] += w
+            else:
+                conf_buckets[bucket]["l"] += w
+
+            # RSI sulle perdite
+            if not is_win and sample.get("rsi_at_entry") is not None:
+                rsi_loss_weights.append(w)
+                rsi_loss_values.append(float(sample["rsi_at_entry"]))
+
+        win_rate = (win_weight / total_weight * 100) if total_weight > 0 else 50.0
+
+        # Best / Worst setups
         best_setups = []
         worst_setups = []
         for st, stats in setup_stats.items():
             w_total = stats["w_wins"] + stats["w_losses"]
-            raw_total = stats["wins"] + stats["losses"]
-            if raw_total >= 3:
-                w_wr = (stats["w_wins"] / w_total * 100) if w_total > 0 else 50
+            if stats["count"] >= 3 and w_total > 0:
+                w_wr = stats["w_wins"] / w_total * 100
                 if w_wr >= 55:
                     best_setups.append(st)
                 elif w_wr < 35:
                     worst_setups.append(st)
 
-        sector_stats = {}
-        for t in trades:
-            sec = t.get("sector", "unknown")
-            weight = self.calc_weight(t.get("date", datetime.utcnow()))
-            if sec not in sector_stats:
-                sector_stats[sec] = {"w_wins": 0, "w_losses": 0, "total": 0}
-            if t.get("pnl_pct", 0) > 0:
-                sector_stats[sec]["w_wins"] += weight
-            else:
-                sector_stats[sec]["w_losses"] += weight
-            sector_stats[sec]["total"] += 1
-
+        # Weak sectors
         weak_sectors = []
         for sec, stats in sector_stats.items():
             w_total = stats["w_wins"] + stats["w_losses"]
-            if stats["total"] >= 3 and w_total > 0:
+            if stats["count"] >= 3 and w_total > 0:
                 if (stats["w_wins"] / w_total) < 0.35:
                     weak_sectors.append(sec)
 
-        conf_buckets = {"high": {"w": 0, "l": 0}, "mid": {"w": 0, "l": 0}, "low": {"w": 0, "l": 0}}
-        for t in trades:
-            conf = t.get("confluence", 50)
-            bucket = "high" if conf >= 60 else ("mid" if conf >= 35 else "low")
-            if t.get("pnl_pct", 0) > 0:
-                conf_buckets[bucket]["w"] += 1
-            else:
-                conf_buckets[bucket]["l"] += 1
-
-        min_conf = params.get("min_confluence", 35)
+        # Aggiustamento min_confluence
+        min_conf = params.get("min_confluence", 48)
         low_total = conf_buckets["low"]["w"] + conf_buckets["low"]["l"]
         mid_total = conf_buckets["mid"]["w"] + conf_buckets["mid"]["l"]
 
@@ -1868,50 +1894,49 @@ class AlphaStrategist(BaseAgent):
         if mid_total >= 3:
             mid_wr = conf_buckets["mid"]["w"] / mid_total
             if mid_wr > 0.65:
-                min_conf = max(min_conf - 2, 42)  # 🔧 floor a 42 (non scende sotto)
+                min_conf = max(min_conf - 2, 42)  # floor a 42
 
-        rsi_losses = [t.get("rsi_at_entry", 50) for t in losses if t.get("rsi_at_entry")]
+        # Aggiustamento max_rsi_entry
         max_rsi = params.get("max_rsi_entry", 68)
-        if rsi_losses:
-            avg_loss_rsi = sum(rsi_losses) / len(rsi_losses)
+        if rsi_loss_values and sum(rsi_loss_weights) > 0:
+            avg_loss_rsi = sum(v * w for v, w in zip(rsi_loss_values, rsi_loss_weights)) / sum(rsi_loss_weights)
             if avg_loss_rsi > 62:
                 max_rsi = 60
             elif avg_loss_rsi > 55:
                 max_rsi = 65
 
-        params["best_setups"] = best_setups if best_setups else self.default_params()["best_setups"]
-        params["worst_setups"] = worst_setups
-        # weak_sectors viene ancora calcolato e salvato perche' e' utile
-        # saperlo, ma non penalizza piu' gli acquisti: se ne occupa la
-        # leadership del MacroAnalyst, che guarda il mercato e non solo
-        # lo storico dei nostri trade.
-        params["weak_sectors"] = weak_sectors
-        params["min_confluence"] = round(min_conf, 1)
-        params["max_rsi_entry"] = max_rsi
+        # Prepara i nuovi parametri
+        proposed = {
+            "best_setups": best_setups if best_setups else self.default_params()["best_setups"],
+            "worst_setups": worst_setups,
+            "weak_sectors": weak_sectors,
+            "min_confluence": round(min_conf, 1),
+            "max_rsi_entry": max_rsi,
+        }
 
-        await self.save_params(params)
+        # Aggiornamento sicuro
+        update_result = await self.update_params_safe(proposed, reason="alpha_learn_v3")
 
         learn_result = {
             "win_rate": round(win_rate, 1),
-            "total_trades": total,
+            "total_positions": len(positions),
             "best_setups": best_setups,
             "worst_setups": worst_setups,
             "weak_sectors": weak_sectors,
-            "min_confluence": min_conf,
+            "min_confluence": proposed["min_confluence"],
             "max_rsi": max_rsi,
-            "setup_stats": {k: {"win_rate": round(v["wins"]/(v["wins"]+v["losses"])*100, 1)
-                                if (v["wins"]+v["losses"]) > 0 else 0,
-                                "trades": v["wins"]+v["losses"]}
-                           for k, v in setup_stats.items()},
+            "param_changes": update_result.get("changes", {}),
+            "updated": update_result.get("updated", False),
         }
 
         await self.save_performance({
             "win_rate": round(win_rate, 1),
-            "total_trades": total,
-            "min_confluence": min_conf,
+            "total_positions": len(positions),
+            "min_confluence": proposed["min_confluence"],
         })
 
-        print(f"🎯 AlphaStrategist LEARN: WR={win_rate:.1f}%, "
-              f"best={best_setups}, worst={worst_setups}")
+        print(f"🎯 AlphaStrategist LEARN v3: WR={win_rate:.1f}%, "
+              f"positions={len(positions)}, min_conf={proposed['min_confluence']}, "
+              f"updated={update_result.get('updated')}")
 
         return learn_result
