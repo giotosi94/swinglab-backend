@@ -4,11 +4,11 @@ Professional Trader Report Generator
 Generates a single, continuous market analysis written as a senior
 portfolio manager would write the daily desk brief.
 
-Called at the end of every pipeline run (Orchestrator).
+Called at the end of every pipeline run (Orchestrator) or on-demand
+via POST /api/agents/professional-report.
 """
 
 from datetime import datetime
-from typing import Optional
 from app.services.llm_service import llm_ask, llm_available
 
 
@@ -88,18 +88,21 @@ def build_user_prompt(context):
 def generate_professional_report(context):
     """Genera il report. Ritorna None se LLM non disponibile."""
     if not llm_available():
+        print("  professional_report: llm_available() = False")
         return None
 
     user_prompt = build_user_prompt(context)
+    # agent_name=None: niente cooldown/cache agent (dopo pipeline e' spesso in cooldown)
     text = llm_ask(
         system_prompt=SYSTEM_PROMPT,
         user_prompt=user_prompt,
         max_tokens=450,
         temperature=0.35,
-        agent_name="professional_report",
+        agent_name=None,
     )
     if text and len(text.strip()) > 80:
         return text.strip()
+    print("  professional_report: llm_ask returned empty/short")
     return None
 
 
@@ -130,3 +133,51 @@ async def save_professional_report(report_text, meta=None):
         )
     except Exception as e:
         print("  professional_report market_context write error: %s" % e)
+
+
+async def build_context_from_brain():
+    """Costruisce il context dal SharedBrain + market_context per generazione on-demand."""
+    from app.db.mongodb import get_db
+    from app.agents.shared_brain import brain
+
+    db = get_db()
+    market = await brain.get_market() or {}
+    candidates = await brain.get_candidates() or {}
+    approved = await brain.get_approved() or {}
+    executions = await brain.get_executions() or {}
+    ctx_doc = await db.market_context.find_one({"_id": "latest"}) or {}
+
+    buy = candidates.get("buy") or []
+    top_picks = []
+    for c in buy[:6]:
+        if isinstance(c, dict) and c.get("ticker"):
+            top_picks.append(c["ticker"])
+
+    sells = []
+    for s in (candidates.get("sell") or [])[:5]:
+        if isinstance(s, dict) and s.get("ticker"):
+            sells.append(s["ticker"])
+
+    risk_report = approved.get("risk_report") or {}
+
+    return {
+        "regime": market.get("regime") or ctx_doc.get("market_regime"),
+        "regime_detail": market.get("regime_detail") or ctx_doc.get("regime_detail"),
+        "confidence": market.get("confidence") or ctx_doc.get("regime_confidence"),
+        "exposure_multiplier": market.get("exposure_multiplier") or ctx_doc.get("exposure_multiplier"),
+        "breadth_pct": market.get("breadth_pct") or ctx_doc.get("breadth_pct"),
+        "volatility": market.get("volatility") or ctx_doc.get("volatility_regime"),
+        "leadership": market.get("leadership") or ctx_doc.get("leadership", {}).get("state") if isinstance(ctx_doc.get("leadership"), dict) else ctx_doc.get("leadership_state"),
+        "rotation": market.get("rotation") or ctx_doc.get("rotation_signal") or ctx_doc.get("rotation_state"),
+        "focus_sectors": ctx_doc.get("focus_sectors") or [],
+        "avoid_sectors": ctx_doc.get("avoid_sectors") or [],
+        "macro_llm": market.get("llm_reasoning") or ctx_doc.get("llm_reasoning"),
+        "risk_llm": risk_report.get("llm_reasoning") if isinstance(risk_report, dict) else None,
+        "apm_summary": {},
+        "top_picks": top_picks,
+        "sells": sells,
+        "approved_count": len(approved.get("trades") or []),
+        "rejected_count": 0,
+        "executed_buys": len(executions.get("last_buys") or []),
+        "executed_sells": len(executions.get("last_sells") or []),
+    }
