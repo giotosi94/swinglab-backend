@@ -8,6 +8,7 @@ Called at the end of every pipeline run (Orchestrator).
 """
 
 from datetime import datetime
+from typing import Optional
 from app.services.llm_service import llm_ask, llm_available
 
 
@@ -30,8 +31,8 @@ def _safe(v, default="N/D"):
     return v if v is not None and v != "" else default
 
 
-def build_user_prompt(context: dict) -> str:
-    """Costruisce il prompt utente dai dati già prodotti dalla pipeline."""
+def build_user_prompt(context):
+    """Costruisce il prompt utente dai dati gia' prodotti dalla pipeline."""
     regime = _safe(context.get("regime"))
     detail = _safe(context.get("regime_detail"))
     conf = context.get("confidence", 0)
@@ -53,29 +54,29 @@ def build_user_prompt(context: dict) -> str:
     executed_sells = context.get("executed_sells", 0)
 
     lines = [
-        f"Regime: {regime} / dettaglio {detail} (confidenza {conf})",
-        f"Esposizione consentita: {round(float(exposure or 0) * 100)}%",
-        f"Breadth (sopra EMA50): {breadth}%  |  Volatilità: {vol}",
-        f"Leadership: {leadership}  |  Rotazione: {rotation}",
+        "Regime: %s / dettaglio %s (confidenza %s)" % (regime, detail, conf),
+        "Esposizione consentita: %s%%" % round(float(exposure or 0) * 100),
+        "Breadth (sopra EMA50): %s%%  |  Volatilita': %s" % (breadth, vol),
+        "Leadership: %s  |  Rotazione: %s" % (leadership, rotation),
     ]
     if focus:
-        lines.append(f"Settori FOCUS: {', '.join(focus[:5])}")
+        lines.append("Settori FOCUS: %s" % ", ".join(focus[:5]))
     if avoid:
-        lines.append(f"Settori da EVITARE: {', '.join(avoid[:5])}")
+        lines.append("Settori da EVITARE: %s" % ", ".join(avoid[:5]))
     if top_picks:
-        lines.append(f"Top candidati Alpha: {', '.join(top_picks[:6])}")
+        lines.append("Top candidati Alpha: %s" % ", ".join(top_picks[:6]))
     if sells:
-        lines.append(f"Sell signals: {', '.join(sells[:5])}")
+        lines.append("Sell signals: %s" % ", ".join(sells[:5]))
     lines.append(
-        f"Risk: approvati {approved}, rifiutati {rejected} | "
-        f"Eseguiti oggi: BUY {executed_buys}, SELL {executed_sells}"
+        "Risk: approvati %s, rifiutati %s | Eseguiti oggi: BUY %s, SELL %s"
+        % (approved, rejected, executed_buys, executed_sells)
     )
     if apm_summary:
-        lines.append(f"APM summary: {apm_summary}")
+        lines.append("APM summary: %s" % apm_summary)
     if macro_llm:
-        lines.append(f"Nota Macro già prodotta: {macro_llm[:350]}")
+        lines.append("Nota Macro gia' prodotta: %s" % macro_llm[:350])
     if risk_llm:
-        lines.append(f"Nota Risk già prodotta: {risk_llm[:250]}")
+        lines.append("Nota Risk gia' prodotta: %s" % risk_llm[:250])
 
     lines.append(
         "\nScrivi ora l'analisi professionale completa del desk, "
@@ -84,10 +85,8 @@ def build_user_prompt(context: dict) -> str:
     return "\n".join(lines)
 
 
-def generate_professional_report(context: dict) -> str | None:
-    """
-    Genera il report. Ritorna None se LLM non disponibile.
-    """
+def generate_professional_report(context):
+    """Genera il report. Ritorna None se LLM non disponibile."""
     if not llm_available():
         return None
 
@@ -104,7 +103,7 @@ def generate_professional_report(context: dict) -> str | None:
     return None
 
 
-async def save_professional_report(report_text: str, meta: dict | None = None):
+async def save_professional_report(report_text, meta=None):
     """Salva report su SharedBrain (market) e su market_context."""
     from app.db.mongodb import get_db
     from app.agents.shared_brain import brain
@@ -116,15 +115,13 @@ async def save_professional_report(report_text: str, meta: dict | None = None):
         "professional_report_meta": meta or {},
     }
 
-    # SharedBrain market section
     try:
         market = await brain.get_market()
         market.update(payload)
         await brain.write_market(market)
     except Exception as e:
-        print(f"  professional_report brain write error: {e}")
+        print("  professional_report brain write error: %s" % e)
 
-    # market_context collection (usata dalla Dashboard)
     try:
         await db.market_context.update_one(
             {"_id": "latest"},
@@ -132,4 +129,4 @@ async def save_professional_report(report_text: str, meta: dict | None = None):
             upsert=True,
         )
     except Exception as e:
-        print(f"  professional_report market_context write error: {e}")
+        print("  professional_report market_context write error: %s" % e)
