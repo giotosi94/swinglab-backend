@@ -12,7 +12,6 @@ from app.services.alpaca_trader import get_account, get_positions
 from app.db.mongodb import get_db
 
 
-# Campi esclusi dal reload asset per l'APM.
 APM_ASSET_PROJECTION = {
     "price_history": 0,
     "vp_distribution": 0,
@@ -319,12 +318,9 @@ class Orchestrator:
             print(f"   Errors: {report['errors']}")
         print(f"{'=' * 60}")
 
-        # Professional Trader Report
+        # Professional Trader Report (genera solo se contesto cambiato o stale)
         try:
-            from app.services.professional_report import (
-                generate_professional_report,
-                save_professional_report,
-            )
+            from app.services.professional_report import generate_and_save_if_needed
             leadership_obj = market_context.get("leadership") or {}
             leadership_state = leadership_obj.get("state") if isinstance(leadership_obj, dict) else leadership_obj
             apm_summary = {}
@@ -355,16 +351,10 @@ class Orchestrator:
                 "executed_buys": len(exec_result.get("executed_buys", [])),
                 "executed_sells": len(exec_result.get("executed_sells", [])),
             }
-            pro_text = generate_professional_report(report_ctx)
-            if pro_text:
-                await save_professional_report(pro_text, meta={
-                    "regime": report_ctx.get("regime"),
-                    "exposure": report_ctx.get("exposure_multiplier"),
-                })
-                report["professional_report"] = pro_text[:120] + "..."
-                print("  Professional report generated and saved")
-            else:
-                print("  Professional report skipped (LLM unavailable)")
+            pro_res = await generate_and_save_if_needed(report_ctx, force=False)
+            report["professional_report_status"] = pro_res.get("status")
+            if pro_res.get("text"):
+                report["professional_report"] = pro_res["text"][:120] + "..."
         except Exception as e:
             print(f"  Professional report error: {e}")
             report["errors"].append(f"ProfessionalReport: {str(e)}")
@@ -393,9 +383,13 @@ class Orchestrator:
             params = await agent.get_params()
             recent = await agent.get_recent_decisions(limit=5)
             perf = await agent.get_performance_history(limit=5)
-            status[name] = {"params": params, "recent_decisions": recent, "performance": perf}
-        pipeline_state = await db.auto_trader.find_one({"_id": "alpaca_state"})
-        if pipeline_state:
-            pipeline_state["_id"] = str(pipeline_state["_id"])
-        brain_state = await brain.get_full_state()
-        return {"agents": status, "pipeline_state": pipeline_state, "shared_brain": brain_state}
+            status[name] = {
+                "params": params,
+                "recent_decisions": recent,
+                "performance": perf,
+            }
+        state = await db.auto_trader.find_one({"_id": "alpaca_state"})
+        if state:
+            state["_id"] = str(state["_id"])
+        status["pipeline_state"] = state
+        return status
