@@ -14,11 +14,10 @@ Token policy:
 - Rigenera solo se contesto cambiato o report piu' vecchio di N ore
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime
 from app.services.llm_service import llm_ask, llm_available
 
 
-# Quante ore puo' restare valido un brief se il contesto non cambia
 REPORT_MAX_AGE_HOURS = 6
 
 SYSTEM_PROMPT = """Sei un portfolio manager senior (swing trading US, 3-20 giorni).
@@ -59,7 +58,7 @@ def context_fingerprint(context):
 
 
 def build_user_prompt(context):
-    """Prompt utente compatto: solo fatti operativi, zero ripetizioni lunghe."""
+    """Prompt utente compatto: solo fatti operativi."""
     regime = _safe(context.get("regime"))
     detail = _safe(context.get("regime_detail"))
     conf = context.get("confidence", 0)
@@ -96,7 +95,6 @@ def build_user_prompt(context):
         "Risk oggi: appro %s / rej %s | exec BUY %s SELL %s"
         % (approved, rejected, executed_buys, executed_sells)
     )
-    # Nota macro solo se corta (risparmio token input)
     macro_llm = (context.get("macro_llm") or "").strip()
     if macro_llm and len(macro_llm) <= 180:
         lines.append("Nota macro: %s" % macro_llm)
@@ -108,13 +106,11 @@ def build_user_prompt(context):
 
 
 def _looks_truncated(text):
-    """True se sembra tagliato a meta' frase."""
     t = (text or "").strip()
     if not t or len(t) < 80:
         return True
-    if t[-1] in ".!?:;\"'"":
+    if t[-1] in ".!?:;\"'":
         return False
-    # finisce con virgola / parola spezzata
     return True
 
 
@@ -138,7 +134,6 @@ def generate_professional_report(context):
 
     text = text.strip()
     if _looks_truncated(text):
-        # Non salvare pezzi a meta' frase: spreca UI e confonde
         print("  professional_report: output truncated, discarded")
         return None
 
@@ -146,12 +141,7 @@ def generate_professional_report(context):
 
 
 async def should_regenerate_report(context):
-    """
-    True solo se conviene spendere token:
-    - nessun report in DB
-    - report piu' vecchio di REPORT_MAX_AGE_HOURS
-    - fingerprint contesto cambiato (regime/focus/exp/picks)
-    """
+    """True solo se conviene spendere token."""
     from app.db.mongodb import get_db
 
     db = get_db()
@@ -182,7 +172,6 @@ async def should_regenerate_report(context):
 
 
 async def save_professional_report(report_text, meta=None):
-    """Salva report su SharedBrain (market) e su market_context."""
     from app.db.mongodb import get_db
     from app.agents.shared_brain import brain
 
@@ -211,10 +200,7 @@ async def save_professional_report(report_text, meta=None):
 
 
 async def generate_and_save_if_needed(context, force=False):
-    """
-    Entry-point pipeline: genera solo se serve.
-    Ritorna dict {status, text?, reason}
-    """
+    """Genera solo se serve. Ritorna dict {status, text?, reason}."""
     fp = context_fingerprint(context)
 
     if not force:
@@ -263,10 +249,12 @@ async def build_context_from_brain():
     risk_report = approved.get("risk_report") or {}
 
     leadership = market.get("leadership")
- if isinstance(ctx_doc.get("leadership"), dict):
-            leadership = leadership or ctx_doc.get("leadership", {}).get("state")
+    if not leadership:
+        lead_doc = ctx_doc.get("leadership")
+        if isinstance(lead_doc, dict):
+            leadership = lead_doc.get("state")
         else:
-            leadership = leadership or ctx_doc.get("leadership_state")
+            leadership = ctx_doc.get("leadership_state")
 
     return {
         "regime": market.get("regime") or ctx_doc.get("market_regime"),
