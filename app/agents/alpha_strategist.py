@@ -1219,6 +1219,26 @@ class AlphaStrategist(BaseAgent):
             upsert=True,
         )
 
+# ============================================
+        # LLM SHADOW (log-only) — Max Strategy
+        # ============================================
+        try:
+            llm_shadow_summary = await run_max_strategy_llm_shadow(
+                max_strategy_shadow, market_ctx, limit=8
+            )
+            await db.agent_state.update_one(
+                {"_id": "max_strategy_llm_shadow"},
+                {"$set": {**llm_shadow_summary, "updated_at": datetime.utcnow()}},
+                upsert=True,
+            )
+            print(
+                f"  🧠 Max LLM shadow: "
+                f"{llm_shadow_summary.get('n_parsed', 0)} parsed · "
+                f"agree={llm_shadow_summary.get('agreement', 0)} · "
+                f"diverge={llm_shadow_summary.get('divergence', 0)}"
+            )
+        except Exception as e:
+            print(f"  ⚠️ Max Strategy LLM shadow error: {e}")
         # Conta settori delle posizioni aperte
         open_sectors = []
         for t in open_tickers:
