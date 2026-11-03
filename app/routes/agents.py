@@ -45,6 +45,47 @@ async def learn_all(force: bool = False):
     orch = _get_orch()
     results = await orch.learn_all()
 
+    # Guardrail post-learn (Alpha): valuta PRIMA, poi aggiorna baseline
+    try:
+        alpha = orch.agents.get("alpha_strategist")
+        if alpha and hasattr(alpha, "evaluate_guardrail"):
+            ares = (results.get("alpha_strategist") or {}).get("result") or {}
+            wr = ares.get("win_rate")
+            npos = ares.get("total_positions") or ares.get("positions") or ares.get("total_trades")
+            if wr is not None:
+                guard = await alpha.evaluate_guardrail(
+                    current_win_rate=float(wr),
+                    current_sample_count=int(npos or 0) if npos is not None else None,
+                )
+                results.setdefault("alpha_strategist", {}).setdefault("result", {})["guardrail"] = guard
+                if guard.get("action") == "rollback":
+                    try:
+                        from app.services.telegram_bot import send_telegram
+                        rb = guard.get("rollback") or {}
+                        await send_telegram(
+                            "⚠️ <b>ROLLBACK Alpha</b>\n"
+                            f"v{rb.get('from_version')} → hist v{rb.get('restored_history_version')} "
+                            f"(new v{rb.get('new_param_version')})\n"
+                            f"WR {guard.get('current_wr')}% < baseline {guard.get('baseline_wr')}% "
+                            f"(drop {guard.get('drop_pts')} pts)"
+                        )
+                    except Exception as te:
+                        print(f"  Guardrail telegram error: {te}")
+                elif hasattr(alpha, "set_learn_baseline"):
+                    ver = ares.get("param_version")
+                    if ver is None:
+                        raw = await alpha.get_params_raw()
+                        ver = raw.get("param_version")
+                    await alpha.set_learn_baseline(
+                        win_rate=float(wr),
+                        sample_count=int(npos or 0),
+                        param_version=ver,
+                        extra={"source": "learn_all", "guardrail": guard.get("action")},
+                    )
+    except Exception as ge:
+        print(f"  Guardrail post-learn error: {ge}")
+        results["guardrail_error"] = str(ge)
+
     try:
         from app.services.telegram_bot import send_telegram
 
@@ -56,11 +97,15 @@ async def learn_all(force: bool = False):
             if status == "ok":
                 r = res.get("result") or {}
                 if name == "alpha_strategist":
+                    g = r.get("guardrail") or {}
                     msg += (
                         f"🎯 <b>Alpha</b>: WR {r.get('win_rate', '?')}% | "
                         f"min_conf {r.get('min_confluence', '?')} | "
-                        f"trades {r.get('total_trades', 0)}\n"
+                        f"trades {r.get('total_trades') or r.get('total_positions', 0)}"
                     )
+                    if g.get("action"):
+                        msg += f" | guardrail={g.get('action')}"
+                    msg += "\n"
                 elif name == "risk_manager":
                     msg += (
                         f"🛡️ <b>Risk</b>: WR {r.get('win_rate', '?')}% | "
@@ -105,10 +150,6 @@ async def learn_all(force: bool = False):
 
 @router.post("/professional-report")
 async def generate_desk_brief():
-    """
-    Genera on-demand il Desk Brief professionale (LLM) e lo salva
-    in SharedBrain + market_context. Non richiede un pipeline completo.
-    """
     try:
         from app.services.professional_report import (
             build_context_from_brain,
@@ -140,144 +181,8 @@ async def generate_desk_brief():
         return {"status": "error", "error": str(e)}
 
 
-@router.post("/macro/run")
-async def run_macro():
-    """Run solo MacroAnalyst → scrive market state nel shared brain."""
-    orch = _get_orch()
-    try:
-        result = await orch.macro.analyze()
-        await brain.write_market({
-            "regime": result.get("market_regime", "UNKNOWN"),
-            "confidence": result.get("regime_confidence", 0),
-            "exposure_multiplier": result.get("exposure_multiplier", 0.5),
-            "volatility": result.get("volatility_regime", "UNKNOWN"),
-            "breadth_pct": result.get("breadth_pct", 0),
-            "rotation": result.get("rotation_signal", "unknown"),
-            "sector_rankings": result.get("sector_rankings", []),
-            "llm_reasoning": result.get("llm_reasoning"),
-        })
-        return {"status": "ok", "agent": "macro_analyst", "result": result}
-    except Exception as e:
-        return {"status": "error", "agent": "macro_analyst", "error": str(e)}
-
-
-@router.post("/alpha/run")
-async def run_alpha():
-    """Run solo AlphaStrategist → legge market dal brain, scrive candidates."""
-    orch = _get_orch()
-    try:
-        market = await brain.get_market()
-        if not market:
-            return {"status": "error", "message": "No market data. Run macro first."}
-
-        from app.services.alpaca_trader import get_positions
-        positions = await get_positions() or []
-
-        result = await orch.alpha.analyze({
-            "market_context": market,
-            "positions": positions,
-        })
-
-        await brain.write_candidates(
-            result.get("buy_candidates", []),
-            result.get("sell_signals", []),
-        )
-
-        return {"status": "ok", "agent": "alpha_strategist", "result": result}
-    except Exception as e:
-        return {"status": "error", "agent": "alpha_strategist", "error": str(e)}
-
-
-@router.post("/risk/run")
-async def run_risk():
-    """Run solo RiskManager → legge market+candidates dal brain, scrive approved."""
-    orch = _get_orch()
-    try:
-        market = await brain.get_market()
-        candidates_data = await brain.get_candidates()
-
-        if not candidates_data.get("buy") and not candidates_data.get("sell"):
-            return {"status": "ok", "message": "No candidates to evaluate."}
-
-        from app.services.alpaca_trader import get_account, get_positions
-        account = await get_account()
-        positions = await get_positions() or []
-
-        if not account:
-            return {"status": "error", "message": "Alpaca not connected"}
-
-        result = await orch.risk.analyze({
-            "market_context": market,
-            "buy_candidates": candidates_data.get("buy", []),
-            "sell_signals": candidates_data.get("sell", []),
-            "account": account,
-            "positions": positions,
-        })
-
-        await brain.write_approved(
-            result.get("approved_trades", []),
-            result.get("approved_sells", []),
-            result.get("risk_report", {}),
-        )
-
-        return {"status": "ok", "agent": "risk_manager", "result": result}
-    except Exception as e:
-        return {"status": "error", "agent": "risk_manager", "error": str(e)}
-
-
-@router.post("/executor/run")
-async def run_executor():
-    """Run solo Executor → legge approved dal brain, esegue, pulisce."""
-    orch = _get_orch()
-    try:
-        market = await brain.get_market()
-        approved = await brain.get_approved()
-
-        approved_trades = approved.get("trades", [])
-        approved_sells = approved.get("sells", [])
-
-        if not approved_trades and not approved_sells:
-            return {"status": "ok", "message": "No approved trades to execute."}
-
-        result = await orch.executor.analyze({
-            "market_context": market,
-            "approved_trades": approved_trades,
-            "approved_sells": approved_sells,
-        })
-
-        await brain.write_executions(
-            result.get("executed_buys", []),
-            result.get("executed_sells", []),
-            result,
-        )
-
-        await brain.clear_approved()
-
-        return {"status": "ok", "agent": "executor", "result": result}
-    except Exception as e:
-        return {"status": "error", "agent": "executor", "error": str(e)}
-
-
-@router.get("/brain")
-async def get_brain():
-    """Legge lo stato completo del shared brain."""
-    return await brain.get_full_state()
-
-
-@router.get("/{agent_name}/decisions")
-async def agent_decisions(agent_name: str, limit: int = 20):
-    """Ultime decisioni di un agente specifico."""
-    orch = _get_orch()
-    agent = orch.agents.get(agent_name)
-    if not agent:
-        return {"error": f"Agent '{agent_name}' not found"}
-    decisions = await agent.get_recent_decisions(limit=limit)
-    return {"agent": agent_name, "decisions": decisions}
-
-
 @router.get("/{agent_name}/performance")
 async def agent_performance(agent_name: str, limit: int = 30):
-    """Storico performance di un agente."""
     orch = _get_orch()
     agent = orch.agents.get(agent_name)
     if not agent:
@@ -288,7 +193,6 @@ async def agent_performance(agent_name: str, limit: int = 30):
 
 @router.get("/{agent_name}/params")
 async def agent_params(agent_name: str):
-    """Parametri appresi di un agente."""
     orch = _get_orch()
     agent = orch.agents.get(agent_name)
     if not agent:
@@ -297,146 +201,115 @@ async def agent_params(agent_name: str):
     return {"agent": agent_name, "params": params}
 
 
+@router.get("/{agent_name}/guardrail")
+async def agent_guardrail_status(agent_name: str):
+    """Stato baseline + confronto WR (senza forzare rollback)."""
+    orch = _get_orch()
+    agent = orch.agents.get(agent_name)
+    if not agent:
+        return {"error": f"Agent '{agent_name}' not found"}
+    baseline = await agent.get_learn_baseline() if hasattr(agent, "get_learn_baseline") else {}
+    perf = await agent.get_performance_history(limit=1) if hasattr(agent, "get_performance_history") else []
+    current_wr = None
+    if perf:
+        m = (perf[0] or {}).get("metrics") or {}
+        current_wr = m.get("win_rate")
+    status = {
+        "agent": agent_name,
+        "baseline": baseline,
+        "latest_performance": perf[0] if perf else None,
+        "thresholds": {
+            "min_days": getattr(agent, "guardrail_min_days", 7),
+            "min_new_positions": getattr(agent, "guardrail_min_new_positions", 5),
+            "wr_drop_pts": getattr(agent, "guardrail_wr_drop_pts", 12.0),
+        },
+    }
+    if current_wr is not None and baseline.get("win_rate") is not None:
+        drop = round(float(baseline["win_rate"]) - float(current_wr), 1)
+        status["drop_pts"] = drop
+        status["would_rollback"] = drop >= getattr(agent, "guardrail_wr_drop_pts", 12.0)
+    return status
+
+
+@router.post("/{agent_name}/rollback")
+async def agent_rollback(agent_name: str):
+    """Rollback manuale alla versione precedente."""
+    orch = _get_orch()
+    agent = orch.agents.get(agent_name)
+    if not agent:
+        return {"error": f"Agent '{agent_name}' not found"}
+    if not hasattr(agent, "rollback_to_previous_version"):
+        return {"error": "Agent does not support rollback"}
+    result = await agent.rollback_to_previous_version(reason="manual_rollback")
+    try:
+        from app.services.telegram_bot import send_telegram
+        if result.get("rolled_back"):
+            await send_telegram(
+                f"↩️ <b>Rollback manuale {agent_name}</b>\n"
+                f"v{result.get('from_version')} → hist v{result.get('restored_history_version')} "
+                f"(new v{result.get('new_param_version')})"
+            )
+    except Exception:
+        pass
+    return {"agent": agent_name, **result}
+
+
 @router.get("/{agent_name}/param-history")
 async def agent_param_history(agent_name: str, limit: int = 20):
-    """Storico dei set di parametri (versioning)."""
     orch = _get_orch()
     agent = orch.agents.get(agent_name)
     if not agent:
         return {"error": f"Agent '{agent_name}' not found"}
     if not hasattr(agent, "get_param_history"):
-        return {"error": "Agent does not support param history (upgrade BaseAgent)"}
+        return {"error": "Agent does not support param history"}
     history = await agent.get_param_history(limit=limit)
     return {"agent": agent_name, "history": history}
 
 
 @router.get("/apm-history")
 async def apm_decisions(limit: int = 30):
-    """Ultime decisioni APM."""
     from app.db.mongodb import get_db
-
     db = get_db()
     col = db["agent_decisions_adaptive_position_manager"]
     decisions = await col.find().sort("created_at", -1).to_list(limit)
-
-    result = []
     for d in decisions:
-        data = d.get("data", {})
-        result.append({
-            "id": str(d.get("_id", "")),
-            "created_at": d.get("created_at").isoformat() if d.get("created_at") else "",
-            "type": d.get("type", "unknown"),
-            "ticker": data.get("ticker", ""),
-            "decision": data.get("decision", "UNKNOWN"),
-            "reason": data.get("reason", ""),
-            "current_pnl_pct": data.get("current_pnl_pct", 0),
-            "current_price": data.get("current_price", 0),
-            "entry_price": data.get("entry_price", 0),
-            "action_taken": data.get("action_taken", False),
-            "action_details": data.get("action_details", {}),
-            "state_snapshot": data.get("state_snapshot", {}),
-            "confidence": d.get("confidence", 0),
-        })
-
-    return {
-        "total": len(result),
-        "decisions": result,
-        "fetched_at": datetime.utcnow().isoformat(),
-    }
+        d["_id"] = str(d["_id"])
+    return {"decisions": decisions}
 
 
 @router.get("/apm/status")
 async def apm_status():
-    """Stato APM (last run, prossima esecuzione)."""
     from app.db.mongodb import get_db
-    from datetime import timedelta
-
     db = get_db()
-    last_run_doc = await db.apm_state.find_one({"_id": "last_run"})
     params_doc = await db.agent_memory_adaptive_position_manager.find_one({"_id": "params"})
-
-    if not last_run_doc:
-        return {
-            "status": "never_run",
-            "last_run": None,
-            "next_check": None,
-            "enabled": params_doc.get("apm_enabled", True) if params_doc else True,
-            "interval_hours": params_doc.get("apm_check_interval_hours", 3) if params_doc else 3,
-        }
-
-    last_run = last_run_doc.get("timestamp")
-    interval_hours = params_doc.get("apm_check_interval_hours", 3) if params_doc else 3
-    next_check = last_run + timedelta(hours=interval_hours) if last_run else None
-    remaining = None
-    if next_check:
-        remaining_seconds = (next_check - datetime.utcnow()).total_seconds()
-        remaining = round(remaining_seconds / 3600, 2) if remaining_seconds > 0 else 0
-
     return {
-        "status": "active",
-        "last_run": last_run.isoformat() if last_run else None,
-        "last_decisions_count": last_run_doc.get("decisions_count", 0),
-        "last_actions_count": last_run_doc.get("actions_count", 0),
-        "next_check": next_check.isoformat() if next_check else None,
-        "remaining_hours": remaining,
         "enabled": params_doc.get("apm_enabled", True) if params_doc else True,
-        "interval_hours": interval_hours,
+        "interval_hours": params_doc.get("apm_check_interval_hours", 3) if params_doc else 3,
+        "params": params_doc or {},
     }
 
 
 @router.get("/apm/summary")
 async def apm_summary(days: int = 7):
-    """Riepilogo statistiche APM negli ultimi N giorni."""
     from app.db.mongodb import get_db
     from datetime import timedelta
-
     db = get_db()
-    cutoff = datetime.utcnow() - timedelta(days=days)
     col = db["agent_decisions_adaptive_position_manager"]
+    cutoff = datetime.utcnow() - timedelta(days=days)
     decisions = await col.find({"created_at": {"$gte": cutoff}}).to_list(500)
-
-    counts = {"HOLD": 0, "SCALE_OUT": 0, "EXIT": 0, "TIGHTEN_STOP": 0, "SKIP": 0}
-    actions_taken = 0
-    total_pnl_managed = 0
-
-    for d in decisions:
-        data = d.get("data", {})
-        decision = data.get("decision", "SKIP")
-        counts[decision] = counts.get(decision, 0) + 1
-        if data.get("action_taken", False):
-            actions_taken += 1
-        total_pnl_managed += abs(data.get("current_pnl_pct", 0))
-
+    actions = [d for d in decisions if d.get("decision") and d.get("decision") != "HOLD"]
     return {
-        "period_days": days,
+        "days": days,
         "total_decisions": len(decisions),
-        "actions_taken": actions_taken,
-        "counts": counts,
-        "avg_pnl_managed": round(total_pnl_managed / max(len(decisions), 1), 2),
+        "actions_taken": len(actions),
     }
 
 
 @router.post("/apm/learn")
 async def apm_learn():
-    """Trigger manuale del Learning Loop APM."""
     orch = _get_orch()
     try:
         result = await orch.apm.learn()
         return {"status": "ok", "learning_result": result}
     except Exception as e:
         return {"status": "error", "error": str(e)}
-
-
-@router.post("/apm/force-run")
-async def apm_force_run():
-    """Forza APM a rieseguire immediatamente, ignorando il timer."""
-    from app.db.mongodb import get_db
-
-    db = get_db()
-    await db.apm_state.delete_one({"_id": "last_run"})
-
-    return {
-        "status": "reset",
-        "message": "APM timer reset. Next pipeline will run APM.",
-        "reset_at": datetime.utcnow().isoformat(),
-    }
