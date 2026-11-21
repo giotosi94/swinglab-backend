@@ -9,3 +9,21 @@ services:
         sync: false
       - key: DB_NAME
         value: swinglab
+
+  # ──────────────────────────────────────────────
+  # Cron: ML Weekly Retrain (domenica 08:00 UTC)
+  # Chiama /api/ml/weekly-retrain → collect + train hybrid + train trend
+  # ──────────────────────────────────────────────
+  - type: cron
+    name: swinglab-ml-weekly-retrain
+    runtime: python
+    schedule: "0 8 * * 0"          # Ogni domenica alle 08:00 UTC
+    buildCommand: "true"           # nessun build necessario
+    startCommand: |
+      curl -X POST "https://swinglab-backend.onrender.com/api/ml/weekly-retrain?also_train_trend=true" \
+        -H "Content-Type: application/json" \
+        --max-time 600 \
+        --fail --silent --show-error || exit 1
+    envVars:
+      - key: MONGODB_URL
+        sync: false
