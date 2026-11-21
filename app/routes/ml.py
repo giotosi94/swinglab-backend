@@ -1,8 +1,10 @@
 """
 SwingLab ML — API Routes
+
+v3.0 — Model versioning endpoints + cron-ready weekly retrain
 """
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 from app.db.mongodb import get_db
 from app.ml.model import ml_model
 from app.ml.trend_model import trend_predictor
@@ -82,21 +84,65 @@ async def trend_predict_all():
 
 
 # ============================================
+# v3.0 — MODEL VERSIONING (frontend + ops)
+# ============================================
+
+@router.get("/versions")
+async def list_xgboost_versions(limit: int = Query(10, ge=1, le=30)):
+    """Lista le versioni del modello XGBoost (WIN/LOSS)."""
+    versions = await ml_model.list_versions(limit=limit)
+    production = await ml_model.get_production_info()
+    return {"family": "xgboost", "production": production, "versions": versions}
+
+
+@router.get("/trend/versions")
+async def list_trend_versions(limit: int = Query(10, ge=1, le=30)):
+    """Lista le versioni del modello Trend."""
+    versions = await trend_predictor.list_versions(limit=limit)
+    production = await trend_predictor.get_production_info()
+    return {"family": "trend", "production": production, "versions": versions}
+
+
+@router.get("/production")
+async def get_xgboost_production():
+    return await ml_model.get_production_info()
+
+
+@router.get("/trend/production")
+async def get_trend_production():
+    return await trend_predictor.get_production_info()
+
+
+@router.post("/promote/{version_id}")
+async def promote_xgboost(version_id: str):
+    """Promuove una versione XGBoost a production."""
+    return await ml_model.promote(version_id)
+
+
+@router.post("/trend/promote/{version_id}")
+async def promote_trend(version_id: str):
+    """Promuove una versione Trend a production."""
+    return await trend_predictor.promote(version_id)
+
+
+@router.post("/rollback")
+async def rollback_xgboost():
+    """Rollback XGBoost alla previous_version."""
+    return await ml_model.rollback()
+
+
+@router.post("/trend/rollback")
+async def rollback_trend():
+    """Rollback Trend alla previous_version."""
+    return await trend_predictor.rollback()
+
+
+# ============================================
 # v1.1 — ML DEBUG ENDPOINTS (permanent)
 # ============================================
 
 @router.get("/debug/ticker/{ticker}")
 async def ml_debug_ticker(ticker: str):
-    """
-    Debug dettagliato per un singolo ticker.
-
-    Mostra:
-    - Le feature esatte usate dal modello
-    - Score dettagliato con breakdown
-    - Feature importance per questa predizione
-    - Comparison con altri ticker recenti
-    - Warning se qualcosa sembra sbagliato
-    """
     from datetime import datetime
     db = get_db()
 
@@ -106,15 +152,11 @@ async def ml_debug_ticker(ticker: str):
     if not asset:
         return {"error": f"Ticker {ticker} not found in DB"}
 
-    # Recupera market context
     ps = await db.auto_trader.find_one({"_id": "alpaca_state"})
     market_context = ps.get("market", {}) if ps else {}
 
-    # Predizione
     prediction = await ml_model.predict(asset, market_context)
 
-    # Estrai feature dal codice del modello
-    # (Ricostruisce le feature che il modello vede)
     features_used = {
         "rsi": asset.get("rsi", 0),
         "macd_histogram": asset.get("macd", {}).get("histogram", 0),
@@ -133,7 +175,6 @@ async def ml_debug_ticker(ticker: str):
         "accumulation_score": asset.get("accumulation", {}).get("score", 0),
     }
 
-    # Check NaN o valori sospetti
     warnings = []
     for feat_name, feat_val in features_used.items():
         if feat_val is None:
@@ -142,7 +183,6 @@ async def ml_debug_ticker(ticker: str):
             if feat_val == 0 and feat_name not in ("change_pct", "macd_histogram"):
                 warnings.append(f"⚠️ {feat_name} = 0 (sospetto)")
 
-    # Model status
     model_status = await ml_model.get_status()
 
     return {
@@ -155,6 +195,7 @@ async def ml_debug_ticker(ticker: str):
             "n_samples_trained": model_status.get("n_samples", 0),
             "n_real_positions": model_status.get("n_real_positions", 0),
             "top_features": model_status.get("top_features", {}),
+            "current_version": model_status.get("current_version"),
         },
         "diagnosis": _diagnose_prediction(prediction, features_used, warnings),
         "timestamp": datetime.utcnow().isoformat(),
@@ -163,15 +204,6 @@ async def ml_debug_ticker(ticker: str):
 
 @router.get("/debug/batch/analysis")
 async def ml_batch_analysis():
-    """
-    Analisi statistica di TUTTE le predizioni ML.
-
-    Rileva problemi tipo:
-    - Predizioni "flat" (tutti uguali)
-    - Varianza troppo bassa
-    - Ticker con feature mancanti
-    - Distribuzione anomala degli score
-    """
     from datetime import datetime
     import statistics
 
@@ -186,7 +218,6 @@ async def ml_batch_analysis():
 
     predictions = await ml_model.predict_batch(assets, market_context)
 
-    # Estrai scores
     scores = [
         p.get("ml_score", 0)
         for ticker, p in predictions.items()
@@ -196,14 +227,12 @@ async def ml_batch_analysis():
     if not scores:
         return {"error": "No valid predictions", "predictions_total": len(predictions)}
 
-    # Statistiche
     mean_score = statistics.mean(scores)
     median_score = statistics.median(scores)
     stdev_score = statistics.stdev(scores) if len(scores) > 1 else 0
     min_score = min(scores)
     max_score = max(scores)
 
-    # Distribution buckets
     buckets = {
         "0-20": 0, "20-40": 0, "40-60": 0, "60-80": 0, "80-100": 0
     }
@@ -219,19 +248,16 @@ async def ml_batch_analysis():
         else:
             buckets["80-100"] += 1
 
-    # Detect "flat" pattern
-    is_flat = stdev_score < 5.0  # troppo bassa varianza
+    is_flat = stdev_score < 5.0
     dominant_bucket = max(buckets, key=buckets.get)
     dominant_pct = round((buckets[dominant_bucket] / len(scores)) * 100, 1)
 
-    # Detect ticker uguali (esempio: molti a 92.3%)
     from collections import Counter
     rounded_scores = [round(s, 1) for s in scores]
     score_counts = Counter(rounded_scores)
     most_common_score, most_common_count = score_counts.most_common(1)[0]
     duplicate_pct = round((most_common_count / len(scores)) * 100, 1)
 
-    # Health assessment
     health = "healthy"
     issues = []
     if is_flat:
@@ -274,28 +300,22 @@ async def ml_batch_analysis():
 
 
 def _diagnose_prediction(prediction, features, warnings):
-    """Diagnostica intelligente della predizione."""
     diagnosis = []
 
     ml_score = prediction.get("ml_score", 0)
-    ml_pred = prediction.get("prediction", "unknown")
     confidence = prediction.get("confidence", 0)
 
-    # Check score troppo alto/basso
     if ml_score > 95:
         diagnosis.append("🚨 Score TROPPO alto (>95%) — probabile overfitting")
     elif ml_score < 5:
         diagnosis.append("🚨 Score TROPPO basso (<5%) — probabile overfitting")
 
-    # Check confidence sospetta
     if confidence > 90 and ml_score > 85:
         diagnosis.append("⚠️ Confidence + Score entrambi altissimi — modello sovraconfidente")
 
-    # Check warnings features
     if len(warnings) > 3:
         diagnosis.append(f"🚨 {len(warnings)} features problematiche — dati incompleti")
 
-    # Score = 92.3% detection
     if abs(ml_score - 92.3) < 1.0:
         diagnosis.append("🚨 Score = 92.3% — pattern noto di modello flat")
 
@@ -307,16 +327,6 @@ def _diagnose_prediction(prediction, features, warnings):
 
 @router.get("/debug/health")
 async def ml_health_check():
-    """
-    Health check completo del sistema ML.
-
-    Verifica:
-    - Modello caricato
-    - Predizioni funzionanti
-    - Distribuzione score
-    - Feature quality
-    - Training data quality
-    """
     from datetime import datetime
     db = get_db()
 
@@ -326,14 +336,12 @@ async def ml_health_check():
         "checks": {},
     }
 
-    # Check 1: Model status
     status = await ml_model.get_status()
     health_report["checks"]["model_loaded"] = {
         "status": "ok" if status.get("is_trained") else "critical",
         "details": status,
     }
 
-    # Check 2: Batch analysis
     try:
         assets = await db.assets.find({}).to_list(50)
         ps = await db.auto_trader.find_one({"_id": "alpaca_state"})
@@ -355,7 +363,6 @@ async def ml_health_check():
             "error": str(e),
         }
 
-    # Check 3: Training data quality
     n_real = status.get("n_real_positions", 0)
     health_report["checks"]["training_data"] = {
         "status": "ok" if n_real >= 20 else "warning",
@@ -366,7 +373,6 @@ async def ml_health_check():
         ),
     }
 
-    # Check 4: Accuracy
     accuracy = status.get("accuracy", 0)
     health_report["checks"]["model_accuracy"] = {
         "status": "ok" if accuracy > 55 else ("warning" if accuracy > 45 else "critical"),
@@ -378,7 +384,6 @@ async def ml_health_check():
         ),
     }
 
-    # Overall status
     critical_count = sum(1 for c in health_report["checks"].values() if c.get("status") == "critical")
     warning_count = sum(1 for c in health_report["checks"].values() if c.get("status") == "warning")
 
@@ -389,7 +394,6 @@ async def ml_health_check():
     else:
         health_report["status"] = "healthy"
 
-    # Suggestions
     suggestions = []
     if critical_count > 0:
         suggestions.append("🚨 URGENT: Retrain model with more real data")
@@ -424,7 +428,6 @@ async def collect_backtest_data(
 @router.post("/train-hybrid")
 async def train_hybrid(real_weight: int = 3):
     """v2.0 Training ibrido: real (dedup) + backtest data."""
-    from app.ml.model import ml_model
     result = await ml_model.train_hybrid(real_weight=real_weight)
     return result
 
@@ -434,15 +437,17 @@ async def weekly_retrain(
     days: int = 250,
     min_confluence: float = 55,
     real_weight: int = 3,
+    also_train_trend: bool = True,
 ):
     """
-    🆕 Cron settimanale: collect backtest data (17 feature) + train-hybrid.
-    Un solo endpoint atomico per il cron della domenica.
-    Il modello impara dai nuovi trade reali accumulati durante la settimana.
+    Cron settimanale (domenica):
+    1. Collect backtest data
+    2. Train hybrid XGBoost (con versioning automatico)
+    3. Opzionalmente train Trend model
+    4. Notifica Telegram
     """
     from datetime import datetime
     from app.ml.backtest_collector import collect_backtest_training_data
-    from app.ml.model import ml_model
 
     report = {"started_at": datetime.utcnow().isoformat()}
 
@@ -461,35 +466,56 @@ async def weekly_retrain(
         report["status"] = "failed_at_collect"
         return report
 
-    # ===== Step 2: Train hybrid =====
+    # ===== Step 2: Train hybrid XGBoost =====
     try:
         train_result = await ml_model.train_hybrid(real_weight=real_weight)
-        report["train"] = {
+        report["train_xgboost"] = {
             "status": "ok",
             "accuracy": train_result.get("accuracy", 0),
             "n_samples": train_result.get("n_samples", 0),
             "n_real_positions": train_result.get("n_real_positions", 0),
+            "version": train_result.get("version"),
             "top_features": train_result.get("top_features", {}),
         }
-        report["status"] = "success"
     except Exception as e:
-        report["train"] = {"status": "error", "error": str(e)}
-        report["status"] = "failed_at_train"
+        report["train_xgboost"] = {"status": "error", "error": str(e)}
+        report["status"] = "failed_at_xgboost"
         return report
 
-    # ===== Step 3: Telegram report =====
+    # ===== Step 3: Train Trend (opzionale) =====
+    if also_train_trend:
+        try:
+            trend_result = await trend_predictor.train()
+            report["train_trend"] = {
+                "status": "ok",
+                "accuracy": trend_result.get("accuracy", 0),
+                "n_samples": trend_result.get("n_samples", 0),
+                "version": trend_result.get("version"),
+            }
+        except Exception as e:
+            report["train_trend"] = {"status": "error", "error": str(e)}
+            # non blocchiamo tutto se fallisce solo il trend
+
+    report["status"] = "success"
+
+    # ===== Step 4: Telegram report =====
     try:
         from app.services.telegram_bot import send_telegram
-        acc = report["train"]["accuracy"]
-        n_real = report["train"]["n_real_positions"]
+        xgb = report.get("train_xgboost", {})
+        tr = report.get("train_trend", {})
         msg = (
             f"🧠 <b>ML Weekly Retrain</b>\n\n"
-            f"✅ Accuracy: {acc}%\n"
-            f"📊 Samples: {report['train']['n_samples']} "
-            f"({n_real} posizioni reali)\n"
-            f"🎯 Backtest: {report['collect']['total_samples']} sample\n\n"
-            f"Modello aggiornato e salvato."
+            f"✅ XGBoost Accuracy: {xgb.get('accuracy', '?')}%\n"
+            f"📦 Version: {xgb.get('version', '?')}\n"
+            f"📊 Samples: {xgb.get('n_samples', '?')} "
+            f"({xgb.get('n_real_positions', '?')} reali)\n"
         )
+        if tr.get("status") == "ok":
+            msg += (
+                f"\n📈 Trend Accuracy: {tr.get('accuracy', '?')}%\n"
+                f"📦 Trend Version: {tr.get('version', '?')}\n"
+            )
+        msg += "\nModelli aggiornati e promossi a production."
         await send_telegram(msg)
     except Exception as e:
         report["telegram"] = f"error: {e}"
