@@ -1,12 +1,19 @@
 """
 SwingLab ML — XGBoost Model
 Trains on trade history, predicts WIN/LOSS probability for new candidates.
+
+v3.0 — Lightweight model versioning (inspired by BaseAgent)
+- Immutable versioned documents (xgboost_vN)
+- Production pointer (xgboost_production)
+- Automatic promote on train + rollback support
+- Fully backward compatible with old xgboost_v1
 """
 
 import numpy as np
 import pickle
 import base64
 from datetime import datetime
+from typing import Optional
 
 from app.db.mongodb import get_db
 from app.ml.features import (
@@ -36,12 +43,280 @@ except ImportError:
 
 
 class SwingLabModel:
-    """XGBoost classifier for trade outcome prediction."""
+    """XGBoost classifier for trade outcome prediction with lightweight versioning."""
+
+    MODEL_FAMILY = "xgboost"
+    PRODUCTION_ID = "xgboost_production"
+    LEGACY_ID = "xgboost_v1"          # fallback for old documents
+    MAX_VERSIONS = 10                 # retention
 
     def __init__(self):
         self.model = None
         self.is_trained = False
         self.metadata = {}
+        self.current_version_id: Optional[str] = None
+
+    # ------------------------------------------------------------------
+    # Version helpers
+    # ------------------------------------------------------------------
+
+    async def _next_version_number(self) -> int:
+        db = get_db()
+        cursor = db.ml_models.find(
+            {"_id": {"$regex": f"^{self.MODEL_FAMILY}_v\\d+$"}},
+            {"_id": 1},
+        )
+        max_v = 0
+        async for doc in cursor:
+            try:
+                num = int(doc["_id"].split("_v")[-1])
+                if num > max_v:
+                    max_v = num
+            except (ValueError, IndexError):
+                continue
+        return max_v + 1
+
+    async def _get_production_pointer(self) -> dict:
+        db = get_db()
+        doc = await db.ml_models.find_one({"_id": self.PRODUCTION_ID})
+        return doc or {}
+
+    async def _set_production(self, version_id: str, previous: Optional[str] = None):
+        db = get_db()
+        now = datetime.utcnow().isoformat()
+        pointer = await self._get_production_pointer()
+        old_active = pointer.get("active_version")
+
+        await db.ml_models.update_one(
+            {"_id": self.PRODUCTION_ID},
+            {"$set": {
+                "active_version": version_id,
+                "previous_version": previous if previous is not None else old_active,
+                "promoted_at": now,
+                "promoted_by": "train",
+                "updated_at": now,
+            }},
+            upsert=True,
+        )
+
+        # Update status flags
+        if old_active and old_active != version_id:
+            await db.ml_models.update_one(
+                {"_id": old_active},
+                {"$set": {"status": "archived"}},
+            )
+        await db.ml_models.update_one(
+            {"_id": version_id},
+            {"$set": {"status": "production"}},
+        )
+
+    async def _prune_old_versions(self):
+        """Keep only the newest MAX_VERSIONS versioned documents."""
+        db = get_db()
+        cursor = db.ml_models.find(
+            {"_id": {"$regex": f"^{self.MODEL_FAMILY}_v\\d+$"}},
+            {"_id": 1, "created_at": 1},
+        ).sort("created_at", -1)
+        docs = await cursor.to_list(length=50)
+        if len(docs) <= self.MAX_VERSIONS:
+            return
+        to_delete = [d["_id"] for d in docs[self.MAX_VERSIONS:]]
+        # Never delete the current production or previous
+        pointer = await self._get_production_pointer()
+        protected = {
+            pointer.get("active_version"),
+            pointer.get("previous_version"),
+            self.LEGACY_ID,
+        }
+        to_delete = [vid for vid in to_delete if vid not in protected]
+        if to_delete:
+            await db.ml_models.delete_many({"_id": {"$in": to_delete}})
+            print(f"  Pruned {len(to_delete)} old model versions")
+
+    # ------------------------------------------------------------------
+    # Core save / load (backward compatible)
+    # ------------------------------------------------------------------
+
+    async def save_to_db(self, promote: bool = True) -> dict:
+        """
+        Save current model as a new immutable version.
+        By default also promotes it to production (keeps existing train behavior).
+        Returns info about the new version.
+        """
+        if not self.model:
+            return {"saved": False, "error": "no model"}
+
+        try:
+            db = get_db()
+            version_num = await self._next_version_number()
+            version_id = f"{self.MODEL_FAMILY}_v{version_num}"
+
+            model_bytes = pickle.dumps(self.model)
+            model_b64 = base64.b64encode(model_bytes).decode("utf-8")
+            now = datetime.utcnow().isoformat()
+
+            doc = {
+                "model_family": self.MODEL_FAMILY,
+                "version": version_num,
+                "status": "staging",
+                "model_data": model_b64,
+                "metadata": self.metadata,
+                "created_at": now,
+                "created_by": self.metadata.get("model_type", "train"),
+            }
+            await db.ml_models.update_one(
+                {"_id": version_id},
+                {"$set": doc},
+                upsert=True,
+            )
+
+            # Also keep the legacy document updated for maximum compatibility
+            await db.ml_models.update_one(
+                {"_id": self.LEGACY_ID},
+                {"$set": {
+                    "model_data": model_b64,
+                    "metadata": self.metadata,
+                    "updated_at": now,
+                    "mirrored_from": version_id,
+                }},
+                upsert=True,
+            )
+
+            result = {
+                "saved": True,
+                "version_id": version_id,
+                "version": version_num,
+            }
+
+            if promote:
+                await self._set_production(version_id)
+                self.current_version_id = version_id
+                result["promoted"] = True
+                result["status"] = "production"
+                print(f"  Model saved as {version_id} and promoted to production")
+            else:
+                print(f"  Model saved as {version_id} (staging)")
+
+            await self._prune_old_versions()
+            return result
+
+        except Exception as e:
+            print(f"  Save model error: {e}")
+            return {"saved": False, "error": str(e)}
+
+    async def load_from_db(self) -> bool:
+        """
+        Load the production model.
+        Falls back to legacy xgboost_v1 if no production pointer exists.
+        """
+        try:
+            db = get_db()
+
+            # 1. Prefer production pointer
+            pointer = await self._get_production_pointer()
+            active = pointer.get("active_version")
+
+            doc = None
+            if active:
+                doc = await db.ml_models.find_one({"_id": active})
+
+            # 2. Fallback to legacy
+            if not doc or "model_data" not in doc:
+                doc = await db.ml_models.find_one({"_id": self.LEGACY_ID})
+
+            if not doc or "model_data" not in doc:
+                return False
+
+            model_bytes = base64.b64decode(doc["model_data"])
+            self.model = pickle.loads(model_bytes)
+            self.metadata = doc.get("metadata", {})
+            self.is_trained = True
+            self.current_version_id = doc.get("_id")
+            print(f"  Model loaded from MongoDB ({self.current_version_id})")
+            return True
+
+        except Exception as e:
+            print(f"  Load model error: {e}")
+            return False
+
+    # ------------------------------------------------------------------
+    # Version management API
+    # ------------------------------------------------------------------
+
+    async def list_versions(self, limit: int = 10) -> list:
+        db = get_db()
+        cursor = db.ml_models.find(
+            {"_id": {"$regex": f"^{self.MODEL_FAMILY}_v\\d+$"}},
+            {"model_data": 0},  # never return the heavy blob
+        ).sort("created_at", -1).limit(limit)
+        docs = await cursor.to_list(length=limit)
+
+        pointer = await self._get_production_pointer()
+        active = pointer.get("active_version")
+        previous = pointer.get("previous_version")
+
+        result = []
+        for d in docs:
+            d["_id"] = str(d["_id"])
+            d["is_production"] = d["_id"] == active
+            d["is_previous"] = d["_id"] == previous
+            result.append(d)
+        return result
+
+    async def promote(self, version_id: str) -> dict:
+        db = get_db()
+        doc = await db.ml_models.find_one({"_id": version_id})
+        if not doc or "model_data" not in doc:
+            return {"promoted": False, "error": f"version {version_id} not found"}
+
+        await self._set_production(version_id)
+        return {
+            "promoted": True,
+            "version_id": version_id,
+            "message": f"{version_id} is now production",
+        }
+
+    async def rollback(self) -> dict:
+        pointer = await self._get_production_pointer()
+        previous = pointer.get("previous_version")
+        if not previous:
+            return {"rolled_back": False, "error": "no previous version recorded"}
+
+        current = pointer.get("active_version")
+        await self._set_production(previous, previous=current)
+        return {
+            "rolled_back": True,
+            "from": current,
+            "to": previous,
+            "message": f"Rolled back to {previous}",
+        }
+
+    async def get_production_info(self) -> dict:
+        pointer = await self._get_production_pointer()
+        active = pointer.get("active_version")
+        if not active:
+            return {"active_version": self.LEGACY_ID, "legacy": True}
+
+        db = get_db()
+        doc = await db.ml_models.find_one(
+            {"_id": active},
+            {"model_data": 0},
+        )
+        if not doc:
+            return {"active_version": active, "error": "document missing"}
+
+        return {
+            "active_version": active,
+            "previous_version": pointer.get("previous_version"),
+            "promoted_at": pointer.get("promoted_at"),
+            "metadata": doc.get("metadata", {}),
+            "status": doc.get("status"),
+            "created_at": doc.get("created_at"),
+        }
+
+    # ------------------------------------------------------------------
+    # Training (unchanged logic, now uses versioned save)
+    # ------------------------------------------------------------------
 
     async def train(self, use_synthetic_if_needed=True):
         if not HAS_SKLEARN:
@@ -120,12 +395,17 @@ class SwingLabModel:
             "feature_importance": importance_dict,
             "model_type": "xgboost" if HAS_XGB else "sklearn_gb",
         }
-        await self.save_to_db()
+        save_res = await self.save_to_db(promote=True)
         print(f"  Model trained! Accuracy: {accuracy}%")
         print(f"  Precision: {precision}%, Recall: {recall}%")
         print(f"  Top features: {list(importance_dict.keys())[:5]}")
         print("=" * 50)
-        return {"status": "trained", **self.metadata, "top_features": dict(list(importance_dict.items())[:5])}
+        return {
+            "status": "trained",
+            **self.metadata,
+            "top_features": dict(list(importance_dict.items())[:5]),
+            "version": save_res.get("version_id"),
+        }
 
     async def predict(self, asset, market_context=None):
         if not self.is_trained:
@@ -175,44 +455,6 @@ class SwingLabModel:
             print(f"  ML batch predict error: {e}")
         return results
 
-    async def save_to_db(self):
-        if not self.model:
-            return False
-        try:
-            db = get_db()
-            model_bytes = pickle.dumps(self.model)
-            model_b64 = base64.b64encode(model_bytes).decode("utf-8")
-            await db.ml_models.update_one(
-                {"_id": "xgboost_v1"},
-                {"$set": {
-                    "model_data": model_b64,
-                    "metadata": self.metadata,
-                    "updated_at": datetime.utcnow().isoformat(),
-                }},
-                upsert=True,
-            )
-            print("  Model saved to MongoDB")
-            return True
-        except Exception as e:
-            print(f"  Save model error: {e}")
-            return False
-
-    async def load_from_db(self):
-        try:
-            db = get_db()
-            doc = await db.ml_models.find_one({"_id": "xgboost_v1"})
-            if not doc or "model_data" not in doc:
-                return False
-            model_bytes = base64.b64decode(doc["model_data"])
-            self.model = pickle.loads(model_bytes)
-            self.metadata = doc.get("metadata", {})
-            self.is_trained = True
-            print("  Model loaded from MongoDB")
-            return True
-        except Exception as e:
-            print(f"  Load model error: {e}")
-            return False
-
     async def get_status(self):
         if not self.is_trained:
             await self.load_from_db()
@@ -224,6 +466,7 @@ class SwingLabModel:
             }
         importance = self.metadata.get("feature_importance", {})
         top5 = dict(list(importance.items())[:5])
+        prod_info = await self.get_production_info()
         return {
             "is_trained": True,
             "status": "ready",
@@ -235,6 +478,8 @@ class SwingLabModel:
             "train_date": self.metadata.get("train_date", ""),
             "model_type": self.metadata.get("model_type", "unknown"),
             "top_features": top5,
+            "current_version": self.current_version_id or prod_info.get("active_version"),
+            "production": prod_info,
         }
 
     async def generate_synthetic_data(self, n_samples=300):
@@ -295,7 +540,6 @@ class SwingLabModel:
             {"side": "sell", "pnl_pct": {"$exists": True}}
         ).to_list(length=5000)
 
-        # Aggrega per buy_order_id: 1 posizione = 1 sample
         positions = {}
         for t in real_trades:
             boid = t.get("buy_order_id", "")
@@ -308,7 +552,6 @@ class SwingLabModel:
                     "rsi": t.get("rsi_at_entry"),
                 }
             positions[boid]["total_pnl_dollar"] += t.get("pnl_dollar", 0)
-            # preferisci trade con rsi_at_entry per features migliori
             if t.get("rsi_at_entry") and not positions[boid]["rsi"]:
                 positions[boid]["rsi"] = t.get("rsi_at_entry")
                 positions[boid]["sample_trade"] = t
@@ -346,7 +589,6 @@ class SwingLabModel:
         print(f"  Backtest: {len(bt_features)} samples")
 
         # ===== 3. COMBINE with weighting =====
-        # Real trades ripetuti real_weight volte per dare più peso
         X_list = []
         y_list = []
         for _ in range(real_weight):
@@ -384,7 +626,6 @@ class SwingLabModel:
                 subsample=0.8, min_samples_leaf=3, random_state=42,
             )
 
-
         print("  Training hybrid model...")
         self.model.fit(X_train, y_train)
         y_pred = self.model.predict(X_test)
@@ -413,13 +654,18 @@ class SwingLabModel:
             "feature_importance": importance_dict,
             "model_type": ("xgboost" if HAS_XGB else "sklearn_gb") + "_hybrid",
         }
-        await self.save_to_db()
+        save_res = await self.save_to_db(promote=True)
 
         print(f"  Hybrid model trained! Accuracy: {accuracy}%")
         print(f"  Top features: {list(importance_dict.keys())[:5]}")
         print("=" * 50)
-        return {"status": "trained_hybrid", **self.metadata,
-                "top_features": dict(list(importance_dict.items())[:5])}
+        return {
+            "status": "trained_hybrid",
+            **self.metadata,
+            "top_features": dict(list(importance_dict.items())[:5]),
+            "version": save_res.get("version_id"),
+        }
+
 
 # ---- Singleton ----
 ml_model = SwingLabModel()
