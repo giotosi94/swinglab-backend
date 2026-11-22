@@ -1,6 +1,6 @@
 """
 SwingLab Telegram Routes
-Endpoint per test connessione + trigger manuale briefing/report.
+Endpoint per test connessione + trigger manuale briefing/report/Max.
 """
 
 from fastapi import APIRouter
@@ -10,22 +10,15 @@ from app.services.telegram_bot import (
     send_telegram,
     send_daily_briefing,
     send_evening_report,
+    send_max_outcome_report,
 )
 
 router = APIRouter()
 
 
-# ============================================
-# TEST — Verifica connessione bot
-# ============================================
-
 @router.post("/test")
 async def telegram_test():
-    """
-    🧪 Test connessione Telegram bot.
-    Invia un messaggio di test al chat configurato.
-    """
-    # Check config
+    """Test connessione Telegram bot."""
     if not app_settings.TELEGRAM_BOT_TOKEN:
         return {
             "success": False,
@@ -38,8 +31,7 @@ async def telegram_test():
             "error": "TELEGRAM_CHAT_ID not configured",
             "hint": "Add TELEGRAM_CHAT_ID to Render env vars",
         }
-    
-    # Send test message
+
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
     msg = (
         "🧪 <b>SwingLab Test Message</b>\n\n"
@@ -50,12 +42,13 @@ async def telegram_test():
         "  • 🟢 Buy/Sell executed\n"
         "  • 🚨 Software SL/TP triggered\n"
         "  • 📈 Trailing stops\n"
-        "  • 🌅 Daily briefings\n"
-        "  • 🌙 Evening reports"
+        "  • 🌅 Daily briefings (+ Max snapshot)\n"
+        "  • 🌙 Evening reports (+ Max outcome)\n"
+        "  • 📐 Max outcome report"
     )
-    
+
     result = await send_telegram(msg)
-    
+
     if result:
         return {
             "success": True,
@@ -63,29 +56,21 @@ async def telegram_test():
             "chat_id": app_settings.TELEGRAM_CHAT_ID,
             "sent_at": now,
         }
-    else:
-        return {
-            "success": False,
-            "error": "Failed to send message",
-            "hints": [
-                "Check TELEGRAM_BOT_TOKEN is correct",
-                "Check TELEGRAM_CHAT_ID is correct",
-                "Make sure you pressed START on the bot",
-                "Check Render logs for details",
-            ],
-        }
+    return {
+        "success": False,
+        "error": "Failed to send message",
+        "hints": [
+            "Check TELEGRAM_BOT_TOKEN is correct",
+            "Check TELEGRAM_CHAT_ID is correct",
+            "Make sure you pressed START on the bot",
+            "Check Render logs for details",
+        ],
+    }
 
-
-# ============================================
-# BRIEFING — Morning report manuale
-# ============================================
 
 @router.post("/briefing")
 async def telegram_briefing():
-    """
-    🌅 Trigger manuale del Morning Briefing.
-    Invia: market regime, top sector, portfolio, top picks.
-    """
+    """Morning Briefing (include snapshot Max)."""
     try:
         await send_daily_briefing()
         return {
@@ -94,22 +79,12 @@ async def telegram_briefing():
             "sent_at": datetime.utcnow().isoformat(),
         }
     except Exception as e:
-        return {
-            "success": False,
-            "error": str(e),
-        }
+        return {"success": False, "error": str(e)}
 
-
-# ============================================
-# REPORT — Evening report manuale
-# ============================================
 
 @router.post("/report")
 async def telegram_report():
-    """
-    🌙 Trigger manuale dell'Evening Report.
-    Invia: equity, trade del giorno, P&L, nuove posizioni.
-    """
+    """Evening Report (include Max outcome)."""
     try:
         await send_evening_report()
         return {
@@ -118,22 +93,25 @@ async def telegram_report():
             "sent_at": datetime.utcnow().isoformat(),
         }
     except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@router.post("/max-report")
+async def telegram_max_report():
+    """Report standalone Max Strategy (ARMED/TRIGGERED/outcome)."""
+    try:
+        ok = await send_max_outcome_report()
         return {
-            "success": False,
-            "error": str(e),
+            "success": bool(ok),
+            "message": "Max outcome report sent!" if ok else "Send failed (check Telegram config/logs)",
+            "sent_at": datetime.utcnow().isoformat(),
         }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
-
-# ============================================
-# STATUS — Info configurazione
-# ============================================
 
 @router.get("/status")
 async def telegram_status():
-    """
-    ℹ️ Stato configurazione Telegram.
-    Ritorna info se il bot è configurato (senza rivelare token).
-    """
     return {
         "configured": bool(app_settings.TELEGRAM_BOT_TOKEN and app_settings.TELEGRAM_CHAT_ID),
         "has_token": bool(app_settings.TELEGRAM_BOT_TOKEN),
